@@ -71,6 +71,7 @@ class LoopbackHttpServer {
 
     private TcpSocket listener;
     private shared bool running = false;
+    private shared size_t rawHandle = size_t.max;
     private ushort boundPort = 0;
 
     this(string bindAddr, ushort port, HikariRouter router) {
@@ -95,11 +96,37 @@ class LoopbackHttpServer {
             addr = new InternetAddress(bindAddr, port);
             listener = new TcpSocket(AddressFamily.INET);
         }
-        listener.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
+        version (Windows) {
+            // On Windows SO_REUSEADDR lets a second process steal an in-use port.
+            // SO_EXCLUSIVEADDRUSE guarantees the loopback port really belongs to hikari.
+            import core.sys.windows.winsock2 : SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt;
+            int one = 1;
+            if (setsockopt(listener.handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &one, int.sizeof) != 0) {
+                throw new Exception("Unable to set SO_EXCLUSIVEADDRUSE on loopback listener");
+            }
+        } else {
+            listener.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
+        }
         listener.bind(addr);
         listener.listen(64);
         boundPort = to!ushort(listener.localAddress().toPortString());
+        atomicStore(rawHandle, cast(size_t) listener.handle);
         atomicStore(running, true);
+    }
+
+    /// Async-signal/console-handler safe stop: no GC, no exceptions. Closing the raw
+    /// listening socket unblocks accept() so serveLoop() returns.
+    void requestStop() nothrow @nogc {
+        atomicStore(running, false);
+        auto h = atomicExchange(&rawHandle, size_t.max);
+        if (h == size_t.max) return;
+        version (Windows) {
+            import core.sys.windows.winsock2 : closesocket, SOCKET;
+            closesocket(cast(SOCKET) h);
+        } else {
+            import core.sys.posix.sys.socket : shutdown, SHUT_RDWR;
+            shutdown(cast(int) h, SHUT_RDWR);
+        }
     }
 
     private void spawnClientHandler(Socket c) {
@@ -135,6 +162,7 @@ class LoopbackHttpServer {
 
     void stop() {
         atomicStore(running, false);
+        atomicStore(rawHandle, size_t.max);
         if (listener !is null) {
             try { listener.shutdown(SocketShutdown.BOTH); } catch (Exception) {}
             try { listener.close(); } catch (Exception) {}

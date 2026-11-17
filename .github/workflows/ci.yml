@@ -73,6 +73,22 @@ jobs:
       - name: Run D unit tests
         run: dub test --compiler=ldc2
 
+      - name: PowerShell static checks
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem install/*.ps1, tests/integration/windows/*.ps1) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $failed = $true; $errs | ForEach-Object { Write-Error "$($f.Name):$($_.Extent.StartLineNumber) $($_.Message)" } }
+          }
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+          if (Get-Module -ListAvailable PSScriptAnalyzer) {
+            $issues = Invoke-ScriptAnalyzer -Path install, tests/integration/windows -Recurse -Severity Error
+            if ($issues) { $issues | Format-Table -AutoSize | Out-String | Write-Host; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
       - name: Smoke test Windows CLI & installer
         shell: pwsh
         run: |

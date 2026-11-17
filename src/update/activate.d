@@ -31,13 +31,85 @@ void atomicSetSymlink(string target, string linkPath) {
         symlink(target, tmpLink);
         rename(tmpLink, linkPath);
     } else version (Windows) {
-        // Store target path atomically and update directory junction without overwriting running .exe
+        // Services launch versions\current\hikari.exe through a directory junction. The
+        // running .exe lives in its own version directory and is never overwritten.
+        // Build the new junction aside, then swap with two renames so `current` is
+        // missing for at most an instant and the old pointer is restored on failure.
+        import std.file : rmdir;
+        auto tmpLink = linkPath ~ ".new";
+        auto oldLink = linkPath ~ ".old";
+        if (exists(tmpLink)) rmdir(tmpLink); // RemoveDirectoryW removes only the junction
+        createJunction(target, tmpLink);
+        if (exists(linkPath)) {
+            if (exists(oldLink)) rmdir(oldLink);
+            rename(linkPath, oldLink);
+            try {
+                rename(tmpLink, linkPath);
+            } catch (Exception e) {
+                rename(oldLink, linkPath);
+                throw e;
+            }
+            try { rmdir(oldLink); } catch (Exception) {}
+        } else {
+            rename(tmpLink, linkPath);
+        }
+        // Text pointer is the source of truth for readVersionSymlink(); write it last.
         auto txtPath = linkPath ~ ".txt";
         auto tmpTxt = txtPath ~ ".tmp";
         write(tmpTxt, baseName(target) ~ "\n");
         rename(tmpTxt, txtPath);
-        execute(["cmd", "/c", "rmdir", "/q", linkPath], null, Config.none, 4096);
-        execute(["cmd", "/c", "mklink", "/J", linkPath, target], null, Config.none, 4096);
+    }
+}
+
+version (Windows) {
+    private void createJunction(string target, string linkPath) {
+        import std.path : absolutePath, buildNormalizedPath;
+        import std.string : replace;
+        auto t = buildNormalizedPath(absolutePath(target)).replace("/", "\\");
+        auto l = buildNormalizedPath(absolutePath(linkPath)).replace("/", "\\");
+        auto r = execute(["cmd", "/c", "mklink", "/J", l, t], null, Config.none, 4096);
+        if (r.status != 0 || !exists(l)) {
+            throw new Exception("Unable to create version junction " ~ l ~ ": " ~ r.output.strip());
+        }
+    }
+
+    private enum ServiceResult { ok, missing, failed }
+
+    /// Restarts one hikari-owned service through the Service Control Manager API and
+    /// waits for real state transitions (sc.exe stop/start return before they finish).
+    private ServiceResult restartWindowsService(string name, uint timeoutMs = 30_000) {
+        import core.sys.windows.winsvc;
+        import core.sys.windows.winbase : GetLastError;
+        import std.utf : toUTF16z;
+
+        enum uint ERROR_SERVICE_DOES_NOT_EXIST = 1060;
+        auto scm = OpenSCManagerW(null, null, SC_MANAGER_CONNECT);
+        if (scm is null) return ServiceResult.failed;
+        scope (exit) CloseServiceHandle(scm);
+        auto svc = OpenServiceW(scm, name.toUTF16z(), SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS);
+        if (svc is null) {
+            return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST ? ServiceResult.missing : ServiceResult.failed;
+        }
+        scope (exit) CloseServiceHandle(svc);
+
+        bool waitFor(uint wanted) {
+            SERVICE_STATUS st;
+            for (uint waited = 0; waited <= timeoutMs; waited += 250) {
+                if (!QueryServiceStatus(svc, &st)) return false;
+                if (st.dwCurrentState == wanted) return true;
+                if (wanted == SERVICE_RUNNING && st.dwCurrentState == SERVICE_STOPPED && waited > 2000) return false;
+                Thread.sleep(msecs(250));
+            }
+            return false;
+        }
+
+        SERVICE_STATUS st;
+        if (QueryServiceStatus(svc, &st) && st.dwCurrentState != SERVICE_STOPPED) {
+            ControlService(svc, SERVICE_CONTROL_STOP, &st);
+            if (!waitFor(SERVICE_STOPPED)) return ServiceResult.failed;
+        }
+        if (!StartServiceW(svc, 0, null)) return ServiceResult.failed;
+        return waitFor(SERVICE_RUNNING) ? ServiceResult.ok : ServiceResult.failed;
     }
 }
 
@@ -77,17 +149,9 @@ bool defaultRestartHikariServices(string action) {
         }
         return true;
     } else version (Windows) {
-        execute(["sc.exe", "stop", "hikari"], null, Config.none, 4096);
-        Thread.sleep(msecs(1000));
-        auto r1 = execute(["sc.exe", "start", "hikari"], null, Config.none, 4096);
-        if (r1.status != 0) return false;
-        auto q2 = execute(["sc.exe", "query", "hikari-caddy"], null, Config.none, 4096);
-        if (q2.status == 0) {
-            execute(["sc.exe", "stop", "hikari-caddy"], null, Config.none, 4096);
-            Thread.sleep(msecs(500));
-            execute(["sc.exe", "start", "hikari-caddy"], null, Config.none, 4096);
-        }
-        return true;
+        if (restartWindowsService("hikari") != ServiceResult.ok) return false;
+        // hikari-caddy is optional (snippet-only installs have none).
+        return restartWindowsService("hikari-caddy") != ServiceResult.failed;
     } else {
         return false;
     }

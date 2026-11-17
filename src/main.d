@@ -176,15 +176,55 @@ private int cmdServe(string[] args) {
 
     auto router = new HikariRouter(cfg, coord, disc, reg, webIndex);
     auto server = new LoopbackHttpServer(cfg.listen.loopback_bind, cfg.listen.loopback_port, router);
-    server.startListening();
+    try {
+        server.startListening();
+    } catch (Exception e) {
+        // Never take over or share a port owned by another process.
+        stderr.writefln("hikari: cannot listen on %s:%u (%s). Another process owns this port; choose a different listen.loopback_port.",
+            server.bindAddr, cfg.listen.loopback_port, e.msg);
+        return 1;
+    }
 
     stdout.writefln("hikari %s listening on http://%s:%u%s (node_id=%s)",
         AGENT_VERSION, server.bindAddr, server.actualPort(),
         cfg.listen.base_path == "/" ? "" : cfg.listen.base_path, nodeId);
     stdout.flush();
 
+    installStopHandlers(server);
     server.serveLoop();
+    stdout.writeln("hikari stopped");
+    stdout.flush();
     return 0;
+}
+
+private __gshared LoopbackHttpServer gStopTarget;
+
+version (Windows) {
+    import core.sys.windows.windef : BOOL, DWORD, FALSE, TRUE;
+
+    private extern (Windows) BOOL hikariConsoleCtrlHandler(DWORD ctrlType) nothrow @nogc {
+        enum : DWORD { CTRL_C = 0, CTRL_BREAK = 1, CTRL_CLOSE = 2, CTRL_LOGOFF = 5, CTRL_SHUTDOWN = 6 }
+        switch (ctrlType) {
+            case CTRL_LOGOFF:
+                // Delivered to service processes whenever ANY user signs out. hikari must
+                // keep running across sign-out and Fast User Switching, so swallow it.
+                return TRUE;
+            case CTRL_C, CTRL_BREAK, CTRL_CLOSE, CTRL_SHUTDOWN:
+                // WinSW stops its child by sending Ctrl+C; shut down cleanly.
+                if (gStopTarget !is null) gStopTarget.requestStop();
+                return TRUE;
+            default:
+                return FALSE;
+        }
+    }
+}
+
+private void installStopHandlers(LoopbackHttpServer server) {
+    gStopTarget = server;
+    version (Windows) {
+        import core.sys.windows.wincon : SetConsoleCtrlHandler;
+        SetConsoleCtrlHandler(&hikariConsoleCtrlHandler, TRUE);
+    }
 }
 
 private int cmdNodes(string[] args) {

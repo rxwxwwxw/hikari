@@ -9,6 +9,7 @@ import tests.core.test_config_serializer;
 import tests.platform.test_linux_parsers;
 import tests.platform.test_hardware_isa;
 import tests.platform.test_cross_platform;
+import tests.platform.test_windows_parsers;
 import tests.http.test_http_tailnet;
 import tests.update.test_update_lifecycle;
 
