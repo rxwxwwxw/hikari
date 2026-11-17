@@ -1,0 +1,6 @@
+.git
+.dub
+dist
+*.o
+*.tmp
+bin/hikari-test

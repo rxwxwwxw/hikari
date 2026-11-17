@@ -1,0 +1,10 @@
+FROM docker.io/library/archlinux:latest
+
+RUN sed -i 's/^CheckSpace/#CheckSpace/; s/^DownloadUser/#DownloadUser/' /etc/pacman.conf \
+    && pacman -Sy --noconfirm --needed bash curl tar python iproute2 shadow ca-certificates \
+    && pacman -Scc --noconfirm
+
+WORKDIR /workspace
+COPY . /workspace
+
+CMD ["bash", "-c", "bash tests/integration/linux/test-installer.sh && bash tests/integration/linux/test-services.sh"]

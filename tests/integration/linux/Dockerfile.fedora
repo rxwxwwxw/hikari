@@ -1,0 +1,9 @@
+FROM docker.io/library/fedora:41
+
+RUN dnf install -y bash curl tar python3 iproute shadow-utils ca-certificates \
+    && dnf clean all
+
+WORKDIR /workspace
+COPY . /workspace
+
+CMD ["bash", "-c", "bash tests/integration/linux/test-installer.sh && bash tests/integration/linux/test-services.sh"]

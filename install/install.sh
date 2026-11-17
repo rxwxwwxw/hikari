@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hikari Unix system installer (Linux systemd & macOS LaunchDaemons)
+# Linux: Fedora/dnf, Arch/CachyOS/pacman, Ubuntu/Mint/Armbian/Debian/apt
+# macOS: Intel x86_64 & Apple Silicon arm64 system-domain LaunchDaemons
+# Guarantees: non-destructive, idempotent, isolated hikari-caddy, preserves existing Caddy & Tailscale.
+
+CADDY_PINNED_VERSION="2.9.1"
+CADDY_SHA512_LINUX_AMD64="0412057ba591c33bdb66034d7f32209619ce635147dac3084c79abcbc118a761145e695199f57c6798d88fab077f2b0d9cb999f52ded904c6d464a4eba202932"
+CADDY_SHA512_LINUX_ARM64="80b917c2bd8aa0892f1386ff97af9e776067dd8cdc4793238869aca7e13f7280f89d1799a1fef08b49af92dbd86684c3ba7a38b9d44afc55ef2eeb33b49e1cbd"
+CADDY_SHA512_MAC_AMD64="41198e1ddd19ce6266395f740c2332d9bc29a9ad31670bf5692a92f17b4c04c4b90fce21b87e7f206c2c404b90542d58944b50d504d555bf530274f42009c32a"
+CADDY_SHA512_MAC_ARM64="246b4ab9755b584f81db37b640af806161da9e292277b17f4fa4f3da987da8f959d9b4cd763e0721e15f3680f530b445feac5f9ecfbefd33dc41b911eb5c8c45"
+
+DRY_RUN=0
+REPAIR=0
+SNIPPET_ONLY=0
+CADDY_SOURCE="auto" # auto | private | system-package | existing
+TAILNET_PORT="9100"
+LOOPBACK_PORT="19100"
+BASE_PATH="/"
+ROOT_PREFIX=""
+OS_RELEASE_PATH=""
+BINARY_SOURCE=""
+CADDY_BIN_OVERRIDE=""
+TAILSCALE_FIXTURE=""
+SYSTEMD_MODE="auto"
+TARGET_OS="auto" # auto | linux | macos
+SERVICE_USER="hikari"
+TRUST_REPO=""
+TRUST_PUBKEY=""
+ALLOW_ROOT_USER_SKIP=0
+
+usage() {
+  cat <<'EOF'
+Usage: install/install.sh [options]
+
+Options:
+  --dry-run                         Show planned changes without modifying files or services
+  --repair                          Reconcile generated units and Caddyfile; preserve user config/state
+  --snippet-only                    Write hikari-snippet.caddy only (no hikari-caddy service)
+  --caddy-source=<mode>             auto (default) | private | system-package | existing
+  --target-os=<auto|linux|macos>    Target OS layout (default: auto via uname -s)
+  --tailnet-port <port>             Tailnet HTTPS port (default: 9100)
+  --loopback-port <port>            Local D agent loopback port (default: 19100)
+  --base-path <path>                URL base path (default: /)
+  --binary-source <path>            Local hikari binary or .tar.gz release path
+  --caddy-bin <path>                Explicit Caddy executable path
+  --root <dir>                      Install under target root directory (for container/staging tests)
+  --os-release <path>               Alternate os-release file path (Linux testing)
+  --tailscale-fixture <path>        Tailscale status --json fixture (for offline tests)
+  --systemd-mode=<auto|skip>        Manage systemd/launchd services or skip activation (default: auto)
+  --service-mode=<auto|skip>        Alias for --systemd-mode
+  --repo <owner/repo>               Pinned GitHub release repository for signed updates
+  --pubkey <path>                   Trusted Ed25519 public key PEM path
+  -h, --help                        Show help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --repair) REPAIR=1; shift ;;
+    --snippet-only) SNIPPET_ONLY=1; shift ;;
+    --caddy-source=*) CADDY_SOURCE="${1#*=}"; shift ;;
+    --caddy-source) CADDY_SOURCE="${2:?}"; shift 2 ;;
+    --target-os=*) TARGET_OS="${1#*=}"; shift ;;
+    --target-os) TARGET_OS="${2:?}"; shift 2 ;;
+    --tailnet-port=*) TAILNET_PORT="${1#*=}"; shift ;;
+    --tailnet-port) TAILNET_PORT="${2:?}"; shift 2 ;;
+    --loopback-port=*) LOOPBACK_PORT="${1#*=}"; shift ;;
+    --loopback-port) LOOPBACK_PORT="${2:?}"; shift 2 ;;
+    --base-path=*) BASE_PATH="${1#*=}"; shift ;;
+    --base-path) BASE_PATH="${2:?}"; shift 2 ;;
+    --binary-source=*) BINARY_SOURCE="${1#*=}"; shift ;;
+    --binary-source) BINARY_SOURCE="${2:?}"; shift 2 ;;
+    --caddy-bin=*) CADDY_BIN_OVERRIDE="${1#*=}"; shift ;;
+    --caddy-bin) CADDY_BIN_OVERRIDE="${2:?}"; shift 2 ;;
+    --root=*) ROOT_PREFIX="${1#*=}"; shift ;;
+    --root) ROOT_PREFIX="${2:?}"; shift 2 ;;
+    --os-release=*) OS_RELEASE_PATH="${1#*=}"; shift ;;
+    --os-release) OS_RELEASE_PATH="${2:?}"; shift 2 ;;
+    --tailscale-fixture=*) TAILSCALE_FIXTURE="${1#*=}"; shift ;;
+    --tailscale-fixture) TAILSCALE_FIXTURE="${2:?}"; shift 2 ;;
+    --systemd-mode=*|--service-mode=*) SYSTEMD_MODE="${1#*=}"; shift ;;
+    --systemd-mode|--service-mode) SYSTEMD_MODE="${2:?}"; shift 2 ;;
+    --repo=*) TRUST_REPO="${1#*=}"; shift ;;
+    --repo) TRUST_REPO="${2:?}"; shift 2 ;;
+    --pubkey=*) TRUST_PUBKEY="${1#*=}"; shift ;;
+    --pubkey) TRUST_PUBKEY="${2:?}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ "$TARGET_OS" = "auto" ]; then
+  case "$(uname -s)" in
+    Darwin) TARGET_OS="macos" ;;
+    *) TARGET_OS="linux" ;;
+  esac
+fi
+
+case "$TARGET_OS" in
+  linux|macos) ;;
+  *) echo "Invalid --target-os: $TARGET_OS" >&2; exit 2 ;;
+esac
+
+case "$CADDY_SOURCE" in
+  auto|private|system-package|existing) ;;
+  *) echo "Invalid --caddy-source: $CADDY_SOURCE" >&2; exit 2 ;;
+esac
+
+if ! [[ "$TAILNET_PORT" =~ ^[0-9]+$ ]] || [ "$TAILNET_PORT" -lt 1 ] || [ "$TAILNET_PORT" -gt 65535 ]; then
+  echo "Invalid --tailnet-port: $TAILNET_PORT" >&2; exit 2
+fi
+if ! [[ "$LOOPBACK_PORT" =~ ^[0-9]+$ ]] || [ "$LOOPBACK_PORT" -lt 1 ] || [ "$LOOPBACK_PORT" -gt 65535 ]; then
+  echo "Invalid --loopback-port: $LOOPBACK_PORT" >&2; exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ -n "$ROOT_PREFIX" ]; then
+  ALLOW_ROOT_USER_SKIP=1
+fi
+
+UNAME_ARCH="$(uname -m)"
+case "$UNAME_ARCH" in
+  x86_64|amd64) ARCH="x86_64" ;;
+  aarch64|arm64) ARCH=$([ "$TARGET_OS" = "macos" ] && echo "arm64" || echo "aarch64") ;;
+  *) echo "Unsupported architecture: $UNAME_ARCH" >&2; exit 1 ;;
+esac
+
+# 1. OS & package manager detection
+DISTRO_ID="unknown"
+DISTRO_ID_LIKE=""
+PKG_FAMILY="unknown"
+BREW_BIN=""
+
+if [ "$TARGET_OS" = "macos" ]; then
+  DISTRO_ID="macos"
+  if [ -x /opt/homebrew/bin/brew ]; then
+    BREW_BIN="/opt/homebrew/bin/brew"
+  elif [ -x /usr/local/bin/brew ]; then
+    BREW_BIN="/usr/local/bin/brew"
+  elif command -v brew >/dev/null 2>&1; then
+    BREW_BIN="$(command -v brew)"
+  fi
+  PKG_FAMILY=$([ -n "$BREW_BIN" ] && echo "homebrew" || echo "none")
+
+  OPT_HIKARI="${ROOT_PREFIX}/opt/hikari"
+  VERSIONS_DIR="${OPT_HIKARI}/versions"
+  PRIVATE_BIN_DIR="${OPT_HIKARI}/bin"
+  ETC_HIKARI="${ROOT_PREFIX}/Library/Application Support/hikari"
+  VAR_HIKARI="${ROOT_PREFIX}/Library/Application Support/hikari/state"
+  REAL_ETC_HIKARI="/Library/Application Support/hikari"
+  REAL_VAR_HIKARI="/Library/Application Support/hikari/state"
+  UNIT_DIR="${ROOT_PREFIX}/Library/LaunchDaemons"
+  LOG_DIR="${ROOT_PREFIX}/var/log/hikari"
+  LOG_FILE="${LOG_DIR}/install.log"
+else
+  if [ -z "$OS_RELEASE_PATH" ]; then
+    if [ -n "$ROOT_PREFIX" ] && [ -f "$ROOT_PREFIX/etc/os-release" ]; then
+      OS_RELEASE_PATH="$ROOT_PREFIX/etc/os-release"
+    else
+      OS_RELEASE_PATH="/etc/os-release"
+    fi
+  fi
+
+  if [ -f "$OS_RELEASE_PATH" ]; then
+    DISTRO_ID=$(grep -E '^ID=' "$OS_RELEASE_PATH" | head -n1 | cut -d= -f2- | tr -d '"' | tr '[:upper:]' '[:lower:]' || true)
+    DISTRO_ID_LIKE=$(grep -E '^ID_LIKE=' "$OS_RELEASE_PATH" | head -n1 | cut -d= -f2- | tr -d '"' | tr '[:upper:]' '[:lower:]' || true)
+  fi
+
+  case " $DISTRO_ID $DISTRO_ID_LIKE " in
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) PKG_FAMILY="dnf" ;;
+    *" cachyos "*|*" arch "*|*" archlinux "*) PKG_FAMILY="pacman" ;;
+    *" ubuntu "*|*" debian "*|*" linuxmint "*|*" armbian "*|*" raspbian "*) PKG_FAMILY="apt" ;;
+    *) PKG_FAMILY="unknown" ;;
+  esac
+
+  OPT_HIKARI="${ROOT_PREFIX}/opt/hikari"
+  VERSIONS_DIR="${OPT_HIKARI}/versions"
+  PRIVATE_BIN_DIR="${OPT_HIKARI}/bin"
+  ETC_HIKARI="${ROOT_PREFIX}/etc/hikari"
+  VAR_HIKARI="${ROOT_PREFIX}/var/lib/hikari"
+  REAL_ETC_HIKARI="/etc/hikari"
+  REAL_VAR_HIKARI="/var/lib/hikari"
+  UNIT_DIR="${ROOT_PREFIX}/etc/systemd/system"
+  LOG_DIR="${ROOT_PREFIX}/var/log"
+  LOG_FILE="${LOG_DIR}/hikari-install.log"
+fi
+
+log() {
+  local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+  echo "$msg"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "$msg" >> "$LOG_FILE"
+  fi
+}
+
+compute_sha512() {
+  local file="$1"
+  if command -v sha512sum >/dev/null 2>&1; then
+    sha512sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 512 "$file" | awk '{print $1}'
+  else
+    echo "Neither sha512sum nor shasum found" >&2
+    return 1
+  fi
+}
+
+# 2. Elevation & preflight checks BEFORE modifying the host
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+  echo "System installation requires root privileges. Re-run with sudo or use --dry-run / --root <dir>." >&2
+  exit 1
+fi
+
+if [ -z "$BINARY_SOURCE" ]; then
+  if [ -x "$REPO_ROOT/bin/hikari" ]; then
+    BINARY_SOURCE="$REPO_ROOT/bin/hikari"
+  else
+    echo "No hikari binary found (pass --binary-source <path> or build with dub build --compiler=ldc2)." >&2
+    exit 1
+  fi
+fi
+
+if [ ! -e "$BINARY_SOURCE" ]; then
+  echo "Binary source not found: $BINARY_SOURCE" >&2
+  exit 1
+fi
+
+# 3. Port collision preflight
+check_port_free_or_hikari() {
+  local port="$1"
+  local label="$2"
+  if [ "$TARGET_OS" = "linux" ] && command -v ss >/dev/null 2>&1; then
+    local listeners
+    listeners=$(ss -H -ltn "sport = :$port" 2>/dev/null || true)
+    if [ -n "$listeners" ]; then
+      if [ "$REPAIR" -eq 1 ] && [ -f "$ETC_HIKARI/config.json" ]; then
+        return 0
+      fi
+      if [ -n "$ROOT_PREFIX" ] && [ "${HIKARI_TEST_CHECK_HOST_PORTS:-0}" = "1" ]; then
+        echo "Port conflict: $label port $port is already occupied:" >&2
+        echo "$listeners" >&2
+        exit 1
+      elif [ -z "$ROOT_PREFIX" ]; then
+        if ! systemctl is-active --quiet hikari.service 2>/dev/null && ! systemctl is-active --quiet hikari-caddy.service 2>/dev/null; then
+          echo "Port conflict: $label port $port is already in use by another process." >&2
+          echo "$listeners" >&2
+          exit 1
+        fi
+      fi
+    fi
+  elif [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ] && command -v lsof >/dev/null 2>&1; then
+    if [ "$REPAIR" -eq 0 ] && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "Port conflict: $label port $port is already in use." >&2
+      exit 1
+    fi
+  fi
+}
+
+check_port_free_or_hikari "$LOOPBACK_PORT" "loopback"
+if [ "$SNIPPET_ONLY" -eq 0 ]; then
+  check_port_free_or_hikari "$TAILNET_PORT" "tailnet"
+fi
+
+# 4. Tailscale CLI & macOS variant preflight (read-only)
+TAILSCALE_BIN=""
+if [ -z "$TAILSCALE_FIXTURE" ]; then
+  if command -v tailscale >/dev/null 2>&1; then
+    TAILSCALE_BIN="$(command -v tailscale)"
+  elif [ "$TARGET_OS" = "macos" ] && [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+    TAILSCALE_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  fi
+fi
+
+TS_JSON=""
+if [ -n "$TAILSCALE_FIXTURE" ]; then
+  if [ ! -f "$TAILSCALE_FIXTURE" ]; then
+    echo "Tailscale fixture not found: $TAILSCALE_FIXTURE" >&2; exit 1
+  fi
+  TS_JSON=$(cat "$TAILSCALE_FIXTURE")
+elif [ -n "$TAILSCALE_BIN" ]; then
+  TS_JSON=$("$TAILSCALE_BIN" status --json 2>/dev/null || true)
+fi
+
+TS_FQDN=""
+TS_IP=""
+if [ -n "$TS_JSON" ] && command -v python3 >/dev/null 2>&1; then
+  read -r TS_FQDN TS_IP < <(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    s = d.get("Self", {})
+    fq = (s.get("DNSName") or "").rstrip(".")
+    ips = s.get("TailscaleIPs") or []
+    print(fq, ips[0] if ips else "")
+except Exception:
+    print("", "")
+' <<< "$TS_JSON") || true
+fi
+
+# 5. Caddy binary resolution (never modify pre-existing Caddy service/config or brew services!)
+RESOLVED_CADDY_BIN=""
+CADDY_ORIGIN="none"
+
+detect_existing_caddy() {
+  if [ -n "$CADDY_BIN_OVERRIDE" ] && [ -x "$CADDY_BIN_OVERRIDE" ]; then
+    RESOLVED_CADDY_BIN="$CADDY_BIN_OVERRIDE"
+    CADDY_ORIGIN="explicit"
+    return 0
+  fi
+  if [ -x "$PRIVATE_BIN_DIR/caddy" ]; then
+    RESOLVED_CADDY_BIN="$PRIVATE_BIN_DIR/caddy"
+    CADDY_ORIGIN="private"
+    return 0
+  fi
+  if [ "$TARGET_OS" = "macos" ]; then
+    for cand in /opt/homebrew/bin/caddy /usr/local/bin/caddy; do
+      if [ -x "$cand" ] && "$cand" version >/dev/null 2>&1; then
+        RESOLVED_CADDY_BIN="$cand"
+        CADDY_ORIGIN="existing_homebrew_readonly"
+        return 0
+      fi
+    done
+  fi
+  if command -v caddy >/dev/null 2>&1; then
+    local sys_caddy
+    sys_caddy="$(command -v caddy)"
+    if "$sys_caddy" version >/dev/null 2>&1; then
+      RESOLVED_CADDY_BIN="$sys_caddy"
+      CADDY_ORIGIN="existing_system_binary_readonly"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+install_private_caddy() {
+  local target="$PRIVATE_BIN_DIR/caddy"
+  local url expected_sha carch cos
+  if [ "$TARGET_OS" = "macos" ]; then
+    cos="mac"
+    if [ "$ARCH" = "x86_64" ]; then
+      carch="amd64"
+      expected_sha="$CADDY_SHA512_MAC_AMD64"
+    else
+      carch="arm64"
+      expected_sha="$CADDY_SHA512_MAC_ARM64"
+    fi
+  else
+    cos="linux"
+    if [ "$ARCH" = "x86_64" ]; then
+      carch="amd64"
+      expected_sha="$CADDY_SHA512_LINUX_AMD64"
+    else
+      carch="arm64"
+      expected_sha="$CADDY_SHA512_LINUX_ARM64"
+    fi
+  fi
+  url="https://github.com/caddyserver/caddy/releases/download/v${CADDY_PINNED_VERSION}/caddy_${CADDY_PINNED_VERSION}_${cos}_${carch}.tar.gz"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] Would download and verify Caddy v${CADDY_PINNED_VERSION} (${cos}_${carch}) into $target"
+    RESOLVED_CADDY_BIN="$target"
+    CADDY_ORIGIN="private_planned"
+    return 0
+  fi
+
+  mkdir -p "$PRIVATE_BIN_DIR"
+  local tmp_tgz
+  tmp_tgz=$(mktemp)
+  trap 'rm -f "$tmp_tgz"' RETURN
+
+  log "Downloading pinned Caddy v${CADDY_PINNED_VERSION} (${cos}_${carch}) to private directory..."
+  curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 "$url" -o "$tmp_tgz"
+  local actual_sha
+  actual_sha=$(compute_sha512 "$tmp_tgz")
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    echo "Caddy checksum verification failed! expected=$expected_sha actual=$actual_sha" >&2
+    exit 1
+  fi
+  tar -xzf "$tmp_tgz" -C "$PRIVATE_BIN_DIR" caddy
+  chmod 0755 "$target"
+  RESOLVED_CADDY_BIN="$target"
+  CADDY_ORIGIN="private"
+}
+
+if [ "$SNIPPET_ONLY" -eq 0 ]; then
+  case "$CADDY_SOURCE" in
+    auto)
+      if ! detect_existing_caddy; then
+        install_private_caddy
+      fi
+      ;;
+    existing)
+      if ! detect_existing_caddy; then
+        echo "No compatible existing Caddy executable found (--caddy-source=existing)." >&2
+        exit 1
+      fi
+      ;;
+    private)
+      if [ -n "$CADDY_BIN_OVERRIDE" ] && [ -x "$CADDY_BIN_OVERRIDE" ]; then
+        RESOLVED_CADDY_BIN="$CADDY_BIN_OVERRIDE"
+        CADDY_ORIGIN="private_override"
+      elif [ -x "$PRIVATE_BIN_DIR/caddy" ]; then
+        RESOLVED_CADDY_BIN="$PRIVATE_BIN_DIR/caddy"
+        CADDY_ORIGIN="private"
+      else
+        install_private_caddy
+      fi
+      ;;
+    system-package)
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] Would install caddy package via $PKG_FAMILY without enabling system caddy service"
+        RESOLVED_CADDY_BIN=$([ "$TARGET_OS" = "macos" ] && echo "/opt/homebrew/bin/caddy" || echo "/usr/bin/caddy")
+        CADDY_ORIGIN="system_package_planned"
+      else
+        case "$PKG_FAMILY" in
+          dnf) dnf install -y caddy ;;
+          pacman) pacman -S --noconfirm --needed caddy ;;
+          apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y caddy ;;
+          homebrew)
+            if [ -z "${SUDO_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
+              echo "Refusing to run brew install as root without SUDO_USER." >&2; exit 1
+            fi
+            if [ -n "${SUDO_USER:-}" ]; then
+              su - "$SUDO_USER" -c "$BREW_BIN install caddy"
+            else
+              "$BREW_BIN" install caddy
+            fi
+            ;;
+          *) echo "Unsupported package manager ($PKG_FAMILY) for --caddy-source=system-package" >&2; exit 1 ;;
+        esac
+        detect_existing_caddy || true
+        CADDY_ORIGIN="system_package"
+      fi
+      ;;
+  esac
+fi
+
+echo "=== hikari ($TARGET_OS) Install Plan ==="
+echo "  Distro/OS:      id=$DISTRO_ID like='$DISTRO_ID_LIKE' pkg=$PKG_FAMILY arch=$ARCH"
+echo "  Target root:    ${ROOT_PREFIX:-/}"
+echo "  Release dir:    $VERSIONS_DIR"
+echo "  Config dir:     $ETC_HIKARI (existing user config preserved)"
+echo "  State dir:      $VAR_HIKARI (existing nodes/hardware/certs preserved)"
+echo "  Mode:           $([ "$SNIPPET_ONLY" -eq 1 ] && echo 'snippet-only' || echo 'isolated hikari + hikari-caddy')"
+echo "  Ports:          tailnet=$TAILNET_PORT loopback=127.0.0.1:$LOOPBACK_PORT base_path=$BASE_PATH"
+echo "  Caddy binary:   ${RESOLVED_CADDY_BIN:-none} ($CADDY_ORIGIN)"
+echo "  Tailscale FQDN: ${TS_FQDN:-<not yet detected>} (IP: ${TS_IP:-<none>})"
+echo "  Service mode:   $SYSTEMD_MODE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[dry-run] Preflight succeeded; no changes written."
+  exit 0
+fi
+
+# 6. Service account (Linux only unless already present) & directory tree
+if [ "$TARGET_OS" = "linux" ] && [ "$ALLOW_ROOT_USER_SKIP" -eq 0 ] && ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  log "Creating restricted system service user '$SERVICE_USER'..."
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
+    || useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
+fi
+
+mkdir -p "$VERSIONS_DIR" "$ETC_HIKARI" "$VAR_HIKARI/caddy" "$UNIT_DIR" "$LOG_DIR"
+
+# 7. Install versioned release directory
+APP_VERSION=$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "0.1.0")
+REL_DIR="$VERSIONS_DIR/$APP_VERSION"
+STAGING_DIR="$VERSIONS_DIR/.install-tmp-$APP_VERSION"
+rm -rf "$STAGING_DIR"
+mkdir -p "$STAGING_DIR/web" "$STAGING_DIR/caddy"
+
+if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
+  tar -xzf "$BINARY_SOURCE" -C "$STAGING_DIR"
+else
+  cp "$BINARY_SOURCE" "$STAGING_DIR/hikari"
+  chmod 0755 "$STAGING_DIR/hikari"
+  cp "$REPO_ROOT/web/index.html" "$STAGING_DIR/web/index.html"
+  cp "$REPO_ROOT/caddy/Caddyfile.tmpl" "$STAGING_DIR/caddy/Caddyfile.tmpl"
+  cp "$REPO_ROOT/caddy/snippet.caddy.tmpl" "$STAGING_DIR/caddy/snippet.caddy.tmpl"
+  cp "$REPO_ROOT/VERSION" "$STAGING_DIR/VERSION"
+fi
+
+if [ ! -x "$STAGING_DIR/hikari" ]; then
+  echo "Installed binary missing or not executable in $STAGING_DIR/hikari" >&2
+  rm -rf "$STAGING_DIR"
+  exit 1
+fi
+
+rm -rf "$REL_DIR"
+mv "$STAGING_DIR" "$REL_DIR"
+
+if [ -L "$VERSIONS_DIR/current" ]; then
+  OLD_TARGET=$(readlink "$VERSIONS_DIR/current" || true)
+  if [ -n "$OLD_TARGET" ] && [ "$OLD_TARGET" != "$REL_DIR" ] && [ -d "$OLD_TARGET" ]; then
+    ln -sfn "$OLD_TARGET" "$VERSIONS_DIR/previous"
+  fi
+fi
+ln -sfn "$REL_DIR" "$VERSIONS_DIR/current"
+log "Installed hikari $APP_VERSION to $REL_DIR"
+
+# 8. Write default config.json ONLY if missing
+CONFIG_PATH="$ETC_HIKARI/config.json"
+if [ ! -f "$CONFIG_PATH" ]; then
+  cat > "$CONFIG_PATH" <<EOF
+{
+  "schema_version": 1,
+  "listen": {
+    "tailnet_port": ${TAILNET_PORT},
+    "loopback_port": ${LOOPBACK_PORT},
+    "loopback_bind": "127.0.0.1",
+    "base_path": "${BASE_PATH}"
+  },
+  "collection": {
+    "ttl_seconds": {
+      "fast": 10,
+      "processes": 20,
+      "device_dynamic": 60,
+      "filesystems": 120,
+      "tailnet": 300,
+      "maintenance": 43200,
+      "hardware": 604800
+    },
+    "max_stale_seconds": {
+      "fast": 60,
+      "processes": 120,
+      "device_dynamic": 600,
+      "filesystems": 1200,
+      "tailnet": 3600,
+      "maintenance": 604800,
+      "hardware": 2592000
+    },
+    "cold_wait_ms": 2000,
+    "probe_timeout_ms": 5000
+  },
+  "discovery": {
+    "enabled_on_dashboard_open": true,
+    "max_concurrent_probes": 4,
+    "probe_timeout_ms": 3000
+  },
+  "updates": {
+    "repo": "${TRUST_REPO:-OWNER/REPO}",
+    "mode": "on_dashboard_open",
+    "auto_install_verified": true,
+    "check_interval_hours": 24,
+    "public_key": "${TRUST_PUBKEY}",
+    "channel": "stable"
+  },
+  "privacy": {
+    "expose_serials": false,
+    "expose_mac_addresses": false
+  },
+  "paths": {
+    "state_dir": "${REAL_VAR_HIKARI}",
+    "config_dir": "${REAL_ETC_HIKARI}",
+    "versions_dir": "/opt/hikari/versions",
+    "web_dir": "/opt/hikari/versions/current/web"
+  }
+}
+EOF
+  chmod 0644 "$CONFIG_PATH"
+  log "Created initial configuration at $CONFIG_PATH"
+else
+  log "Preserved existing user configuration at $CONFIG_PATH"
+fi
+
+# 9. Render hikari-owned Caddy config or snippet
+if [ "$SNIPPET_ONLY" -eq 1 ]; then
+  SNIPPET_PATH="$ETC_HIKARI/hikari-snippet.caddy"
+  "$REL_DIR/hikari" caddy snippet \
+    --config "$CONFIG_PATH" \
+    --template "$REL_DIR/caddy/snippet.caddy.tmpl" \
+    --out "$SNIPPET_PATH"
+  log "Generated Caddy import snippet at $SNIPPET_PATH"
+else
+  if [ -n "$TS_FQDN" ] && [ -n "$TS_IP" ]; then
+    CADDYFILE_PATH="$ETC_HIKARI/Caddyfile"
+    if [ -f "$CADDYFILE_PATH" ]; then
+      cp "$CADDYFILE_PATH" "${CADDYFILE_PATH}.bak"
+    fi
+    "$REL_DIR/hikari" caddy render \
+      --config "$CONFIG_PATH" \
+      --template "$REL_DIR/caddy/Caddyfile.tmpl" \
+      --fqdn "$TS_FQDN" \
+      --tailscale-ip "$TS_IP" \
+      --out "$CADDYFILE_PATH"
+    if [ -x "$RESOLVED_CADDY_BIN" ]; then
+      if "$RESOLVED_CADDY_BIN" validate --adapter caddyfile --config "$CADDYFILE_PATH" >/dev/null 2>&1; then
+        log "Validated isolated Caddyfile at $CADDYFILE_PATH"
+      else
+        echo "Generated Caddyfile failed validation with $RESOLVED_CADDY_BIN" >&2
+        exit 1
+      fi
+    fi
+  else
+    log "Tailscale FQDN/IP unavailable during install; skipping Caddyfile bind until Tailscale is online."
+  fi
+fi
+
+# 10. Generate system-domain service definitions (systemd on Linux, LaunchDaemons on macOS)
+if [ "$TARGET_OS" = "macos" ]; then
+  cat > "$UNIT_DIR/io.hikari.agent.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.hikari.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/hikari/versions/current/hikari</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>/Library/Application Support/hikari/config.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/hikari/agent.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/hikari/agent.stderr.log</string>
+</dict>
+</plist>
+EOF
+  chmod 0644 "$UNIT_DIR/io.hikari.agent.plist"
+
+  if [ "$SNIPPET_ONLY" -eq 0 ]; then
+    cat > "$UNIT_DIR/io.hikari.caddy.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.hikari.caddy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${RESOLVED_CADDY_BIN}</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/Library/Application Support/hikari/Caddyfile</string>
+    <string>--adapter</string>
+    <string>caddyfile</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/var/log/hikari/caddy.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/hikari/caddy.stderr.log</string>
+</dict>
+</plist>
+EOF
+    chmod 0644 "$UNIT_DIR/io.hikari.caddy.plist"
+  fi
+
+  if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
+    launchctl bootout system/io.hikari.agent 2>/dev/null || true
+    launchctl bootstrap system "$UNIT_DIR/io.hikari.agent.plist"
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
+      launchctl bootout system/io.hikari.caddy 2>/dev/null || true
+      launchctl bootstrap system "$UNIT_DIR/io.hikari.caddy.plist"
+    fi
+    log "Loaded system-domain LaunchDaemons via launchctl"
+  else
+    log "Skipped launchctl activation (service-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
+  fi
+else
+  cat > "$UNIT_DIR/hikari.service" <<EOF
+[Unit]
+Description=hikari tailnet telemetry and hardware inventory agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_USER}
+ExecStart=/opt/hikari/versions/current/hikari serve --config /etc/hikari/config.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/hikari
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if [ "$SNIPPET_ONLY" -eq 0 ]; then
+    cat > "$UNIT_DIR/hikari-caddy.service" <<EOF
+[Unit]
+Description=hikari isolated Tailscale HTTPS reverse proxy (Caddy)
+After=network-online.target tailscaled.service hikari.service
+Wants=network-online.target tailscaled.service hikari.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=${RESOLVED_CADDY_BIN} run --config /etc/hikari/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  if [ "$ALLOW_ROOT_USER_SKIP" -eq 0 ]; then
+    chown -R "${SERVICE_USER}:${SERVICE_USER}" "$VAR_HIKARI"
+    chown root:"${SERVICE_USER}" "$CONFIG_PATH"
+    chmod 0640 "$CONFIG_PATH"
+  fi
+
+  if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable --now hikari.service
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
+      systemctl enable --now hikari-caddy.service
+    fi
+    log "Enabled and started hikari systemd units"
+  else
+    log "Skipped systemctl activation (systemd-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
+  fi
+fi
+
+# 12. Final operator report
+echo ""
+echo "=== hikari installation complete ($TARGET_OS) ==="
+echo "  Version:          $APP_VERSION"
+echo "  Loopback API:     http://127.0.0.1:${LOOPBACK_PORT}/healthz"
+if [ "$SNIPPET_ONLY" -eq 1 ]; then
+  echo "  Caddy snippet:    $ETC_HIKARI/hikari-snippet.caddy"
+  echo "  Action needed:    Add 'import ${REAL_ETC_HIKARI}/hikari-snippet.caddy' inside your existing Caddy site block."
+else
+  echo "  Caddy executable: $RESOLVED_CADDY_BIN ($CADDY_ORIGIN)"
+  echo "  Caddy config:     $ETC_HIKARI/Caddyfile"
+  if [ -n "$TS_FQDN" ]; then
+    BP_CLEAN="${BASE_PATH%/}"
+    echo "  Dashboard URL:    https://${TS_FQDN}:${TAILNET_PORT}${BP_CLEAN}/"
+  else
+    echo "  Dashboard URL:    Run 'hikari doctor' once Tailscale is logged in to render Caddyfile with your .ts.net FQDN."
+  fi
+fi
+echo "  Install log:      $LOG_FILE"
+echo "  Recovery/status:  hikari doctor"

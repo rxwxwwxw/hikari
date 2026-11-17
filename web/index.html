@@ -1,0 +1,1607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hikari — Tailnet Fleet Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-card: #1b212b;
+    --bg-hover: #212835;
+    --border: #2d3644;
+    --border-strong: #3f4b5e;
+    --text: #e6edf3;
+    --text-muted: #9aa5b5;
+    --text-dim: #707d91;
+    --accent: #58a6ff;
+    --accent-dim: rgba(88, 166, 255, 0.14);
+    --ok: #3fb950;
+    --ok-dim: rgba(63, 185, 80, 0.15);
+    --warn: #d29922;
+    --warn-dim: rgba(210, 153, 34, 0.15);
+    --err: #f85149;
+    --err-dim: rgba(248, 81, 73, 0.16);
+    --info: #a371f7;
+    --info-dim: rgba(163, 113, 247, 0.15);
+    --muted-badge: rgba(154, 165, 181, 0.14);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, sans-serif;
+    --radius: 8px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+
+  button, input, select {
+    font: inherit;
+    color: inherit;
+  }
+
+  .app-shell {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px 20px 40px;
+  }
+
+  .topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, #58a6ff 0%, #3fb950 100%);
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    color: #0b0f14;
+    font-size: 15px;
+  }
+
+  .brand-title {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .brand-sub {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.12s, border-color 0.12s;
+  }
+
+  .btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+  .btn:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .btn-primary {
+    background: var(--accent-dim);
+    border-color: rgba(88, 166, 255, 0.45);
+    color: #9ecbff;
+  }
+
+  .select, .input {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
+
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .kpi-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+  }
+
+  .kpi-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .kpi-value {
+    font-size: 22px;
+    font-weight: 600;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 12px;
+    align-items: center;
+  }
+
+  .toolbar .input {
+    flex: 1 1 240px;
+    min-width: 180px;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .badge-ok { background: var(--ok-dim); color: #6fe381; border-color: rgba(63, 185, 80, 0.3); }
+  .badge-warn { background: var(--warn-dim); color: #f0be4d; border-color: rgba(210, 153, 34, 0.32); }
+  .badge-err { background: var(--err-dim); color: #ff8e87; border-color: rgba(248, 81, 73, 0.35); }
+  .badge-info { background: var(--info-dim); color: #caa8ff; border-color: rgba(163, 113, 247, 0.35); }
+  .badge-muted { background: var(--muted-badge); color: var(--text-muted); border-color: var(--border); }
+
+  .table-wrap {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow-x: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 920px;
+  }
+
+  th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+
+  tr.host-row {
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  tr.host-row:hover { background: var(--bg-hover); }
+  tr.host-row.selected { background: rgba(88, 166, 255, 0.1); }
+  tr.host-row:last-child td { border-bottom: none; }
+
+  .host-title { font-weight: 600; color: var(--text); }
+  .host-sub { font-size: 12px; color: var(--text-muted); font-family: var(--mono); }
+  .muted { color: var(--text-muted); }
+  .dim { color: var(--text-dim); }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .meter {
+    width: 108px;
+    height: 6px;
+    border-radius: 3px;
+    background: #27303f;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .meter-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent);
+  }
+  .meter-fill.warn { background: var(--warn); }
+  .meter-fill.err { background: var(--err); }
+  .meter-fill.ok { background: var(--ok); }
+
+  .detail-panel {
+    margin-top: 18px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .detail-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-card);
+  }
+
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+  }
+
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 10px 14px;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .detail-body {
+    padding: 16px 18px;
+  }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .card-title {
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .kv-list {
+    display: grid;
+    grid-template-columns: minmax(110px, auto) 1fr;
+    gap: 6px 14px;
+    font-size: 13px;
+  }
+  .kv-k { color: var(--text-muted); }
+  .kv-v { font-weight: 500; word-break: break-word; }
+
+  .isa-summary {
+    font-size: 13px;
+    color: #9ecbff;
+    background: var(--accent-dim);
+    border: 1px solid rgba(88, 166, 255, 0.25);
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+  }
+
+  .chip-group { margin-top: 10px; }
+  .chip-group-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  .chip-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    font-size: 12px;
+    font-family: var(--mono);
+    background: #232b38;
+    border: 1px solid var(--border);
+    cursor: help;
+  }
+  .chip.disabled-isa {
+    opacity: 0.55;
+    border-style: dashed;
+  }
+
+  .sub-item {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin-top: 10px;
+  }
+  .sub-item:first-child {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+  }
+
+  .banner {
+    padding: 10px 14px;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+  }
+  .banner-warn { border-color: rgba(210, 153, 34, 0.45); background: var(--warn-dim); }
+  .banner-err { border-color: rgba(248, 81, 73, 0.45); background: var(--err-dim); }
+
+  @media (max-width: 780px) {
+    .app-shell { padding: 12px; }
+    .card-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">H</div>
+      <div>
+        <div class="brand-title">hikari</div>
+        <div class="brand-sub" id="poll-status-text">On-demand tailnet fleet telemetry &amp; hardware inventory</div>
+      </div>
+    </div>
+    <div class="controls">
+      <label class="muted" for="interval-select">Refresh:</label>
+      <select id="interval-select" class="select" aria-label="Auto-refresh interval">
+        <option value="5000">5s</option>
+        <option value="15000" selected>15s</option>
+        <option value="30000">30s</option>
+        <option value="60000">60s</option>
+        <option value="0">Off</option>
+      </select>
+      <button type="button" id="refresh-now-btn" class="btn btn-primary">Refresh now</button>
+      <button type="button" id="discover-btn" class="btn">Scan peers</button>
+    </div>
+  </header>
+
+  <section class="kpi-grid" aria-label="Fleet summary">
+    <div class="kpi-card">
+      <div class="kpi-label">Known hosts</div>
+      <div class="kpi-value" id="kpi-total">0</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Online</div>
+      <div class="kpi-value" id="kpi-online" style="color:var(--ok)">0</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Unreachable / Offline</div>
+      <div class="kpi-value" id="kpi-offline" style="color:var(--text-muted)">0</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Stale / Warnings</div>
+      <div class="kpi-value" id="kpi-stale" style="color:var(--warn)">0</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Reboot required</div>
+      <div class="kpi-value" id="kpi-reboot" style="color:var(--info)">0</div>
+    </div>
+  </section>
+
+  <section class="toolbar" aria-label="Filter and sort fleet">
+    <input id="search-input" class="input" type="search" placeholder="Filter by alias, hostname, OS, or CPU..." aria-label="Filter hosts">
+    <select id="status-filter" class="select" aria-label="Filter by state">
+      <option value="all">All hosts</option>
+      <option value="online">Online only</option>
+      <option value="offline">Unreachable / Offline</option>
+      <option value="reboot">Reboot required</option>
+    </select>
+    <select id="sort-select" class="select" aria-label="Sort hosts">
+      <option value="name">Sort: Name</option>
+      <option value="cpu">Sort: CPU %</option>
+      <option value="ram">Sort: RAM %</option>
+      <option value="disk">Sort: Disk %</option>
+      <option value="seen">Sort: Last seen</option>
+    </select>
+  </section>
+
+  <div id="fleet-banner" class="banner" style="display:none"></div>
+
+  <div class="table-wrap">
+    <table aria-label="Fleet nodes">
+      <thead>
+        <tr>
+          <th>Machine</th>
+          <th>OS / Arch</th>
+          <th>Status &amp; Freshness</th>
+          <th>CPU</th>
+          <th>Memory</th>
+          <th>Max Disk</th>
+          <th>Network Rate</th>
+          <th>Extras</th>
+          <th>Last Contact</th>
+        </tr>
+      </thead>
+      <tbody id="fleet-tbody">
+        <tr><td colspan="9" class="muted">Loading known hosts...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <section id="detail-panel" class="detail-panel" style="display:none" aria-live="polite">
+    <div class="detail-header">
+      <div>
+        <div id="detail-title" style="font-size:16px;font-weight:600"></div>
+        <div id="detail-subtitle" class="host-sub"></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="detail-badges"></span>
+        <button type="button" id="close-detail-btn" class="btn">Close</button>
+      </div>
+    </div>
+    <div class="tabs" role="tablist">
+      <button type="button" class="tab-btn active" role="tab" data-tab="overview">Overview</button>
+      <button type="button" class="tab-btn" role="tab" data-tab="hardware">Hardware</button>
+      <button type="button" class="tab-btn" role="tab" data-tab="storage">Storage &amp; Network</button>
+      <button type="button" class="tab-btn" role="tab" data-tab="processes">Processes &amp; Maintenance</button>
+    </div>
+    <div id="detail-body" class="detail-body"></div>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const ISA_GLOSSARY = {
+    sse: ["SSE", "Vector/SIMD", "128-bit single-precision SIMD"],
+    sse2: ["SSE2", "Vector/SIMD", "Baseline x86-64 128-bit SIMD"],
+    sse3: ["SSE3", "Vector/SIMD", "Horizontal vector arithmetic"],
+    ssse3: ["SSSE3", "Vector/SIMD", "Supplemental byte-shuffle SIMD"],
+    sse4_1: ["SSE4.1", "Vector/SIMD", "Dot products & vector blending"],
+    sse4_2: ["SSE4.2", "Vector/SIMD", "Hardware CRC32C & string ops"],
+    avx: ["AVX", "Vector/SIMD", "256-bit floating-point SIMD (requires OS XSAVE)"],
+    avx2: ["AVX2", "Vector/SIMD", "256-bit integer SIMD & gather"],
+    fma: ["FMA3", "Vector/SIMD", "Fused multiply-add vector instructions"],
+    f16c: ["F16C", "Vector/SIMD", "FP16 vector conversion"],
+    avx512f: ["AVX-512F", "Vector/SIMD", "512-bit AVX-512 foundation"],
+    avx512dq: ["AVX-512DQ", "Vector/SIMD", "AVX-512 double/quadword ops"],
+    avx512bw: ["AVX-512BW", "Vector/SIMD", "AVX-512 byte/word ops"],
+    avx512vl: ["AVX-512VL", "Vector/SIMD", "AVX-512 128/256-bit masking"],
+    avx512vnni: ["AVX-512 VNNI", "Vector/SIMD", "INT8 AI dot-product acceleration"],
+    avx512bf16: ["AVX-512 BF16", "Vector/SIMD", "BFloat16 vector math"],
+    avx_vnni: ["AVX-VNNI", "Vector/SIMD", "256-bit INT8 dot-product acceleration"],
+    aes: ["AES-NI", "Cryptography", "Hardware AES encryption/decryption"],
+    pclmulqdq: ["PCLMULQDQ", "Cryptography", "Carry-less multiply for GCM/CRC"],
+    vaes: ["VAES", "Cryptography", "Vectorized 256/512-bit AES"],
+    vpclmulqdq: ["VPCLMULQDQ", "Cryptography", "Vectorized carry-less multiply"],
+    sha: ["SHA-NI", "Cryptography", "Hardware SHA-1 / SHA-256"],
+    rdrand: ["RDRAND", "Cryptography", "Hardware RNG instruction"],
+    rdseed: ["RDSEED", "Cryptography", "Cryptographic entropy seed"],
+    bmi1: ["BMI1", "Bit manipulation", "Bit manipulation set 1"],
+    bmi2: ["BMI2", "Bit manipulation", "PDEP/PEXT/MULX bit ops"],
+    adx: ["ADX", "Bit manipulation", "Multi-precision carry arithmetic"],
+    popcnt: ["POPCNT", "Bit manipulation", "Population bit count"],
+    lzcnt: ["LZCNT", "Bit manipulation", "Leading-zero bit count"],
+    vmx: ["Intel VT-x", "Virtualization", "Intel hardware virtualization"],
+    svm: ["AMD-V", "Virtualization", "AMD hardware virtualization"],
+    fp: ["FP", "Vector/SIMD", "ARM64 floating-point unit"],
+    asimd: ["NEON (ASIMD)", "Vector/SIMD", "ARM64 128-bit Advanced SIMD"],
+    asimddp: ["DotProd", "Vector/SIMD", "ARM64 INT8 vector dot product"],
+    sve: ["SVE", "Vector/SIMD", "ARM64 Scalable Vector Extension"],
+    sve2: ["SVE2", "Vector/SIMD", "ARM64 Scalable Vector Extension v2"],
+    bf16: ["BF16", "Vector/SIMD", "ARM64 BFloat16 arithmetic"],
+    i8mm: ["I8MM", "Vector/SIMD", "ARM64 Int8 matrix multiplication"],
+    pmull: ["PMULL", "Cryptography", "ARM64 polynomial multiply for GCM"],
+    sha1: ["SHA1", "Cryptography", "ARM64 hardware SHA-1"],
+    sha2: ["SHA256", "Cryptography", "ARM64 hardware SHA-256"],
+    sha3: ["SHA3", "Cryptography", "ARM64 hardware SHA-3"],
+    crc32: ["CRC32", "Bit manipulation", "ARM64 hardware CRC32 checksum"],
+    atomics: ["LSE Atomics", "Other", "ARM64 large system atomic primitives"],
+    rng: ["RNDR", "Cryptography", "ARM64 hardware random generator"],
+    xsave: ["XSAVE", "Other", "Extended processor state save/restore"],
+    osxsave: ["OSXSAVE", "Other", "OS-enabled XSAVE/XCR0 state"],
+  };
+
+  const state = {
+    nodes: [],
+    statusByNode: new Map(), // node_id -> { state, httpStatus, data, error, fetchedAtMs }
+    hardwareByNode: new Map(), // node_id -> { loading, data, error, fetchedAtMs }
+    selectedNodeId: null,
+    activeTab: "overview",
+    showVirtualNics: false,
+    isaFilter: "",
+    pollIntervalMs: 15000,
+    pollTimer: null,
+    activeControllers: new Set(),
+    isPolling: false,
+  };
+
+  // Pure formatting & URL helpers
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      for (const [k, v] of Object.entries(attrs)) {
+        if (v === null || v === undefined) continue;
+        if (k === "className") node.className = v;
+        else if (k === "text") node.textContent = String(v);
+        else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
+        else node.setAttribute(k, String(v));
+      }
+    }
+    if (children) {
+      for (const c of Array.isArray(children) ? children : [children]) {
+        if (c === null || c === undefined) continue;
+        node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+      }
+    }
+    return node;
+  }
+
+  function formatBytes(bytes) {
+    if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return "—";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let val = Number(bytes);
+    let idx = 0;
+    while (val >= 1024 && idx < units.length - 1) {
+      val /= 1024;
+      idx++;
+    }
+    return (idx === 0 ? val.toFixed(0) : val.toFixed(1)) + " " + units[idx];
+  }
+
+  function formatRate(bps) {
+    if (bps === null || bps === undefined || !Number.isFinite(bps)) return "—";
+    return formatBytes(bps) + "/s";
+  }
+
+  function formatPct(p) {
+    if (p === null || p === undefined || !Number.isFinite(p)) return "—";
+    return Number(p).toFixed(1) + "%";
+  }
+
+  function formatDuration(sec) {
+    if (sec === null || sec === undefined || !Number.isFinite(sec)) return "—";
+    const s = Math.max(0, Math.floor(sec));
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    if (h < 48) return h + "h " + (m % 60) + "m";
+    const d = Math.floor(h / 24);
+    return d + "d " + (h % 24) + "h";
+  }
+
+  function formatTs(unixSec) {
+    if (!unixSec) return "Never";
+    const nowS = Math.floor(Date.now() / 1000);
+    const diff = nowS - unixSec;
+    if (diff >= 0 && diff < 3600) return formatDuration(diff) + " ago";
+    try {
+      return new Date(unixSec * 1000).toLocaleString();
+    } catch (_) {
+      return String(unixSec);
+    }
+  }
+
+  function resolveEndpointUrl(node, kind) {
+    const rel = kind === "status" ? "./api/v1/status" : "./api/v1/hardware";
+    if (!node) return rel;
+    const raw = kind === "status" ? node.status_url : node.hardware_url;
+    if (node.is_self) {
+      if (!raw || (typeof window !== "undefined" && window.location && window.location.protocol === "http:")) {
+        return rel;
+      }
+    }
+    if (raw && (raw.startsWith("https://") || raw.startsWith("./") || raw.startsWith("/"))) {
+      return raw;
+    }
+    return rel;
+  }
+
+  function abortAllRequests() {
+    for (const ac of state.activeControllers) {
+      try { ac.abort(); } catch (_) {}
+    }
+    state.activeControllers.clear();
+  }
+
+  async function fetchJsonBounded(url, timeoutMs) {
+    const ac = new AbortController();
+    state.activeControllers.add(ac);
+    const tid = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        method: "GET",
+        headers: { "Accept": "application/json" },
+        signal: ac.signal,
+        cache: "no-store",
+      });
+      const text = await resp.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch (_) {}
+      return { ok: resp.ok, status: resp.status, json };
+    } finally {
+      clearTimeout(tid);
+      state.activeControllers.delete(ac);
+    }
+  }
+
+  async function runBoundedPool(items, concurrency, fn) {
+    let idx = 0;
+    const workers = [];
+    const n = Math.min(concurrency, items.length);
+    for (let i = 0; i < n; i++) {
+      workers.push((async () => {
+        while (idx < items.length) {
+          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+          const cur = items[idx++];
+          await fn(cur);
+        }
+      })());
+    }
+    await Promise.allSettled(workers);
+  }
+
+  function getPresenceInfo(node, st) {
+    if (!st) {
+      if (node.discovery_state === "unreachable") return { label: "Unreachable", cls: "badge-err", online: false };
+      return { label: "Checking", cls: "badge-muted", online: false };
+    }
+    if (st.state === "online") {
+      const groups = st.data && st.data.groups ? Object.values(st.data.groups) : [];
+      const anyErr = groups.some((g) => g.status === "error");
+      const anyStale = groups.some((g) => g.status === "stale");
+      if (anyErr) return { label: "Online · Error", cls: "badge-warn", online: true, stale: true };
+      if (anyStale) return { label: "Online · Stale", cls: "badge-warn", online: true, stale: true };
+      return { label: "Online · Fresh", cls: "badge-ok", online: true, stale: false };
+    }
+    if (st.state === "collecting") return { label: "Collecting (202)", cls: "badge-info", online: true };
+    if (st.state === "incompatible") return { label: "Incompatible", cls: "badge-err", online: false };
+    return { label: "Unreachable", cls: "badge-err", online: false };
+  }
+
+  function maxMountPct(st) {
+    if (!st || !st.data || !Array.isArray(st.data.mounts) || st.data.mounts.length === 0) return null;
+    let mx = null;
+    for (const m of st.data.mounts) {
+      if (typeof m.pct === "number" && (mx === null || m.pct > mx)) mx = m.pct;
+    }
+    return mx;
+  }
+
+  function totalNetRates(st) {
+    if (!st || !st.data || !Array.isArray(st.data.network)) return { rx: null, tx: null };
+    // Avoid summing overlapping physical and tailscale0 packets; prefer physical/wireless first
+    const nonTail = st.data.network.filter((n) => n.kind === "physical" || n.kind === "wireless");
+    const list = nonTail.length > 0 ? nonTail : st.data.network;
+    let rx = null, tx = null;
+    for (const n of list) {
+      if (typeof n.rx_bytes_per_s === "number") rx = (rx || 0) + n.rx_bytes_per_s;
+      if (typeof n.tx_bytes_per_s === "number") tx = (tx || 0) + n.tx_bytes_per_s;
+    }
+    return { rx, tx };
+  }
+
+  function renderMeter(pct, tone) {
+    const wrap = el("div", { className: "meter" });
+    if (pct === null || pct === undefined || !Number.isFinite(pct)) return wrap;
+    const clamped = Math.max(0, Math.min(100, pct));
+    let cls = tone || (clamped >= 90 ? "err" : clamped >= 75 ? "warn" : "ok");
+    wrap.appendChild(el("div", { className: "meter-fill " + cls, style: { width: clamped.toFixed(1) + "%" } }));
+    return wrap;
+  }
+
+  function renderFleet() {
+    const search = document.getElementById("search-input").value.trim().toLowerCase();
+    const filter = document.getElementById("status-filter").value;
+    const sortBy = document.getElementById("sort-select").value;
+
+    let onlineCount = 0, offlineCount = 0, staleCount = 0, rebootCount = 0;
+
+    for (const n of state.nodes) {
+      const st = state.statusByNode.get(n.node_id);
+      const pres = getPresenceInfo(n, st);
+      if (pres.online) onlineCount++;
+      else offlineCount++;
+      if (pres.stale) staleCount++;
+      if (st && st.data && st.data.drift && st.data.drift.reboot_required === true) rebootCount++;
+    }
+
+    document.getElementById("kpi-total").textContent = String(state.nodes.length);
+    document.getElementById("kpi-online").textContent = String(onlineCount);
+    document.getElementById("kpi-offline").textContent = String(offlineCount);
+    document.getElementById("kpi-stale").textContent = String(staleCount);
+    document.getElementById("kpi-reboot").textContent = String(rebootCount);
+
+    let rows = state.nodes.filter((n) => {
+      const st = state.statusByNode.get(n.node_id);
+      const pres = getPresenceInfo(n, st);
+      if (filter === "online" && !pres.online) return false;
+      if (filter === "offline" && pres.online) return false;
+      if (filter === "reboot" && !(st && st.data && st.data.drift && st.data.drift.reboot_required === true)) return false;
+
+      if (search) {
+        const hwSum = (st && st.data && st.data.hardware_summary) || n.last_known_hardware_summary;
+        const hay = [n.alias, n.name, n.fqdn, n.os, hwSum && hwSum.cpu].filter(Boolean).join(" ").toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+
+    rows.sort((a, b) => {
+      const sa = state.statusByNode.get(a.node_id);
+      const sb = state.statusByNode.get(b.node_id);
+      if (sortBy === "cpu") {
+        const va = sa && sa.data && sa.data.cpu && typeof sa.data.cpu.pct === "number" ? sa.data.cpu.pct : -1;
+        const vb = sb && sb.data && sb.data.cpu && typeof sb.data.cpu.pct === "number" ? sb.data.cpu.pct : -1;
+        return vb - va;
+      }
+      if (sortBy === "ram") {
+        const va = sa && sa.data && sa.data.memory && typeof sa.data.memory.pct === "number" ? sa.data.memory.pct : -1;
+        const vb = sb && sb.data && sb.data.memory && typeof sb.data.memory.pct === "number" ? sb.data.memory.pct : -1;
+        return vb - va;
+      }
+      if (sortBy === "disk") {
+        return (maxMountPct(sb) ?? -1) - (maxMountPct(sa) ?? -1);
+      }
+      if (sortBy === "seen") {
+        return (b.last_seen_ts || 0) - (a.last_seen_ts || 0);
+      }
+      const na = (a.alias || a.name || a.node_id).toLowerCase();
+      const nb = (b.alias || b.name || b.node_id).toLowerCase();
+      return na.localeCompare(nb);
+    });
+
+    const tbody = document.getElementById("fleet-tbody");
+    tbody.textContent = "";
+
+    if (rows.length === 0) {
+      tbody.appendChild(el("tr", null, el("td", { colspan: 9, className: "muted", text: "No matching machines." })));
+      return;
+    }
+
+    for (const n of rows) {
+      const st = state.statusByNode.get(n.node_id);
+      const d = st && st.data ? st.data : null;
+      const pres = getPresenceInfo(n, st);
+      const hwSum = (d && d.hardware_summary) || n.last_known_hardware_summary;
+
+      const tr = el("tr", {
+        className: "host-row" + (state.selectedNodeId === n.node_id ? " selected" : ""),
+        tabindex: "0",
+      });
+      tr.addEventListener("click", () => selectNode(n.node_id));
+      tr.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          selectNode(n.node_id);
+        }
+      });
+
+      // Machine col
+      const tdHost = el("td");
+      tdHost.appendChild(el("div", { className: "host-title", text: n.alias || n.name || n.node_id }));
+      const subParts = [];
+      if (n.alias && n.name) subParts.push(n.name);
+      if (n.fqdn) subParts.push(n.fqdn);
+      if (hwSum && hwSum.cpu) subParts.push(hwSum.cpu);
+      tdHost.appendChild(el("div", { className: "host-sub", text: subParts.join(" · ") || n.node_id }));
+      tr.appendChild(tdHost);
+
+      // OS/Arch
+      tr.appendChild(el("td", null, [
+        el("div", { text: (d && d.os) || n.os || "—" }),
+        el("div", { className: "host-sub", text: (d && d.arch) || n.arch || "" }),
+      ]));
+
+      // Status & Freshness
+      const tdStatus = el("td");
+      const badgeWrap = el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap" } });
+      badgeWrap.appendChild(el("span", { className: "badge " + pres.cls, text: pres.label }));
+      if (n.tailscale_online === false) {
+        badgeWrap.appendChild(el("span", { className: "badge badge-muted", text: "Tailscale offline" }));
+      }
+      if (n.is_self) {
+        badgeWrap.appendChild(el("span", { className: "badge badge-muted", text: "Local" }));
+      }
+      tdStatus.appendChild(badgeWrap);
+      if (st && st.error) {
+        tdStatus.appendChild(el("div", { className: "host-sub", text: st.error }));
+      }
+      tr.appendChild(tdStatus);
+
+      // CPU
+      const cpuPct = d && d.cpu ? d.cpu.pct : null;
+      const tdCpu = el("td", { className: "mono" }, [
+        el("div", { text: cpuPct !== null ? formatPct(cpuPct) : "—" }),
+        renderMeter(cpuPct),
+      ]);
+      tr.appendChild(tdCpu);
+
+      // RAM
+      const ramPct = d && d.memory ? d.memory.pct : null;
+      const ramSub = d && d.memory && d.memory.total_bytes
+        ? (formatBytes(d.memory.used_bytes) + " / " + formatBytes(d.memory.total_bytes))
+        : (hwSum && hwSum.ram_bytes ? ("Total " + formatBytes(hwSum.ram_bytes)) : "—");
+      const tdRam = el("td", { className: "mono" }, [
+        el("div", { text: ramPct !== null ? formatPct(ramPct) : ramSub }),
+        ramPct !== null ? el("div", { className: "host-sub", text: ramSub }) : null,
+        renderMeter(ramPct),
+      ]);
+      tr.appendChild(tdRam);
+
+      // Max Disk
+      const diskPct = maxMountPct(st);
+      tr.appendChild(el("td", { className: "mono" }, [
+        el("div", { text: formatPct(diskPct) }),
+        renderMeter(diskPct),
+      ]));
+
+      // Net Rate
+      const nr = totalNetRates(st);
+      tr.appendChild(el("td", { className: "mono" }, [
+        el("div", { text: "↓ " + formatRate(nr.rx) }),
+        el("div", { className: "host-sub", text: "↑ " + formatRate(nr.tx) }),
+      ]));
+
+      // Extras (GPU, Battery, Reboot)
+      const tdEx = el("td");
+      const exWrap = el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap" } });
+      if (d && Array.isArray(d.gpus) && d.gpus.length > 0) {
+        const g0 = d.gpus[0];
+        exWrap.appendChild(el("span", {
+          className: "badge badge-muted",
+          text: "GPU " + (g0.utilization_pct !== null ? formatPct(g0.utilization_pct) : g0.display_name),
+        }));
+      }
+      if (d && Array.isArray(d.batteries) && d.batteries.length > 0) {
+        const b0 = d.batteries[0];
+        exWrap.appendChild(el("span", {
+          className: "badge badge-muted",
+          text: "Bat " + formatPct(b0.pct),
+        }));
+      }
+      if (d && d.drift && d.drift.reboot_required === true) {
+        exWrap.appendChild(el("span", { className: "badge badge-warn", text: "Reboot req" }));
+      }
+      if (exWrap.childNodes.length === 0) exWrap.appendChild(el("span", { className: "dim", text: "—" }));
+      tdEx.appendChild(exWrap);
+      tr.appendChild(tdEx);
+
+      // Last contact
+      const fastTs = d && d.groups && d.groups.fast ? d.groups.fast.sampled_at : null;
+      tr.appendChild(el("td", { className: "mono" }, [
+        el("div", { text: formatTs(n.last_seen_ts) }),
+        fastTs ? el("div", { className: "host-sub", text: "Sampled " + formatTs(fastTs) }) : null,
+      ]));
+
+      tbody.appendChild(tr);
+    }
+  }
+
+  function selectNode(nodeId) {
+    state.selectedNodeId = nodeId;
+    renderFleet();
+    renderDetail();
+    if (state.activeTab === "hardware") {
+      ensureHardwareLoaded(nodeId, false);
+    }
+  }
+
+  async function ensureHardwareLoaded(nodeId, forceRefresh) {
+    const node = state.nodes.find((n) => n.node_id === nodeId);
+    if (!node) return;
+    const existing = state.hardwareByNode.get(nodeId);
+    if (!forceRefresh && existing && existing.data) return;
+
+    state.hardwareByNode.set(nodeId, {
+      loading: true,
+      data: existing ? existing.data : null,
+      error: null,
+    });
+    renderDetail();
+
+    let url = resolveEndpointUrl(node, "hardware");
+    if (forceRefresh) url += (url.includes("?") ? "&" : "?") + "refresh=1";
+
+    try {
+      const res = await fetchJsonBounded(url, 6000);
+      if (res.status === 200 && res.json && res.json.app === "hikari") {
+        state.hardwareByNode.set(nodeId, { loading: false, data: res.json, error: null });
+      } else if (res.status === 202) {
+        state.hardwareByNode.set(nodeId, { loading: true, data: existing ? existing.data : null, error: "Scanning hardware (202 collecting)..." });
+      } else {
+        state.hardwareByNode.set(nodeId, {
+          loading: false,
+          data: existing ? existing.data : null,
+          error: (res.json && res.json.message) || ("HTTP " + res.status),
+        });
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+      state.hardwareByNode.set(nodeId, {
+        loading: false,
+        data: existing ? existing.data : null,
+        error: "Hardware endpoint unreachable",
+      });
+    }
+    if (state.selectedNodeId === nodeId) renderDetail();
+  }
+
+  function renderKv(pairs) {
+    const dl = el("div", { className: "kv-list" });
+    for (const [k, v] of pairs) {
+      dl.appendChild(el("div", { className: "kv-k", text: k }));
+      dl.appendChild(el("div", { className: "kv-v", text: (v === null || v === undefined || v === "") ? "Unavailable" : String(v) }));
+    }
+    return dl;
+  }
+
+  function renderDetail() {
+    const panel = document.getElementById("detail-panel");
+    const node = state.nodes.find((n) => n.node_id === state.selectedNodeId);
+    if (!node) {
+      panel.style.display = "none";
+      return;
+    }
+    panel.style.display = "block";
+
+    const st = state.statusByNode.get(node.node_id);
+    const d = st && st.data ? st.data : null;
+    const pres = getPresenceInfo(node, st);
+
+    document.getElementById("detail-title").textContent = node.alias || node.name || node.node_id;
+    document.getElementById("detail-subtitle").textContent = [
+      node.fqdn || "no MagicDNS",
+      node.node_id,
+      d ? (d.os + " / " + d.arch) : "",
+    ].filter(Boolean).join(" · ");
+
+    const badges = document.getElementById("detail-badges");
+    badges.textContent = "";
+    badges.appendChild(el("span", { className: "badge " + pres.cls, text: pres.label }));
+
+    for (const btn of document.querySelectorAll(".tab-btn")) {
+      btn.classList.toggle("active", btn.getAttribute("data-tab") === state.activeTab);
+    }
+
+    const body = document.getElementById("detail-body");
+    body.textContent = "";
+
+    if (state.activeTab === "overview") {
+      renderOverviewTab(body, node, st, d);
+    } else if (state.activeTab === "hardware") {
+      renderHardwareTab(body, node);
+    } else if (state.activeTab === "storage") {
+      renderStorageNetworkTab(body, d);
+    } else if (state.activeTab === "processes") {
+      renderProcessesMaintenanceTab(body, d);
+    }
+  }
+
+  function renderOverviewTab(body, node, st, d) {
+    if (!d) {
+      const hwSum = node.last_known_hardware_summary;
+      body.appendChild(el("div", {
+        className: "banner banner-warn",
+        text: "Live status unavailable (" + ((st && st.error) || "offline") + "). Last seen: " + formatTs(node.last_seen_ts),
+      }));
+      if (hwSum) {
+        body.appendChild(el("div", { className: "card" }, [
+          el("div", { className: "card-title", text: "Last Known Hardware Summary" }),
+          renderKv([
+            ["CPU", hwSum.cpu],
+            ["RAM", formatBytes(hwSum.ram_bytes)],
+            ["System", hwSum.system_model],
+          ]),
+        ]));
+      }
+      return;
+    }
+
+    const grid = el("div", { className: "card-grid" });
+
+    // Compute & Memory
+    const sysCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "Compute & Memory" }),
+        el("span", { className: "dim", text: "Aggregate CPU 0–100%" }),
+      ]),
+      renderKv([
+        ["CPU usage", d.cpu ? formatPct(d.cpu.pct) : "—"],
+        ["Load (1m)", d.cpu && d.cpu.load_1m !== null ? d.cpu.load_1m.toFixed(2) : "Unavailable"],
+        ["CPU temp", d.cpu && d.cpu.temp_c !== null ? d.cpu.temp_c.toFixed(1) + " °C" : "Unavailable"],
+        ["RAM", d.memory ? `${formatBytes(d.memory.used_bytes)} / ${formatBytes(d.memory.total_bytes)} (${formatPct(d.memory.pct)})` : "—"],
+        ["Swap", d.swap ? `${formatBytes(d.swap.used_bytes)} / ${formatBytes(d.swap.total_bytes)} (${formatPct(d.swap.pct)})` : "None / Unavailable"],
+        d.commit ? ["Commit charge", `${formatBytes(d.commit.used_bytes)} / ${formatBytes(d.commit.limit_bytes)} (${formatPct(d.commit.pct)})`] : null,
+        ["Uptime", formatDuration(d.uptime_s)],
+        ["Boot ID", d.boot_id],
+      ].filter(Boolean)),
+    ]);
+    grid.appendChild(sysCard);
+
+    // Group freshness table
+    const grpCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Probe Group Freshness" })),
+    ]);
+    const grpRows = [];
+    for (const [gname, gm] of Object.entries(d.groups || {})) {
+      const cls = gm.status === "fresh" ? "badge-ok" : gm.status === "stale" ? "badge-warn" : gm.status === "error" ? "badge-err" : "badge-muted";
+      grpRows.push(el("div", { className: "sub-item", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" } }, [
+        el("div", null, [
+          el("span", { className: "mono", text: gname }),
+          gm.error ? el("div", { className: "host-sub", text: gm.error }) : null,
+        ]),
+        el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+          el("span", { className: "host-sub", text: gm.age_s !== null ? formatDuration(gm.age_s) + " old" : "never" }),
+          el("span", { className: "badge " + cls, text: gm.status + (gm.refreshing ? " (refreshing)" : "") }),
+        ]),
+      ]));
+    }
+    for (const r of grpRows) grpCard.appendChild(r);
+    grid.appendChild(grpCard);
+
+    // Batteries if present
+    if (Array.isArray(d.batteries) && d.batteries.length > 0) {
+      const batCard = el("div", { className: "card" }, [
+        el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Batteries" })),
+      ]);
+      for (const b of d.batteries) {
+        batCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          [b.name || b.id, `${formatPct(b.pct)} (${b.status})`],
+          ["Power", b.power_watts !== null ? b.power_watts.toFixed(1) + " W" : "—"],
+          ["Remaining", formatDuration(b.time_remaining_s)],
+          ["Health", formatPct(b.health_pct)],
+        ])));
+      }
+      grid.appendChild(batCard);
+    }
+
+    body.appendChild(grid);
+  }
+
+  function renderHardwareTab(body, node) {
+    const hwEntry = state.hardwareByNode.get(node.node_id);
+
+    const actionBar = el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "8px" } });
+    const statusText = hwEntry && hwEntry.data
+      ? ("Collected " + formatTs(hwEntry.data.collected_at) + " · status: " + (hwEntry.data.collection ? hwEntry.data.collection.status : "fresh"))
+      : "Hardware inventory is fetched lazily when opened.";
+    actionBar.appendChild(el("div", { className: "muted", text: statusText }));
+    const refBtn = el("button", { type: "button", className: "btn btn-primary", text: hwEntry && hwEntry.loading ? "Scanning..." : "Refresh Hardware Scan" });
+    refBtn.disabled = Boolean(hwEntry && hwEntry.loading);
+    refBtn.addEventListener("click", () => ensureHardwareLoaded(node.node_id, true));
+    actionBar.appendChild(refBtn);
+    body.appendChild(actionBar);
+
+    if (hwEntry && hwEntry.error) {
+      body.appendChild(el("div", { className: "banner banner-err", text: hwEntry.error }));
+    }
+    if (!hwEntry || (!hwEntry.data && hwEntry.loading)) {
+      body.appendChild(el("div", { className: "muted", text: "Loading hardware inventory..." }));
+      return;
+    }
+    if (!hwEntry.data) return;
+
+    const hw = hwEntry.data;
+    const grid = el("div", { className: "card-grid" });
+
+    // 1. CPU & ISA Card
+    const cpu = hw.cpu || {};
+    const isa = cpu.isa || { hardware: [], usable: [], detection: "unknown" };
+    const topBadges = [];
+    for (const id of ["avx512f", "avx2", "avx", "asimd", "sve", "aes", "sha"]) {
+      if (Array.isArray(isa.usable) && isa.usable.includes(id)) {
+        const meta = ISA_GLOSSARY[id];
+        topBadges.push(meta ? meta[0] : id.toUpperCase());
+        if (topBadges.length >= 4) break;
+      }
+    }
+    const coreSummary = [
+      cpu.physical_cores ? cpu.physical_cores + " cores" : null,
+      cpu.logical_cores ? cpu.logical_cores + " threads" : null,
+      cpu.architecture || null,
+      ...topBadges,
+    ].filter(Boolean).join(" · ");
+
+    const cpuCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "CPU & Instruction Sets" }),
+        el("span", { className: "badge badge-muted", text: isa.detection || "unknown" }),
+      ]),
+      el("div", { className: "isa-summary", text: coreSummary || cpu.display_name || "CPU details" }),
+      renderKv([
+        ["Model", cpu.display_name],
+        ["Vendor", cpu.vendor],
+        ["Sockets / Cores", `${cpu.sockets ?? "—"} socket · ${cpu.physical_cores ?? "—"}P / ${cpu.logical_cores ?? "—"}T`],
+        (cpu.performance_cores !== null || cpu.efficiency_cores !== null)
+          ? ["Hybrid layout", `${cpu.performance_cores ?? "?"}P + ${cpu.efficiency_cores ?? "?"}E`] : null,
+        ["L1 / L2 / L3", cpu.cache_bytes ? `${formatBytes(cpu.cache_bytes.l1d)} / ${formatBytes(cpu.cache_bytes.l2)} / ${formatBytes(cpu.cache_bytes.l3)}` : "—"],
+      ].filter(Boolean)),
+    ]);
+
+    // Searchable ISA chips grouped by category
+    const isaSearch = el("input", {
+      type: "search",
+      className: "input",
+      placeholder: "Filter ISA extensions (e.g. avx, aes, sve)...",
+      style: { width: "100%", marginTop: "10px" },
+      value: state.isaFilter,
+    });
+    isaSearch.addEventListener("input", (e) => {
+      state.isaFilter = e.target.value;
+      renderDetail();
+    });
+    cpuCard.appendChild(isaSearch);
+
+    const usableSet = new Set(isa.usable || []);
+    const allFeats = Array.from(new Set([...(isa.usable || []), ...(isa.hardware || [])]));
+    const filterTerm = state.isaFilter.trim().toLowerCase();
+    const categories = ["Vector/SIMD", "Cryptography", "Bit manipulation", "Virtualization", "Other"];
+
+    for (const cat of categories) {
+      const matching = allFeats.filter((f) => {
+        const meta = ISA_GLOSSARY[f] || [f, "Other", "Processor instruction-set extension"];
+        if (meta[1] !== cat) return false;
+        if (filterTerm && !f.includes(filterTerm) && !meta[0].toLowerCase().includes(filterTerm) && !meta[2].toLowerCase().includes(filterTerm)) return false;
+        return true;
+      });
+      if (matching.length === 0) continue;
+
+      const grp = el("div", { className: "chip-group" }, [
+        el("div", { className: "chip-group-title", text: cat }),
+      ]);
+      const wrap = el("div", { className: "chip-wrap" });
+      for (const f of matching) {
+        const meta = ISA_GLOSSARY[f] || [f, "Other", "Processor instruction-set extension"];
+        const isUsable = usableSet.has(f);
+        wrap.appendChild(el("span", {
+          className: "chip" + (isUsable ? "" : " disabled-isa"),
+          title: `${meta[0]} (${f}): ${meta[2]}${isUsable ? "" : " [Present in CPUID but disabled by OS state]"}`,
+          text: meta[0] + (isUsable ? "" : " (OS off)"),
+        }));
+      }
+      grp.appendChild(wrap);
+      cpuCard.appendChild(grp);
+    }
+    grid.appendChild(cpuCard);
+
+    // 2. Motherboard & Firmware Card
+    const sys = hw.system || {};
+    const brd = hw.board || {};
+    const fw = hw.firmware || {};
+    grid.appendChild(el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "System, Motherboard & Firmware" }),
+        sys.form_factor ? el("span", { className: "badge badge-muted", text: sys.form_factor }) : null,
+      ]),
+      renderKv([
+        ["System", [sys.manufacturer, sys.model].filter(Boolean).join(" ") || null],
+        ["Family", sys.product_family],
+        ["Virtualization", sys.virtualization || "Bare metal / none detected"],
+        ["Board", [brd.manufacturer, brd.model, brd.revision].filter(Boolean).join(" ") || null],
+        ["Firmware", [fw.type, fw.vendor, fw.version].filter(Boolean).join(" · ") || null],
+        ["BIOS/UEFI Date", fw.release_date],
+      ]),
+    ]));
+
+    // 3. Memory Card
+    const mem = hw.memory || {};
+    const memCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "Memory" }),
+        el("span", { className: "badge badge-muted", text: "DIMMs: " + (mem.module_enumeration || "unavailable") }),
+      ]),
+      renderKv([
+        ["Total installed", formatBytes(mem.total_bytes)],
+        ["Technology", mem.technology],
+        ["Speed", mem.speed_mt_s ? mem.speed_mt_s + " MT/s" : null],
+      ]),
+    ]);
+    if (Array.isArray(mem.modules) && mem.modules.length > 0) {
+      for (const m of mem.modules) {
+        memCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          [m.slot || "DIMM", `${formatBytes(m.size_bytes)} ${m.technology || ""} ${m.speed_mt_s ? m.speed_mt_s + " MT/s" : ""}`.trim()],
+          ["Vendor / Part", [m.manufacturer, m.part_number].filter(Boolean).join(" ") || null],
+        ])));
+      }
+    }
+    grid.appendChild(memCard);
+
+    // 4. Graphics Adapters Card
+    const gpus = hw.graphics_adapters || [];
+    const gpuCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Graphics Adapters" })),
+    ]);
+    if (gpus.length === 0) {
+      gpuCard.appendChild(el("div", { className: "muted", text: "No graphics adapters enumerated." }));
+    } else {
+      for (const g of gpus) {
+        gpuCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          ["Model", g.display_name],
+          ["Vendor / Driver", [g.vendor, g.driver].filter(Boolean).join(" · ") || null],
+          ["Static VRAM", formatBytes(g.memory_total_bytes)],
+        ])));
+      }
+    }
+    grid.appendChild(gpuCard);
+
+    // 5. Network Adapters Card
+    const nics = hw.network_adapters || [];
+    const nicCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "Network Adapters" }),
+        (() => {
+          const b = el("button", { type: "button", className: "btn", text: state.showVirtualNics ? "Hide virtual" : "Show virtual" });
+          b.addEventListener("click", () => { state.showVirtualNics = !state.showVirtualNics; renderDetail(); });
+          return b;
+        })(),
+      ]),
+    ]);
+    const filteredNics = state.showVirtualNics ? nics : nics.filter((x) => x.kind !== "virtual");
+    if (filteredNics.length === 0) {
+      nicCard.appendChild(el("div", { className: "muted", text: "No physical/tailnet network adapters matching filter." }));
+    } else {
+      for (const na of filteredNics) {
+        nicCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          [na.interface || na.id, `${na.display_name} [${na.kind}]`],
+          ["Driver / Bus", [na.driver, na.bus, na.vendor_id && na.device_id ? `${na.vendor_id}:${na.device_id}` : null].filter(Boolean).join(" · ") || null],
+          ["Link speed", na.link_speed_bps ? (na.link_speed_bps / 1000000).toFixed(0) + " Mbps" : null],
+        ])));
+      }
+    }
+    grid.appendChild(nicCard);
+
+    // 6. Storage Devices Card
+    const stors = hw.storage_devices || [];
+    const storCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Physical Storage Devices" })),
+    ]);
+    if (stors.length === 0) {
+      storCard.appendChild(el("div", { className: "muted", text: "No physical block devices enumerated." }));
+    } else {
+      for (const sd of stors) {
+        storCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          [sd.display_name || sd.id, `${formatBytes(sd.capacity_bytes)} (${sd.bus || "?"} · ${sd.media_type || "unknown"})`],
+          ["Mounted paths", Array.isArray(sd.mounts) && sd.mounts.length > 0 ? sd.mounts.join(", ") : "Unmounted / raw"],
+        ])));
+      }
+    }
+    grid.appendChild(storCard);
+
+    body.appendChild(grid);
+  }
+
+  function renderStorageNetworkTab(body, d) {
+    if (!d) {
+      body.appendChild(el("div", { className: "muted", text: "Live status unavailable." }));
+      return;
+    }
+    const grid = el("div", { className: "card-grid" });
+
+    // Mounts
+    const mountCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Mounted Filesystems" })),
+    ]);
+    for (const m of d.mounts || []) {
+      mountCard.appendChild(el("div", { className: "sub-item" }, [
+        el("div", { style: { display: "flex", justifyContent: "space-between" } }, [
+          el("strong", { className: "mono", text: m.mount }),
+          el("span", { className: "mono", text: `${formatBytes(m.used_bytes)} / ${formatBytes(m.total_bytes)} (${formatPct(m.pct)})` }),
+        ]),
+        el("div", { className: "host-sub", text: `${m.fs} · ${m.source}` }),
+        renderMeter(m.pct),
+      ]));
+    }
+    grid.appendChild(mountCard);
+
+    // Live Network Counters & Rates
+    const netCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Network Interfaces (Traffic)" })),
+    ]);
+    for (const n of d.network || []) {
+      netCard.appendChild(el("div", { className: "sub-item" }, [
+        el("div", { style: { display: "flex", justifyContent: "space-between" } }, [
+          el("strong", { className: "mono", text: `${n.name} (${n.kind})` }),
+          el("span", { className: "mono", text: `↓ ${formatRate(n.rx_bytes_per_s)}  ↑ ${formatRate(n.tx_bytes_per_s)}` }),
+        ]),
+        el("div", { className: "host-sub", text: `Total RX ${formatBytes(n.rx_bytes)} · TX ${formatBytes(n.tx_bytes)}` }),
+      ]));
+    }
+    grid.appendChild(netCard);
+
+    // Live GPU Telemetry
+    if (Array.isArray(d.gpus) && d.gpus.length > 0) {
+      const gpuCard = el("div", { className: "card" }, [
+        el("div", { className: "card-head" }, el("div", { className: "card-title", text: "GPU Telemetry" })),
+      ]);
+      for (const g of d.gpus) {
+        gpuCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+          ["GPU", g.display_name],
+          ["Utilization", formatPct(g.utilization_pct)],
+          ["VRAM", `${formatBytes(g.vram_used_bytes)} / ${formatBytes(g.vram_total_bytes)}`],
+          ["Temp / Power", `${g.temp_c !== null ? g.temp_c.toFixed(0) + " °C" : "—"} · ${g.power_watts !== null ? g.power_watts.toFixed(1) + " W" : "—"}`],
+        ])));
+      }
+      grid.appendChild(gpuCard);
+    }
+
+    body.appendChild(grid);
+  }
+
+  function renderProcessesMaintenanceTab(body, d) {
+    if (!d) {
+      body.appendChild(el("div", { className: "muted", text: "Live status unavailable." }));
+      return;
+    }
+    const grid = el("div", { className: "card-grid" });
+
+    function makeProcCard(title, list) {
+      const c = el("div", { className: "card" }, [
+        el("div", { className: "card-head" }, [
+          el("div", { className: "card-title", text: title }),
+          el("span", { className: "dim", text: "100% = 1 logical CPU" }),
+        ]),
+      ]);
+      if (!list || list.length === 0) {
+        c.appendChild(el("div", { className: "muted", text: "No process samples yet." }));
+        return c;
+      }
+      for (const p of list) {
+        c.appendChild(el("div", { className: "sub-item", style: { display: "flex", justifyContent: "space-between", gap: "8px" } }, [
+          el("div", null, [
+            el("strong", { text: p.name }),
+            el("span", { className: "host-sub", text: ` (PID ${p.pid})` }),
+          ]),
+          el("div", { className: "mono", text: `${formatPct(p.cpu_pct)} · ${formatBytes(p.rss_bytes)}` }),
+        ]));
+      }
+      return c;
+    }
+
+    grid.appendChild(makeProcCard("Top CPU Processes", d.top_cpu));
+    grid.appendChild(makeProcCard("Top Memory Processes", d.top_mem));
+
+    const dr = d.drift || {};
+    grid.appendChild(el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "OS Maintenance & Kernel Drift" })),
+      renderKv([
+        ["Running kernel", dr.running_kernel],
+        ["Installed kernel", dr.installed_kernel],
+        ["Reboot required", dr.reboot_required === null ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
+        ["Pending updates", dr.pending_updates !== null ? String(dr.pending_updates) : "Unknown"],
+        ["Package cache age", formatDuration(dr.package_cache_age_s)],
+      ]),
+    ]));
+
+    body.appendChild(grid);
+  }
+
+  async function refreshAll(discoverPeers) {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    if (state.isPolling) return;
+    state.isPolling = true;
+    const statusText = document.getElementById("poll-status-text");
+    statusText.textContent = "Refreshing fleet...";
+
+    try {
+      const nodesUrl = discoverPeers ? "./api/v1/nodes?refresh=1" : "./api/v1/nodes";
+      const nRes = await fetchJsonBounded(nodesUrl, 6000);
+      if (nRes.ok && nRes.json && Array.isArray(nRes.json.nodes)) {
+        state.nodes = nRes.json.nodes;
+        if (!state.selectedNodeId && state.nodes.length > 0) {
+          state.selectedNodeId = state.nodes[0].node_id;
+        }
+        renderFleet();
+        renderDetail();
+      } else {
+        const b = document.getElementById("fleet-banner");
+        b.style.display = "block";
+        b.className = "banner banner-err";
+        b.textContent = "Failed to load /api/v1/nodes (HTTP " + nRes.status + ")";
+      }
+
+      // Bounded parallel status requests (concurrency 4)
+      await runBoundedPool(state.nodes, 4, async (node) => {
+        const url = resolveEndpointUrl(node, "status");
+        try {
+          const res = await fetchJsonBounded(url, 5000);
+          if (res.status === 200 && res.json && res.json.app === "hikari") {
+            state.statusByNode.set(node.node_id, { state: "online", httpStatus: 200, data: res.json, error: null });
+          } else if (res.status === 202) {
+            const prev = state.statusByNode.get(node.node_id);
+            state.statusByNode.set(node.node_id, {
+              state: "collecting",
+              httpStatus: 202,
+              data: prev ? prev.data : null,
+              error: "Collecting initial sample (retry in " + ((res.json && res.json.retry_after_s) || 1) + "s)",
+            });
+          } else if (res.status === 503) {
+            const prev = state.statusByNode.get(node.node_id);
+            state.statusByNode.set(node.node_id, {
+              state: "unreachable",
+              httpStatus: 503,
+              data: prev ? prev.data : null,
+              error: (res.json && res.json.error) || "Service unavailable (503)",
+            });
+          } else {
+            const prev = state.statusByNode.get(node.node_id);
+            state.statusByNode.set(node.node_id, {
+              state: "incompatible",
+              httpStatus: res.status,
+              data: prev ? prev.data : null,
+              error: "Incompatible or HTTP " + res.status,
+            });
+          }
+        } catch (err) {
+          if (err && err.name === "AbortError") return;
+          const prev = state.statusByNode.get(node.node_id);
+          state.statusByNode.set(node.node_id, {
+            state: "unreachable",
+            httpStatus: 0,
+            data: prev ? prev.data : null,
+            error: "Connection failed or timed out",
+          });
+        }
+        renderFleet();
+        if (state.selectedNodeId === node.node_id) renderDetail();
+      });
+
+      statusText.textContent = "Last updated " + new Date().toLocaleTimeString();
+    } catch (err) {
+      if (!err || err.name !== "AbortError") {
+        statusText.textContent = "Refresh failed";
+      }
+    } finally {
+      state.isPolling = false;
+    }
+  }
+
+  function schedulePolling() {
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    if (state.pollIntervalMs > 0) {
+      state.pollTimer = setInterval(() => {
+        if (document.visibilityState === "visible") refreshAll(false);
+      }, state.pollIntervalMs);
+    }
+  }
+
+  function onVisibilityChange() {
+    if (document.visibilityState === "hidden") {
+      if (state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
+      abortAllRequests();
+      document.getElementById("poll-status-text").textContent = "Paused while tab hidden";
+    } else {
+      schedulePolling();
+      refreshAll(false);
+    }
+  }
+
+  function init() {
+    document.getElementById("interval-select").addEventListener("change", (e) => {
+      state.pollIntervalMs = Number(e.target.value);
+      schedulePolling();
+    });
+    document.getElementById("refresh-now-btn").addEventListener("click", () => refreshAll(false));
+    document.getElementById("discover-btn").addEventListener("click", () => refreshAll(true));
+    document.getElementById("search-input").addEventListener("input", renderFleet);
+    document.getElementById("status-filter").addEventListener("change", renderFleet);
+    document.getElementById("sort-select").addEventListener("change", renderFleet);
+    document.getElementById("close-detail-btn").addEventListener("click", () => {
+      state.selectedNodeId = null;
+      renderFleet();
+      renderDetail();
+    });
+
+    for (const btn of document.querySelectorAll(".tab-btn")) {
+      btn.addEventListener("click", () => {
+        state.activeTab = btn.getAttribute("data-tab");
+        renderDetail();
+        if (state.activeTab === "hardware" && state.selectedNodeId) {
+          ensureHardwareLoaded(state.selectedNodeId, false);
+        }
+      });
+    }
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", abortAllRequests);
+    window.addEventListener("beforeunload", abortAllRequests);
+
+    if (document.visibilityState !== "hidden") {
+      refreshAll(false);
+      schedulePolling();
+    }
+  }
+
+  if (typeof window !== "undefined") {
+    window.__hikariApp = {
+      state,
+      formatBytes,
+      formatRate,
+      formatPct,
+      formatDuration,
+      resolveEndpointUrl,
+      getPresenceInfo,
+      refreshAll,
+      abortAllRequests,
+      ensureHardwareLoaded,
+      selectNode,
+      onVisibilityChange,
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", init);
+    } else {
+      init();
+    }
+  }
+})();
+</script>
+</body>
+</html>

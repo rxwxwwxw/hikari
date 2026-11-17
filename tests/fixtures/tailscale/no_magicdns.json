@@ -1,0 +1,21 @@
+{
+  "MagicDNSSuffix": "",
+  "Self": {
+    "ID": "nSelf123",
+    "HostName": "isolated-box",
+    "DNSName": "",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.20"],
+    "Online": true
+  },
+  "Peer": {
+    "nodekey:p1": {
+      "ID": "nPeerNoDns",
+      "HostName": "peer-nodns",
+      "DNSName": "",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.21"],
+      "Online": true
+    }
+  }
+}

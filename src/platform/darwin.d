@@ -1,0 +1,708 @@
+module platform.darwin;
+
+import core.model;
+import core.serializer : sanitizeOsString;
+import hardware.inventory;
+import hardware.isa_names;
+import platform.api;
+import std.algorithm : canFind, startsWith;
+import std.conv : to;
+import std.format : format;
+import std.process : Config, execute;
+import std.string : fromStringz, indexOf, split, strip, toLower;
+import std.typecons : Nullable;
+
+version (OSX) {
+    import core.sys.darwin.ifaddrs : freeifaddrs, getifaddrs, ifaddrs;
+    import core.sys.darwin.sys.sysctl : sysctlbyname;
+
+    private enum int H_HOST_CPU_LOAD_INFO = 3;
+    private enum uint H_HOST_CPU_LOAD_INFO_COUNT = 4;
+    private enum int H_HOST_VM_INFO64 = 4;
+    private enum uint H_HOST_VM_INFO64_COUNT = 38;
+    private enum int H_MNT_NOWAIT = 2;
+    private enum int H_AF_LINK = 18;
+    private enum int H_PROC_PIDTASKALLINFO = 2;
+
+    private struct H_host_cpu_load_info_data {
+        uint[4] cpu_ticks; // 0=user, 1=system, 2=idle, 3=nice
+    }
+
+    private struct H_vm_statistics64 {
+        uint free_count;
+        uint active_count;
+        uint inactive_count;
+        uint wire_count;
+        ulong zero_fill_count;
+        ulong reactivations;
+        ulong pageins;
+        ulong pageouts;
+        ulong faults;
+        ulong cow_faults;
+        ulong lookups;
+        ulong hits;
+        ulong purges;
+        uint purgeable_count;
+        uint speculative_count;
+        ulong decompressions;
+        ulong compressions;
+        ulong swapins;
+        ulong swapouts;
+        uint compressor_page_count;
+        uint throttled_count;
+        uint external_page_count;
+        uint internal_page_count;
+        ulong total_uncompressed_pages_in_compressor;
+    }
+
+    private struct H_xsw_usage {
+        ulong xsu_total;
+        ulong xsu_avail;
+        ulong xsu_used;
+        uint xsu_pagesize;
+        bool xsu_encrypted;
+    }
+
+    private struct H_timeval {
+        long tv_sec;
+        long tv_usec;
+    }
+
+    private struct H_if_data {
+        ubyte ifi_type;
+        ubyte ifi_typelen;
+        ubyte ifi_physical;
+        ubyte ifi_addrlen;
+        ubyte ifi_hdrlen;
+        ubyte ifi_recvquota;
+        ubyte ifi_xmitquota;
+        ubyte ifi_unused1;
+        uint ifi_mtu;
+        uint ifi_metric;
+        uint ifi_baudrate;
+        uint ifi_ipackets;
+        uint ifi_ierrors;
+        uint ifi_opackets;
+        uint ifi_oerrors;
+        uint ifi_collisions;
+        uint ifi_ibytes;
+        uint ifi_obytes;
+        uint ifi_imcasts;
+        uint ifi_omcasts;
+        uint ifi_iqdrops;
+        uint ifi_noproto;
+        uint ifi_recvtiming;
+        uint ifi_xmittiming;
+        H_timeval ifi_lastchange;
+        uint ifi_unused2;
+        uint ifi_hwassist;
+        uint ifi_reserved1;
+        uint ifi_reserved2;
+    }
+
+    private struct H_proc_bsdinfo {
+        uint pbi_flags;
+        uint pbi_status;
+        uint pbi_xstatus;
+        uint pbi_pid;
+        uint pbi_ppid;
+        uint pbi_uid;
+        uint pbi_gid;
+        uint pbi_ruid;
+        uint pbi_rgid;
+        uint pbi_svuid;
+        uint pbi_svgid;
+        uint rfu_1;
+        char[16] pbi_comm;
+        char[32] pbi_name;
+        uint pbi_nfiles;
+        uint pbi_pgid;
+        uint pbi_pjobc;
+        uint e_tdev;
+        uint e_tpgid;
+        int pbi_nice;
+        ulong pbi_start_tvsec;
+        ulong pbi_start_tvusec;
+    }
+
+    private struct H_proc_taskinfo {
+        ulong pti_virtual_size;
+        ulong pti_resident_size;
+        ulong pti_total_user;
+        ulong pti_total_system;
+        ulong pti_threads_user;
+        ulong pti_threads_system;
+        int pti_policy;
+        int pti_faults;
+        int pti_pageins;
+        int pti_cow_faults;
+        int pti_messages_sent;
+        int pti_messages_received;
+        int pti_syscalls_mach;
+        int pti_syscalls_unix;
+        int pti_csw;
+        int pti_threadnum;
+        int pti_numrunning;
+        int pti_priority;
+    }
+
+    private struct H_proc_taskallinfo {
+        H_proc_bsdinfo pbsd;
+        H_proc_taskinfo ptinfo;
+    }
+
+    private struct H_statfs {
+        uint f_bsize;
+        int f_iosize;
+        ulong f_blocks;
+        ulong f_bfree;
+        ulong f_bavail;
+        ulong f_files;
+        ulong f_ffree;
+        long[1] f_fsid; // 8 bytes on Darwin (int[2])
+        uint f_owner;
+        uint f_type;
+        uint f_flags;
+        uint f_fssubtype;
+        char[16] f_fstypename;
+        char[1024] f_mntonname;
+        char[1024] f_mntfromname;
+        uint[8] f_reserved;
+    }
+
+    private struct H_mach_timebase_info {
+        uint numer;
+        uint denom;
+    }
+
+    private extern (C) nothrow @nogc {
+        uint mach_host_self();
+        int host_statistics(uint host_priv, int flavor, int* host_info_out, uint* host_info_outCnt);
+        int host_statistics64(uint host_priv, int flavor, int* host_info_out, uint* host_info_outCnt);
+        int mach_timebase_info(H_mach_timebase_info* info);
+        int proc_listallpids(void* buffer, int buffersize);
+        int proc_pidinfo(int pid, int flavor, ulong arg, void* buffer, int buffersize);
+        int getfsstat(H_statfs* buf, int bufsize, int flags);
+        uint if_nametoindex(const(char)* ifname);
+        int getloadavg(double* loadavg, int nelem);
+    }
+}
+
+BatteryStatus[] parsePmsetBatteryOutput(string pmsetText) {
+    BatteryStatus[] list;
+    uint idx = 0;
+    foreach (rawLine; pmsetText.split('\n')) {
+        auto line = rawLine.strip();
+        if (!line.canFind("InternalBattery") && !line.canFind("Battery-")) continue;
+
+        BatteryStatus b;
+        b.id = "BAT" ~ to!string(idx);
+        b.name = b.id;
+        idx++;
+
+        auto tab = line.indexOf('\t');
+        auto rest = tab >= 0 ? line[tab + 1 .. $].strip() : line;
+        // Example: "84%; discharging; 4:12 remaining present: true"
+        auto parts = rest.split(';');
+        if (parts.length >= 1) {
+            auto pctIdx = parts[0].indexOf('%');
+            if (pctIdx > 0) {
+                // Find token immediately preceding '%'
+                auto beforePct = parts[0][0 .. pctIdx].strip().split();
+                if (beforePct.length > 0) {
+                    try { b.pct = to!double(beforePct[$ - 1]); } catch (Exception) {}
+                }
+            }
+        }
+        if (parts.length >= 2) {
+            auto st = parts[1].strip().toLower();
+            if (st == "charging" || st == "finishing charge") b.status = "charging";
+            else if (st == "discharging") b.status = "discharging";
+            else if (st == "charged") b.status = "full";
+            else if (st == "ac attached" || st.canFind("not charging")) b.status = "not_charging";
+            else b.status = "unknown";
+        } else {
+            b.status = "unknown";
+        }
+        if (parts.length >= 3) {
+            auto rem = parts[2].strip().split();
+            if (rem.length > 0 && rem[0].canFind(':')) {
+                auto hm = rem[0].split(':');
+                if (hm.length == 2) {
+                    try {
+                        long h = to!long(hm[0]);
+                        long m = to!long(hm[1]);
+                        b.time_remaining_s = h * 3600L + m * 60L;
+                    } catch (Exception) {}
+                }
+            }
+        }
+        list ~= b;
+    }
+    return list;
+}
+
+class DarwinPlatformBackend : PlatformBackend {
+    bool exposeMacAddresses;
+
+    this(bool exposeMacAddresses = false) {
+        this.exposeMacAddresses = exposeMacAddresses;
+    }
+
+    version (OSX) {
+        private string sysctlString(const(char)* name) const {
+            size_t len = 0;
+            if (sysctlbyname(name, null, &len, null, 0) != 0 || len == 0 || len > 1024) return "";
+            auto buf = new char[len];
+            if (sysctlbyname(name, buf.ptr, &len, null, 0) != 0) return "";
+            size_t end = len;
+            foreach (i, c; buf[0 .. len]) {
+                if (c == '\0') { end = i; break; }
+            }
+            return sanitizeOsString(cast(string) buf[0 .. end], 160);
+        }
+
+        private bool sysctlU64(const(char)* name, out ulong val) const {
+            size_t sz = ulong.sizeof;
+            ulong tmp = 0;
+            if (sysctlbyname(name, &tmp, &sz, null, 0) == 0 && sz == ulong.sizeof) {
+                val = tmp;
+                return true;
+            }
+            uint u32 = 0;
+            sz = uint.sizeof;
+            if (sysctlbyname(name, &u32, &sz, null, 0) == 0 && sz == uint.sizeof) {
+                val = u32;
+                return true;
+            }
+            return false;
+        }
+
+        private bool sysctlU32(const(char)* name, out uint val) const {
+            size_t sz = uint.sizeof;
+            uint tmp = 0;
+            if (sysctlbyname(name, &tmp, &sz, null, 0) == 0 && sz == uint.sizeof) {
+                val = tmp;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    override PlatformIdentity identity() {
+        PlatformIdentity id;
+        id.os = "darwin";
+        version (AArch64) id.arch = "arm64";
+        else version (X86_64) id.arch = "x86_64";
+        else id.arch = "unknown";
+
+        version (OSX) {
+            id.host = sysctlString("kern.hostname");
+            if (id.host.length == 0) id.host = "macos-host";
+
+            H_timeval bt;
+            size_t bsz = H_timeval.sizeof;
+            if (sysctlbyname("kern.boottime".ptr, &bt, &bsz, null, 0) == 0 && bt.tv_sec > 0) {
+                id.boot_id = format!"darwinboot-%d"(bt.tv_sec);
+                import std.datetime.systime : Clock;
+                long nowWall = Clock.currTime.toUnixTime();
+                if (nowWall >= bt.tv_sec) id.uptime_s = nowWall - bt.tv_sec;
+            } else {
+                id.boot_id = "darwin-boot";
+            }
+        }
+        return id;
+    }
+
+    override RawCpu sampleCpu() {
+        RawCpu c;
+        version (OSX) {
+            H_host_cpu_load_info_data info;
+            uint cnt = H_HOST_CPU_LOAD_INFO_COUNT;
+            if (host_statistics(mach_host_self(), H_HOST_CPU_LOAD_INFO, cast(int*) &info, &cnt) != 0) {
+                c.state = CapabilityState.error;
+                c.error = "mach_host_statistics_failed";
+                return c;
+            }
+            ulong u = info.cpu_ticks[0];
+            ulong sys = info.cpu_ticks[1];
+            ulong idl = info.cpu_ticks[2];
+            ulong ni = info.cpu_ticks[3];
+            c.idle_ticks = idl;
+            c.total_ticks = u + sys + idl + ni;
+
+            uint lcores = 1;
+            if (sysctlU32("hw.logicalcpu".ptr, lcores) && lcores > 0) {
+                c.logical_cores = lcores;
+            }
+
+            double[3] loads;
+            if (getloadavg(loads.ptr, 3) >= 1) {
+                c.load_1m = loads[0];
+            }
+            c.state = CapabilityState.ok;
+        } else {
+            c.state = CapabilityState.unsupported;
+            c.error = "darwin_only_backend";
+        }
+        return c;
+    }
+
+    override RawMemory sampleMemory() {
+        RawMemory m;
+        version (OSX) {
+            ulong memSize = 0;
+            if (!sysctlU64("hw.memsize".ptr, memSize) || memSize == 0) {
+                m.state = CapabilityState.error;
+                m.error = "sysctl_hw_memsize_failed";
+                return m;
+            }
+            m.total_bytes = memSize;
+
+            ulong pageSize = 4096;
+            ulong psTmp = 0;
+            if (sysctlU64("hw.pagesize".ptr, psTmp) && psTmp > 0) pageSize = psTmp;
+
+            H_vm_statistics64 vm;
+            uint cnt = H_HOST_VM_INFO64_COUNT;
+            if (host_statistics64(mach_host_self(), H_HOST_VM_INFO64, cast(int*) &vm, &cnt) == 0) {
+                ulong usedPages = cast(ulong) vm.active_count + cast(ulong) vm.wire_count + cast(ulong) vm.compressor_page_count;
+                ulong usedB = usedPages * pageSize;
+                m.used_bytes = usedB <= memSize ? usedB : memSize;
+            }
+
+            H_xsw_usage xsw;
+            size_t xsz = H_xsw_usage.sizeof;
+            if (sysctlbyname("vm.swapusage".ptr, &xsw, &xsz, null, 0) == 0) {
+                m.swap_total_bytes = xsw.xsu_total;
+                m.swap_used_bytes = xsw.xsu_used;
+            }
+
+            m.state = CapabilityState.ok;
+        } else {
+            m.state = CapabilityState.unsupported;
+            c_err:
+            m.error = "darwin_only_backend";
+        }
+        return m;
+    }
+
+    override RawNetworkResult sampleNetwork() {
+        RawNetworkResult r;
+        version (OSX) {
+            ifaddrs* head = null;
+            if (getifaddrs(&head) != 0 || head is null) {
+                r.state = CapabilityState.error;
+                r.error = "getifaddrs_failed";
+                return r;
+            }
+            scope (exit) freeifaddrs(head);
+
+            r.state = CapabilityState.ok;
+            for (ifaddrs* cur = head; cur !is null; cur = cur.ifa_next) {
+                if (cur.ifa_addr is null || cur.ifa_data is null) continue;
+                if (cur.ifa_addr.sa_family != H_AF_LINK) continue;
+
+                auto ifName = sanitizeOsString(fromStringz(cur.ifa_name).idup, 64);
+                if (ifName.length == 0 || ifName == "lo0") continue;
+
+                auto data = cast(const(H_if_data)*) cur.ifa_data;
+                uint ifIdx = if_nametoindex(cur.ifa_name);
+
+                RawNetworkInterface ni;
+                ni.id = ifIdx > 0 ? ("ifindex:" ~ to!string(ifIdx)) : ("name:" ~ ifName);
+                ni.name = ifName;
+                if (ifName.startsWith("utun")) ni.kind = "tailnet";
+                else if (ifName.startsWith("en")) ni.kind = "physical";
+                else ni.kind = "virtual";
+
+                ni.rx_bytes = data.ifi_ibytes;
+                ni.tx_bytes = data.ifi_obytes;
+                if (data.ifi_baudrate > 0) ni.link_speed_bps = cast(ulong) data.ifi_baudrate;
+                ni.link_up = (cur.ifa_flags & 0x1) != 0; // IFF_UP
+                r.interfaces ~= ni;
+            }
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    override RawProcessResult sampleProcesses() {
+        RawProcessResult r;
+        version (OSX) {
+            auto cpu = sampleCpu();
+            if (cpu.state == CapabilityState.error) {
+                r.state = CapabilityState.error;
+                r.error = cpu.error;
+                return r;
+            }
+            r.total_cpu_ticks = cpu.total_ticks;
+            r.logical_cores = cpu.logical_cores;
+
+            H_mach_timebase_info tb;
+            if (mach_timebase_info(&tb) != 0 || tb.denom == 0) {
+                tb.numer = 1;
+                tb.denom = 1;
+            }
+
+            int byteCap = proc_listallpids(null, 0);
+            if (byteCap <= 0) {
+                r.state = CapabilityState.error;
+                r.error = "proc_listallpids_failed";
+                return r;
+            }
+            auto pids = new int[(byteCap / int.sizeof) + 64];
+            int actualBytes = proc_listallpids(pids.ptr, cast(int)(pids.length * int.sizeof));
+            if (actualBytes <= 0) {
+                r.state = CapabilityState.error;
+                r.error = "proc_listallpids_empty";
+                return r;
+            }
+            size_t count = actualBytes / int.sizeof;
+
+            r.state = CapabilityState.ok;
+            foreach (i; 0 .. count) {
+                int pid = pids[i];
+                if (pid <= 0) continue;
+                H_proc_taskallinfo pti;
+                int resSz = proc_pidinfo(pid, H_PROC_PIDTASKALLINFO, 0, &pti, cast(int) H_proc_taskallinfo.sizeof);
+                if (resSz != cast(int) H_proc_taskallinfo.sizeof) continue;
+
+                auto pname = sanitizeOsString(fromStringz(pti.pbsd.pbi_name.ptr).idup, 128);
+                if (pname.length == 0) {
+                    pname = sanitizeOsString(fromStringz(pti.pbsd.pbi_comm.ptr).idup, 128);
+                }
+                if (pname.length == 0) pname = "pid-" ~ to!string(pid);
+
+                // Convert Mach timebase ticks to 10ms ticks matching host_statistics 100Hz clock
+                ulong machTicks = pti.ptinfo.pti_total_user + pti.ptinfo.pti_total_system;
+                ulong ns = (machTicks / tb.denom) * tb.numer;
+                ulong cpuTicks10ms = ns / 10_000_000UL;
+
+                RawProcess rp;
+                rp.pid = cast(uint) pid;
+                rp.start_id = format!"%u:%u"(pti.pbsd.pbi_start_tvsec, pti.pbsd.pbi_start_tvusec);
+                rp.name = pname;
+                rp.cpu_ticks = cpuTicks10ms;
+                rp.rss_bytes = pti.ptinfo.pti_resident_size;
+                rp.memory_kind = "rss";
+                r.processes ~= rp;
+            }
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    override RawFilesystemResult sampleFilesystems() {
+        RawFilesystemResult r;
+        version (OSX) {
+            int cnt = getfsstat(null, 0, H_MNT_NOWAIT);
+            if (cnt <= 0) {
+                r.state = CapabilityState.error;
+                r.error = "getfsstat_failed";
+                return r;
+            }
+            auto buf = new H_statfs[cnt + 8];
+            int actual = getfsstat(buf.ptr, cast(int)(buf.length * H_statfs.sizeof), H_MNT_NOWAIT);
+            if (actual <= 0) {
+                r.state = CapabilityState.error;
+                r.error = "getfsstat_empty";
+                return r;
+            }
+
+            r.state = CapabilityState.ok;
+            foreach (const ref fs; buf[0 .. actual]) {
+                auto fsType = sanitizeOsString(fromStringz(fs.f_fstypename.ptr).idup, 32).toLower();
+                auto mnt = sanitizeOsString(fromStringz(fs.f_mntonname.ptr).idup, 512);
+                auto src = sanitizeOsString(fromStringz(fs.f_mntfromname.ptr).idup, 256);
+                if (fsType == "devfs" || fsType == "autofs" || fsType == "nullfs") continue;
+                if (mnt.startsWith("/System/Volumes/VM") || mnt.startsWith("/System/Volumes/Preboot")
+                    || mnt.startsWith("/System/Volumes/Update") || mnt.startsWith("/System/Volumes/xarts")
+                    || mnt.startsWith("/System/Volumes/iSCPreboot") || mnt.startsWith("/System/Volumes/Hardware")) {
+                    continue;
+                }
+                if (fs.f_blocks == 0) continue;
+
+                ulong tot = fs.f_blocks * cast(ulong) fs.f_bsize;
+                ulong fre = fs.f_bfree * cast(ulong) fs.f_bsize;
+                ulong used = tot > fre ? (tot - fre) : 0;
+
+                MountStatus ms;
+                ms.mount = mnt;
+                ms.source = src;
+                ms.fs = fsType;
+                ms.total_bytes = tot;
+                ms.used_bytes = used;
+                ms.pct = tot > 0 ? (cast(double) used / cast(double) tot) * 100.0 : 0.0;
+                r.mounts ~= ms;
+            }
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    override RawGpuResult sampleGpus() {
+        // Public macOS APIs do not expose reliable cross-version live GPU utilization without private frameworks
+        return RawGpuResult(CapabilityState.unsupported, "", null);
+    }
+
+    override RawBatteryResult sampleBatteries() {
+        RawBatteryResult r;
+        version (OSX) {
+            try {
+                auto ex = execute(["/usr/bin/pmset", "-g", "batt"], null, Config.none, 4096);
+                if (ex.status == 0) {
+                    r.state = CapabilityState.ok;
+                    r.batteries = parsePmsetBatteryOutput(ex.output);
+                    return r;
+                }
+            } catch (Exception) {}
+            r.state = CapabilityState.unavailable;
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    override RawMaintenanceResult sampleMaintenance() {
+        RawMaintenanceResult r;
+        version (OSX) {
+            r.state = CapabilityState.ok;
+            r.drift.running_kernel = sysctlString("kern.osrelease");
+            // Never invoke `softwareupdate -l` during passive telemetry
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    override RawHardwareResult scanHardware() {
+        RawHardwareResult r;
+        version (OSX) {
+            HardwareInventory hw;
+            auto modelId = sysctlString("hw.model");
+            hw.system.manufacturer = "Apple Inc.";
+            hw.system.model = modelId;
+            hw.system.product_family = sysctlString("kern.osproductversion");
+            auto lowMod = modelId.toLower();
+            if (lowMod.canFind("macbook")) hw.system.form_factor = "laptop";
+            else if (lowMod.length > 0) hw.system.form_factor = "desktop";
+
+            // On Macs without PC-style motherboard info, expose Mac model identifier cleanly
+            hw.board.manufacturer = "Apple Inc.";
+            hw.board.model = modelId;
+            hw.firmware.type = "Apple Boot";
+            hw.firmware.vendor = "Apple Inc.";
+            hw.firmware.version_str = sysctlString("kern.osversion");
+
+            version (AArch64) hw.cpu.architecture = "arm64";
+            else version (X86_64) hw.cpu.architecture = "x86_64";
+            else hw.cpu.architecture = "unknown";
+
+            hw.cpu.display_name = sysctlString("machdep.cpu.brand_string");
+            if (hw.cpu.display_name.length == 0) hw.cpu.display_name = modelId;
+            version (AArch64) hw.cpu.vendor = "Apple";
+            else {
+                auto bv = hw.cpu.display_name.toLower();
+                hw.cpu.vendor = bv.canFind("intel") ? "Intel" : "Apple";
+            }
+
+            uint val32 = 0;
+            if (sysctlU32("hw.packages".ptr, val32)) hw.cpu.sockets = val32;
+            if (sysctlU32("hw.physicalcpu".ptr, val32)) hw.cpu.physical_cores = val32;
+            if (sysctlU32("hw.logicalcpu".ptr, val32)) hw.cpu.logical_cores = val32;
+            if (sysctlU32("hw.perflevel0.physicalcpu".ptr, val32)) hw.cpu.performance_cores = val32;
+            if (sysctlU32("hw.perflevel1.physicalcpu".ptr, val32)) hw.cpu.efficiency_cores = val32;
+
+            ulong csz = 0;
+            if (sysctlU64("hw.l1dcachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1d = csz;
+            if (sysctlU64("hw.l1icachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1i = csz;
+            if (sysctlU64("hw.l2cachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l2 = csz;
+            if (sysctlU64("hw.l3cachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l3 = csz;
+
+            version (X86_64) {
+                hw.cpu.isa = detectHostX86Isa();
+            } else version (AArch64) {
+                hw.cpu.isa = detectAppleSiliconIsa();
+            }
+
+            auto rawMem = sampleMemory();
+            hw.memory.total_bytes = rawMem.total_bytes;
+            hw.memory.module_enumeration = CapabilityState.unsupported;
+
+            auto netRes = sampleNetwork();
+            if (netRes.state == CapabilityState.ok) {
+                foreach (ni; netRes.interfaces) {
+                    NetworkAdapterHardware na;
+                    na.id = ni.id;
+                    na.display_name = ni.name == "utun" || ni.kind == "tailnet" ? ("Tailscale Tunnel (" ~ ni.name ~ ")") : ni.name;
+                    na.interface_name = ni.name;
+                    na.kind = ni.kind == "physical" ? "ethernet" : ni.kind;
+                    na.link_speed_bps = ni.link_speed_bps;
+                    hw.network_adapters ~= na;
+                }
+            }
+
+            hw.capabilities["board"] = hw.board.model.length > 0 ? CapabilityState.ok : CapabilityState.unavailable;
+            hw.capabilities["memory_modules"] = CapabilityState.unsupported;
+            hw.capabilities["network_adapters"] = CapabilityState.ok;
+            hw.capabilities["storage_devices"] = CapabilityState.unavailable;
+            hw.capabilities["isa"] = hw.cpu.isa.usable.length > 0 ? CapabilityState.ok : CapabilityState.unavailable;
+
+            hw.collection.status = GroupStatus.fresh;
+            hw.collection.partial = true;
+            r.state = CapabilityState.ok;
+            r.inventory = hw;
+        } else {
+            r.state = CapabilityState.unsupported;
+            r.error = "darwin_only_backend";
+        }
+        return r;
+    }
+
+    version (OSX) {
+        private IsaInfo detectAppleSiliconIsa() const {
+            IsaInfo isa;
+            static immutable string[2][] sysctlMap = [
+                ["hw.optional.floatingpoint", "fp"],
+                ["hw.optional.neon", "asimd"],
+                ["hw.optional.AdvSIMD", "asimd"],
+                ["hw.optional.arm.FEAT_AES", "aes"],
+                ["hw.optional.arm.FEAT_PMULL", "pmull"],
+                ["hw.optional.arm.FEAT_SHA1", "sha1"],
+                ["hw.optional.arm.FEAT_SHA256", "sha2"],
+                ["hw.optional.arm.FEAT_SHA3", "sha3"],
+                ["hw.optional.arm.FEAT_SHA512", "sha512"],
+                ["hw.optional.armv8_crc32", "crc32"],
+                ["hw.optional.arm.FEAT_LSE", "atomics"],
+                ["hw.optional.arm.FEAT_FP16", "fphp"],
+                ["hw.optional.arm.FEAT_DotProd", "asimddp"],
+                ["hw.optional.arm.FEAT_BF16", "bf16"],
+                ["hw.optional.arm.FEAT_I8MM", "i8mm"],
+                ["hw.optional.arm.FEAT_FCMA", "fcma"],
+                ["hw.optional.arm.FEAT_JSCVT", "jscvt"],
+                ["hw.optional.arm.FEAT_BTI", "bti"],
+                ["hw.optional.arm.FEAT_PAuth", "paca"],
+            ];
+            string[] feats;
+            foreach (pair; sysctlMap) {
+                uint v = 0;
+                if (sysctlU32(pair[0].ptr, v) && v != 0) {
+                    feats ~= pair[1];
+                }
+            }
+            isa.hardware = normalizeIsaList(feats);
+            isa.usable = isa.hardware.dup;
+            isa.detection = "sysctl_hw_optional";
+            return isa;
+        }
+    }
+}

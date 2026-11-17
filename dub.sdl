@@ -1,0 +1,26 @@
+name "hikari"
+description "Decentralized, on-demand Tailscale fleet telemetry and hardware inventory agent"
+authors "hikari contributors"
+license "MIT"
+targetType "executable"
+targetPath "bin"
+
+buildType "debug" {
+    buildOptions "debugMode" "debugInfo"
+}
+
+buildType "release" {
+    buildOptions "releaseMode" "optimize" "inline"
+}
+
+configuration "application" {
+    mainSourceFile "src/main.d"
+    sourcePaths "src"
+}
+
+configuration "unittest" {
+    targetName "hikari-test"
+    mainSourceFile "tests/runner.d"
+    sourcePaths "src" "tests"
+    excludedSourceFiles "src/main.d"
+}

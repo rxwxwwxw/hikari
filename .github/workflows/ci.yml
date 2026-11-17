@@ -1,0 +1,112 @@
+name: CI (Linux, Windows, macOS)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-build-and-test:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            docker_distro: all
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            docker_distro: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LDC2, DUB, and tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ldc dub nodejs openssl curl tar iproute2 shellcheck python3
+
+      - name: Build debug and release binaries
+        run: |
+          dub build --compiler=ldc2 --build=debug
+          dub build --compiler=ldc2 --build=release
+
+      - name: Run D unit and contract test suite
+        run: dub test --compiler=ldc2
+
+      - name: Smoke test CLI commands
+        run: |
+          ./bin/hikari version
+          ./bin/hikari snapshot --state-dir /tmp/ci-state > /tmp/snap.json
+          ./bin/hikari hardware --state-dir /tmp/ci-state > /tmp/hw.json
+          python3 -c 'import json; json.load(open("/tmp/snap.json")); json.load(open("/tmp/hw.json"))'
+
+      - name: Run browser and macOS-layout installer tests
+        run: |
+          node tests/browser/test_dashboard.js
+          bash tests/integration/macos/test-installer.sh
+
+      - name: Run shellcheck on scripts
+        run: shellcheck -S warning install/install.sh install/uninstall.sh tests/integration/linux/*.sh tests/integration/macos/*.sh
+
+      - name: Run Linux installer, service, and container suite
+        run: bash tests/integration/linux/run.sh --distro "${{ matrix.docker_distro }}"
+
+  windows-build-and-test:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup LDC2
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Build debug and release binaries
+        run: |
+          dub build --compiler=ldc2 --build=debug
+          dub build --compiler=ldc2 --build=release
+
+      - name: Run D unit tests
+        run: dub test --compiler=ldc2
+
+      - name: Smoke test Windows CLI & installer
+        shell: pwsh
+        run: |
+          .\bin\hikari.exe version
+          .\bin\hikari.exe snapshot --state-dir "$env:TEMP\hikari-ci" | Out-Null
+          .\bin\hikari.exe hardware --state-dir "$env:TEMP\hikari-ci" | Out-Null
+          .\tests\integration\windows\test-installer.ps1
+
+  macos-build-and-test:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LDC2 and DUB
+        run: brew install ldc dub
+
+      - name: Build debug and release binaries
+        run: |
+          dub build --compiler=ldc2 --build=debug
+          dub build --compiler=ldc2 --build=release
+
+      - name: Run D unit tests and macOS smoke checks
+        run: |
+          dub test --compiler=ldc2
+          ./bin/hikari version
+          ./bin/hikari snapshot --state-dir /tmp/hikari-mac-ci > /tmp/snap.json
+          ./bin/hikari hardware --state-dir /tmp/hikari-mac-ci > /tmp/hw.json
+          bash tests/integration/macos/test-installer.sh

@@ -1,0 +1,5 @@
+PRETTY_NAME="Armbian 24.8.1 noble"
+NAME="Ubuntu"
+ID=ubuntu
+ID_LIKE=debian
+ARMBIAN_PRETTY_NAME="Armbian 24.8.1 noble"

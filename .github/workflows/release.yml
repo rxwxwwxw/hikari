@@ -1,0 +1,156 @@
+name: Release (Linux, Windows, macOS)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package-unix:
+    name: Package ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+          - os: darwin
+            arch: x86_64
+            runner: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches VERSION
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER="$(cat VERSION | tr -d '[:space:]')"
+          test "$TAG_VER" = "$FILE_VER"
+
+      - name: Install LDC2 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ldc dub
+
+      - name: Install LDC2 (macOS)
+        if: matrix.os == 'darwin'
+        run: brew install ldc dub
+
+      - name: Build release binary and run tests
+        run: |
+          dub test --compiler=ldc2
+          dub build --compiler=ldc2 --build=release
+
+      - name: Create release archive
+        run: |
+          STAGE="dist/stage"
+          mkdir -p "$STAGE/web" "$STAGE/caddy" "$STAGE/install"
+          cp bin/hikari "$STAGE/hikari"
+          cp VERSION "$STAGE/VERSION"
+          cp web/index.html "$STAGE/web/index.html"
+          cp caddy/Caddyfile.tmpl "$STAGE/caddy/Caddyfile.tmpl"
+          cp caddy/snippet.caddy.tmpl "$STAGE/caddy/snippet.caddy.tmpl"
+          cp install/install.sh "$STAGE/install/install.sh"
+          cp install/uninstall.sh "$STAGE/install/uninstall.sh"
+          tar -czf "dist/hikari-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" -C "$STAGE" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hikari-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/hikari-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+  package-windows:
+    name: Package windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup LDC2
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Build release binary and run tests
+        run: |
+          dub test --compiler=ldc2
+          dub build --compiler=ldc2 --build=release
+
+      - name: Create Windows release zip
+        shell: pwsh
+        run: |
+          $stage = "dist\stage"
+          New-Item -ItemType Directory -Force -Path "$stage\web", "$stage\caddy", "$stage\install" | Out-Null
+          Copy-Item bin\hikari.exe "$stage\hikari.exe"
+          Copy-Item VERSION "$stage\VERSION"
+          Copy-Item web\index.html "$stage\web\index.html"
+          Copy-Item caddy\Caddyfile.tmpl "$stage\caddy\Caddyfile.tmpl"
+          Copy-Item caddy\snippet.caddy.tmpl "$stage\caddy\snippet.caddy.tmpl"
+          Copy-Item install\install.ps1 "$stage\install\install.ps1"
+          Copy-Item install\uninstall.ps1 "$stage\install\uninstall.ps1"
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\hikari-windows-x86_64.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hikari-windows-x86_64
+          path: dist/hikari-windows-x86_64.zip
+
+  publish-manifest:
+    needs: [package-unix, package-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate manifest.json and sign if release key configured
+        env:
+          SIGNING_KEY: ${{ secrets.HIKARI_RELEASE_ED25519_KEY }}
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name 'hikari-*.tar.gz' -o -name 'hikari-*.zip' \) -exec cp {} release-files/ \;
+          VER="$(cat VERSION | tr -d '[:space:]')"
+          python3 - <<PY
+          import hashlib, json, os, glob
+          arts = []
+          for p in sorted(glob.glob("release-files/hikari-*")):
+              fn = os.path.basename(p)
+              stem = fn.replace(".tar.gz", "").replace(".zip", "")
+              parts = stem.split("-")
+              os_name, arch = parts[1], parts[2]
+              data = open(p, "rb").read()
+              arts.append({
+                  "os": os_name,
+                  "arch": arch,
+                  "filename": fn,
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "size_bytes": len(data),
+              })
+          manifest = {
+              "schema_version": 1,
+              "repo": os.environ["GITHUB_REPOSITORY"],
+              "version": "$VER",
+              "channel": "stable",
+              "artifacts": arts,
+          }
+          open("release-files/manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
+          PY
+          if [ -n "$SIGNING_KEY" ]; then
+            printf '%s\n' "$SIGNING_KEY" > /tmp/rel.pem
+            openssl pkeyutl -sign -inkey /tmp/rel.pem -rawin -in release-files/manifest.json -out release-files/manifest.sig
+            rm -f /tmp/rel.pem
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*

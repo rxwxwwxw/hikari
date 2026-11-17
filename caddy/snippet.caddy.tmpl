@@ -1,0 +1,16 @@
+# Importable Caddy snippet for operators integrating hikari into an existing site block.
+# Example inside your https://my-host.tail1234.ts.net { ... } block:
+#   import /etc/hikari/hikari-snippet.caddy
+#
+# hikari does not modify or reload your existing Caddy configuration or service.
+
+handle_path __BASE_PATH_PREFIX__/* {
+	handle /api/v1/* {
+		reverse_proxy 127.0.0.1:__LOCAL_PORT__
+	}
+
+	handle {
+		root * __WEB_DIR__
+		file_server
+	}
+}

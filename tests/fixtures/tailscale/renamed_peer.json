@@ -1,0 +1,21 @@
+{
+  "MagicDNSSuffix": "tail1234.ts.net",
+  "Self": {
+    "ID": "nSelf123",
+    "HostName": "workstation-linux",
+    "DNSName": "workstation-linux.tail1234.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.10"],
+    "Online": true
+  },
+  "Peer": {
+    "nodekey:peer1": {
+      "ID": "nPeer1",
+      "HostName": "storage-renamed",
+      "DNSName": "storage-renamed.tail1234.ts.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.11"],
+      "Online": true
+    }
+  }
+}
