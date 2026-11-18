@@ -112,6 +112,12 @@ if [ "$TARGET_OS" = "macos" ]; then
 
   remove_path "$UNIT_DIR/io.hikari.recover.plist"
   remove_path "$UNIT_DIR/io.hikari.agent.plist"
+  if [ -f "$UNIT_DIR/io.hikari.maintenance.plist" ] && grep -q 'hikari-owned maintenance' "$UNIT_DIR/io.hikari.maintenance.plist"; then
+    if [ "$DRY_RUN" -eq 0 ] && [ -z "$ROOT_PREFIX" ] && [ "$SYSTEMD_MODE" = auto ]; then
+      launchctl bootout system/io.hikari.maintenance 2>/dev/null || true
+    fi
+    remove_path "$UNIT_DIR/io.hikari.maintenance.plist"
+  fi
   remove_path "$UNIT_DIR/io.hikari.caddy.plist"
   remove_path "$OPT_HIKARI"
   remove_path "$ETC_HIKARI/Caddyfile"
@@ -133,11 +139,25 @@ else
     if [ "$DRY_RUN" -eq 1 ]; then
       echo "[dry-run] Would stop and disable hikari.service and hikari-caddy.service"
     else
+      if grep -q 'hikari-owned maintenance' "$UNIT_DIR/hikari-maintenance.path" 2>/dev/null; then
+        systemctl disable --now hikari-maintenance.path 2>/dev/null || true
+      fi
+      if grep -q 'hikari-owned maintenance' "$UNIT_DIR/hikari-maintenance.timer" 2>/dev/null; then
+        systemctl disable --now hikari-maintenance.timer 2>/dev/null || true
+      fi
+      if grep -q 'hikari-owned maintenance' "$UNIT_DIR/hikari-maintenance.service" 2>/dev/null; then
+        systemctl stop hikari-maintenance.service 2>/dev/null || true
+      fi
       systemctl disable --now hikari-caddy.service 2>/dev/null || true
       systemctl disable --now hikari.service 2>/dev/null || true
     fi
   fi
 
+  for maintenance in hikari-maintenance.timer hikari-maintenance.service hikari-maintenance.path; do
+    if grep -q 'hikari-owned maintenance' "$UNIT_DIR/$maintenance" 2>/dev/null; then
+      remove_path "$UNIT_DIR/$maintenance"
+    fi
+  done
   remove_path "$UNIT_DIR/hikari.service"
   remove_path "$UNIT_DIR/hikari-caddy.service"
   remove_path "$OPT_HIKARI"

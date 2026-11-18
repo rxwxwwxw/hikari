@@ -360,7 +360,9 @@ async function runTests() {
   vm.runInNewContext(scriptSrc, sandbox);
 
   // Wait for initial async refreshAll launched by init()
-  await new Promise((r) => setTimeout(r, 40));
+  for (let attempt = 0; attempt < 200 && (!sandbox.window.__hikariApp || sandbox.window.__hikariApp.state.isPolling); attempt++)
+    await new Promise((r) => setTimeout(r, 5));
+  assert(!sandbox.window.__hikariApp.state.isPolling, "Initial refresh must complete");
 
   const app = sandbox.window.__hikariApp;
   assert(app, "Dashboard failed to initialize");
@@ -393,12 +395,74 @@ async function runTests() {
   const hwCount2 = fetchCalls.filter((u) => u.includes("/hardware")).length;
   assert.strictEqual(hwCount2, 1, "Second hardware view must reuse session cache");
 
+  // Real timeout AbortErrors must change presence, unlike visibility cancellation.
+  const originalFetch = sandbox.fetch;
+  const originalTimeout = sandbox.setTimeout;
+  sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 5000 ? 5 : ms);
+  sandbox.fetch = (url, opts) => url === "./api/v1/status"
+    ? new Promise((resolve, reject) => opts.signal.addEventListener("abort", () =>
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))))
+    : originalFetch(url, opts);
+  await app.refreshAll(false);
+  assert.strictEqual(app.state.statusByNode.get("hikari:self-1").state, "unreachable");
+  sandbox.setTimeout = originalTimeout;
+
+  // A cold inventory retries while visible, and stops loading after success.
+  app.state.activeTab = "hardware";
+  app.state.selectedNodeId = "hikari:self-1";
+  app.state.hardwareByNode.delete("hikari:self-1");
+  let hardwareAttempts = 0;
+  sandbox.fetch = (url, opts) => {
+    if (url === "./api/v1/hardware" && ++hardwareAttempts === 1)
+      return Promise.resolve({status:202, ok:true, text:async () => JSON.stringify({retry_after_s:1})});
+    return originalFetch(url, opts);
+  };
+  sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 1000 ? 5 : ms);
+  await app.ensureHardwareLoaded("hikari:self-1", false);
+  assert.strictEqual(app.state.hardwareByNode.get("hikari:self-1").loading, false);
+  for (let attempt = 0; attempt < 200 && !app.state.hardwareByNode.get("hikari:self-1").data; attempt++)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.strictEqual(hardwareAttempts, 2);
+  assert(app.state.hardwareByNode.get("hikari:self-1").data);
+  sandbox.fetch = originalFetch;
+  sandbox.setTimeout = originalTimeout;
+
+  // Hardware timeouts leave the reload control usable, with cached data retained.
+  sandbox.fetch = (url, opts) => url === "./api/v1/hardware"
+    ? new Promise((resolve, reject) => opts.signal.addEventListener("abort", () =>
+        reject(Object.assign(new Error("aborted"), { name: "AbortError" }))))
+    : originalFetch(url, opts);
+  sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 6000 ? 5 : ms);
+  await app.ensureHardwareLoaded("hikari:self-1", true);
+  assert.strictEqual(app.state.hardwareByNode.get("hikari:self-1").loading, false);
+  assert(app.state.hardwareByNode.get("hikari:self-1").error);
+
+  // A permanently collecting endpoint has a finite retry budget.
+  let collectingCalls = 0;
+  sandbox.fetch = (url, opts) => {
+    if (url !== "./api/v1/hardware") return originalFetch(url, opts);
+    collectingCalls++;
+    return Promise.resolve({status:202, ok:true, text:async () => JSON.stringify({retry_after_s:1})});
+  };
+  sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 1000 ? 5 : ms);
+  await app.ensureHardwareLoaded("hikari:self-1", true);
+  for (let attempt = 0; attempt < 200 && (app.state.hardwareRetryTimer || app.state.hardwareByNode.get("hikari:self-1").loading); attempt++)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.strictEqual(collectingCalls, 11);
+  assert.strictEqual(app.state.hardwareByNode.get("hikari:self-1").loading, false);
+  await app.ensureHardwareLoaded("hikari:self-1", true);
+  assert(app.state.hardwareRetryTimer, "202 must schedule a retry while visible");
+
   // Verify visibility-hidden stops polling timers and blocks fetches
   assert(activeTimers.size > 0, "Visible page should have an active polling timer");
   const callsBeforeHidden = fetchCalls.length;
   document.visibilityState = "hidden";
   app.onVisibilityChange();
   assert.strictEqual(activeTimers.size, 0, "Hiding tab must clear all polling timers");
+  assert.strictEqual(app.state.hardwareRetryTimer, null, "Hiding tab cancels hardware retries");
+  const beforeHiddenCollecting = collectingCalls;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.strictEqual(collectingCalls, beforeHiddenCollecting);
   await app.refreshAll(false);
   assert.strictEqual(fetchCalls.length, callsBeforeHidden, "Hidden page must make ZERO fetch requests");
 

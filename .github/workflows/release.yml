@@ -59,7 +59,7 @@ jobs:
           cp caddy/snippet.caddy.tmpl "$STAGE/caddy/snippet.caddy.tmpl"
           cp install/install.sh "$STAGE/install/install.sh"
           cp install/uninstall.sh "$STAGE/install/uninstall.sh"
-          cp install/macos-*.sh install/*.py "$STAGE/install/"
+          cp install/macos-*.sh install/maintenance-jobs.sh install/*.py "$STAGE/install/"
           tar -czf "dist/hikari-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" -C "$STAGE" .
 
       - uses: actions/upload-artifact@v4

@@ -217,3 +217,30 @@ unittest {
     assert(statusCalls == 0);
     assert(backend.counts.cpuCalls == 0 && backend.counts.hardwareCalls == 0);
 }
+
+unittest {
+    import core.thread : Thread;
+    import core.time : MonoTime, msecs;
+    auto server = new LoopbackHttpServer("127.0.0.1", 0, null, 2);
+    auto acceptThread = server.startBackground();
+    scope(exit) { server.stop(); acceptThread.join(); }
+    auto first = new TcpSocket;
+    auto second = new TcpSocket;
+    scope(exit) { first.close(); second.close(); }
+    first.connect(new InternetAddress("127.0.0.1", server.actualPort()));
+    second.connect(new InternetAddress("127.0.0.1", server.actualPort()));
+    auto deadline = MonoTime.currTime + msecs(1000);
+    while (server.activeClients() < 2 && MonoTime.currTime < deadline) Thread.sleep(msecs(5));
+    assert(server.activeClients() == 2);
+    auto excess = new TcpSocket;
+    scope(exit) excess.close();
+    excess.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, msecs(1000));
+    excess.connect(new InternetAddress("127.0.0.1", server.actualPort()));
+    char[1] data;
+    assert(excess.receive(data[]) == 0, "Overload must close without another worker");
+    assert(server.activeClients() == 2);
+    first.close(); second.close();
+    deadline = MonoTime.currTime + msecs(1000);
+    while (server.activeClients() && MonoTime.currTime < deadline) Thread.sleep(msecs(5));
+    assert(server.activeClients() == 0, "Disconnected clients release admission slots");
+}

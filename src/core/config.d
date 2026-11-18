@@ -176,6 +176,8 @@ void validateConfig(const ref HikariConfig cfg) {
     if (!["auto", "integrate", "isolated", "snippet"].canFind(cfg.caddy.mode)) {
         throw new Exception("caddy.mode must be one of auto, integrate, isolated, snippet; got: " ~ cfg.caddy.mode);
     }
+    if (cfg.updates.check_interval_hours == 0 || cfg.updates.check_interval_hours > 8760)
+        throw new Exception("updates.check_interval_hours must be between 1 and 8760");
     if (cfg.discovery.max_concurrent_probes == 0 || cfg.discovery.max_concurrent_probes > 32) {
         throw new Exception("discovery.max_concurrent_probes must be between 1 and 32");
     }

@@ -68,13 +68,20 @@ class LoopbackHttpServer {
     string bindAddr;
     ushort port;
     HikariRouter router;
+    void delegate() dashboardResponseCompleted;
 
     private TcpSocket listener;
     private shared bool running = false;
     private shared size_t rawHandle = size_t.max;
     private ushort boundPort = 0;
+    private shared uint clients = 0;
+    private uint maxClients;
 
-    this(string bindAddr, ushort port, HikariRouter router) {
+    uint activeClients() { return atomicLoad(clients); }
+
+    this(string bindAddr, ushort port, HikariRouter router, uint maxClients = 32) {
+        if (!maxClients || maxClients > 1024) throw new Exception("Invalid HTTP client limit");
+        this.maxClients = maxClients;
         if (!isLoopbackBindAddress(bindAddr)) {
             throw new Exception("Security violation: HTTP server refuses non-loopback bind address: " ~ bindAddr);
         }
@@ -130,11 +137,21 @@ class LoopbackHttpServer {
     }
 
     private void spawnClientHandler(Socket c) {
-        auto t = new Thread({
-            handleConnection(c);
-        });
-        t.isDaemon = true;
-        t.start();
+        // Only the accept loop admits clients. Reject overload before allocating
+        // a thread; closing here never blocks accept on a slow client's writes.
+        if (atomicLoad(clients) >= maxClients) { closeQuietly(c); return; }
+        atomicOp!"+="(clients, 1);
+        try {
+            auto t = new Thread({
+                scope (exit) atomicOp!"-="(clients, 1);
+                handleConnection(c);
+            });
+            t.isDaemon = true;
+            t.start();
+        } catch (Exception) {
+            atomicOp!"-="(clients, 1);
+            closeQuietly(c);
+        }
     }
 
     void serveLoop() {
@@ -150,6 +167,13 @@ class LoopbackHttpServer {
                 if (!atomicLoad(running)) break;
             }
         }
+    }
+
+    // Called after stopping acceptance. An external update supervisor waits for
+    // the service to stop before starting the replacement, preserving responses.
+    void drainClients() {
+        import core.time : msecs;
+        while (atomicLoad(clients)) Thread.sleep(msecs(10));
     }
 
     Thread startBackground() {
@@ -182,7 +206,12 @@ class LoopbackHttpServer {
             size_t total = 0;
             bool headersComplete = false;
 
+            import core.time : MonoTime;
+            auto headerDeadline = MonoTime.currTime + msecs(3000);
             while (total < MAX_REQUEST_BYTES) {
+                auto remaining = headerDeadline - MonoTime.currTime;
+                if (remaining <= msecs(1)) return;
+                client.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, remaining);
                 auto n = client.receive(buf[total .. MAX_REQUEST_BYTES]);
                 if (n <= 0) break;
                 total += n;
@@ -202,7 +231,7 @@ class LoopbackHttpServer {
                 return;
             }
 
-            if (total == 0) return;
+            if (total == 0 || !headersComplete) return;
 
             auto rawReq = cast(string) buf[0 .. total];
             HttpRequest req;
@@ -220,6 +249,9 @@ class LoopbackHttpServer {
             auto resp = router.handle(req);
             auto wire = formatRawHttpResponse(resp, req.method == "HEAD");
             sendAll(client, wire);
+            auto path = stripConfiguredBasePath(req.path, router.config.listen.base_path);
+            if (dashboardResponseCompleted !is null && resp.statusCode >= 200 && resp.statusCode < 300 &&
+                (path == "/api/v1/status" || path == "/api/v1/nodes")) dashboardResponseCompleted();
         } catch (Exception) {
             // Connection dropped or timed out cleanly
         }
@@ -230,11 +262,16 @@ class LoopbackHttpServer {
     }
 
     private static void sendAll(Socket sock, string data) {
+        import core.time : MonoTime, msecs;
+        auto deadline = MonoTime.currTime + msecs(5000);
         size_t sent = 0;
         auto bytes = cast(const(ubyte)[]) data;
         while (sent < bytes.length) {
+            auto remaining = deadline - MonoTime.currTime;
+            if (remaining <= msecs(1)) throw new Exception("Response deadline exceeded");
+            sock.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, remaining);
             auto n = sock.send(bytes[sent .. $]);
-            if (n <= 0) break;
+            if (n <= 0) throw new Exception("Response connection closed");
             sent += n;
         }
     }

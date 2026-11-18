@@ -282,7 +282,19 @@ if (-not $SnippetOnly -and $CaddyDecision -eq "isolated") { Resolve-IsolatedCadd
 
 $AppVersion = if (Test-Path (Join-Path $RepoRoot "VERSION")) { (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim() } else { "0.1.0" }
 
+# Fail before writes when the maintenance task name belongs to someone else.
+if ($ManageServices) {
+    $taskBeforeInstall = Get-ScheduledTask -TaskName "hikari-maintenance" -ErrorAction SilentlyContinue
+    if ($taskBeforeInstall -and ($taskBeforeInstall.Description -ne "hikari-owned maintenance" -or
+            @($taskBeforeInstall.Actions).Count -ne 1 -or
+            $taskBeforeInstall.Actions[0].Execute -ne (Join-Path $CurrentJunction "hikari.exe") -or
+            $taskBeforeInstall.Actions[0].Arguments -ne "update maintain --config `"$ConfigPath`"")) {
+        throw "Refusing to replace a foreign hikari-maintenance task"
+    }
+}
+
 Write-Host "=== hikari Windows install plan ==="
+Write-Host "  Maintenance:      hikari-maintenance scheduled task (SYSTEM), local eligibility every 5 min; network only when update policy permits."
 Write-Host "  Version:          $AppVersion -> $VersionsDir\$AppVersion (versions\current junction)"
 Write-Host "  Config / state:   $ConfigDir (config.json preserved if present) / $StateDir"
 Write-Host "  Ports:            tailnet=$TailnetPort loopback=127.0.0.1:$LoopbackPort base_path=$BasePath"
@@ -639,6 +651,29 @@ if ($Integrated) {
 }
 
 # ---------------------------------------------------------------------------
+# Short-lived privileged job: the restricted agent only writes an activity timestamp.
+if ($ManageServices) {
+    $existingTask = Get-ScheduledTask -TaskName "hikari-maintenance" -ErrorAction SilentlyContinue
+    $maintenanceArguments = "update maintain --config `"$ConfigPath`""
+    if ($existingTask -and ($existingTask.Description -ne "hikari-owned maintenance" -or
+            @($existingTask.Actions).Count -ne 1 -or $existingTask.Actions[0].Execute -ne $InstalledExe -or
+            $existingTask.Actions[0].Arguments -ne $maintenanceArguments)) {
+        throw "Refusing to replace a foreign hikari-maintenance task"
+    }
+    $action = New-ScheduledTaskAction -Execute $InstalledExe -Argument $maintenanceArguments
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName "hikari-maintenance" -Description "hikari-owned maintenance" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    if ($AgentAccount -eq "Virtual") {
+        $agentSid = ([System.Security.Principal.NTAccount]"NT SERVICE\hikari").Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $scheduler = New-Object -ComObject "Schedule.Service"
+        $scheduler.Connect()
+        # Read/execute only: agent can trigger this fixed action, never change it.
+        $scheduler.GetFolder("\").GetTask("hikari-maintenance").SetSecurityDescriptor("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$agentSid)", 0)
+    }
+}
+
 # 10. Post-install verification from the real service identity
 # ---------------------------------------------------------------------------
 $ServiceTailscaleOk = $null

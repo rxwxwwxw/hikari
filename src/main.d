@@ -16,7 +16,7 @@ import platform.command : runLocalCommand;
 import platform.linux;
 import std.algorithm : canFind, startsWith;
 import std.conv : to;
-import std.file : exists, mkdirRecurse, readText, remove, tempDir, write;
+import std.file : exists, mkdirRecurse, readText, remove, rmdirRecurse, tempDir, write;
 import std.format : format;
 import std.json : JSONOptions, JSONValue, parseJSON;
 import std.process : Config, environment, execute;
@@ -26,6 +26,7 @@ import std.typecons : Nullable;
 import tailnet.discovery;
 import tailnet.registry;
 import update.activate;
+import update.maintenance;
 import update.stage;
 import update.verify;
 
@@ -241,6 +242,8 @@ private int serveMain(string[] args, Logger log, void delegate() reportRunning) 
         return 1;
     }
 
+    auto updateRequest = new DashboardUpdateRequest(cfg);
+    server.dashboardResponseCompleted = &updateRequest.completedRequest;
     installStopHandlers(server);
     if (reportRunning !is null) reportRunning();
     log.info(format!"hikari %s listening on http://%s:%u%s (node_id=%s, config=%s, state=%s, web=%s)"(
@@ -264,6 +267,7 @@ private int serveMain(string[] args, Logger log, void delegate() reportRunning) 
     identityInit.start();
 
     server.serveLoop();
+    server.drainClients();
     log.info("hikari stopped");
     return 0;
 }
@@ -298,12 +302,29 @@ version (Windows) {
     }
 }
 
+version (Posix) {
+    private extern (C) void hikariPosixSignalHandler(int signal) nothrow @nogc {
+        hikariRequestStop();
+    }
+}
+
 private void installStopHandlers(LoopbackHttpServer server) {
     import core.atomic : atomicLoad;
     gStopTarget = server;
     version (Windows) {
         import core.sys.windows.wincon : SetConsoleCtrlHandler;
         SetConsoleCtrlHandler(&hikariConsoleCtrlHandler, TRUE);
+    } else version (Posix) {
+        import core.sys.posix.signal : sigaction, sigaction_t, sigemptyset, SIGTERM, SIGINT, SIGPIPE;
+        import core.stdc.signal : SIG_IGN;
+        sigaction_t action;
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = &hikariPosixSignalHandler;
+        if (sigaction(SIGTERM, &action, null) != 0 || sigaction(SIGINT, &action, null) != 0)
+            throw new Exception("Unable to install graceful shutdown handlers");
+        action.sa_handler = SIG_IGN;
+        if (sigaction(SIGPIPE, &action, null) != 0)
+            throw new Exception("Unable to suppress disconnected-client SIGPIPE");
     }
     // A stop that arrived during startup must not be lost.
     if (atomicLoad(gStopRequested)) server.requestStop();
@@ -856,6 +877,16 @@ private int cmdUpdate(string[] args) {
     auto stateDir = getFlagValue(args, "--state-dir", cfg.paths.state_dir);
     auto versionsDir = getFlagValue(args, "--versions-dir", cfg.paths.versions_dir);
 
+    version (Windows) { enum updateOs = "windows"; enum updateArch = "x86_64"; }
+    else version (OSX) {
+        enum updateOs = "darwin";
+        version (AArch64) enum updateArch = "arm64"; else enum updateArch = "x86_64";
+    } else {
+        enum updateOs = "linux";
+        version (AArch64) enum updateArch = "aarch64"; else enum updateArch = "x86_64";
+    }
+    if (sub == "maintain") return maintainRelease(cfg, updateOs, updateArch);
+
     if (sub == "check") {
         if (!cfg.updates.isTrustConfigured()) {
             stderr.writeln("Signed update trust root not configured (repo and public_key required).");
@@ -863,8 +894,14 @@ private int cmdUpdate(string[] args) {
         }
         auto manifestPath = getFlagValue(args, "--manifest", "");
         auto sigPath = getFlagValue(args, "--sig", "");
-        if (manifestPath.length == 0 || sigPath.length == 0) {
-            writeln("Trust root configured for ", cfg.updates.repo, " (mode=", cast(string) cfg.updates.mode, "). Pass --manifest and --sig to verify locally.");
+        if ((manifestPath.length == 0) != (sigPath.length == 0))
+            throw new Exception("Provide both --manifest and --sig for offline verification");
+        if (manifestPath.length == 0) {
+            auto temporary = createMaintenanceDirectory(tempDir());
+            scope(exit) rmdirRecurse(temporary);
+            auto release = checkRelease(cfg, temporary, AGENT_VERSION, updateOs, updateArch);
+            writeln("Verified release ", release.manifest.version_str, " (current=", AGENT_VERSION,
+                ", newer=", release.newer, ")");
             return 0;
         }
         if (!verifySignatureWithOpenSsl(manifestPath, sigPath, cfg.updates.public_key)) {
@@ -899,8 +936,13 @@ private int cmdUpdate(string[] args) {
             stderr.writeln("Usage: hikari update apply --manifest <path> --sig <path> --archive <path>");
             return 2;
         }
+        auto transaction = new UpdateLock(versionsDir);
+        scope(exit) transaction.release();
+        auto current = readVersionSymlink(versionsDir ~ "/current");
+        auto currentVersion = current.length && SemVer.parse(current) > SemVer.parse(AGENT_VERSION)
+            ? current : AGENT_VERSION;
         auto staged = stageSignedRelease(cfg, manifestPath, sigPath, archivePath,
-            versionsDir, AGENT_VERSION, targetOs, arch);
+            versionsDir, currentVersion, targetOs, arch);
         import std.functional : toDelegate;
         bool noRestartFn(string _) { return true; }
         auto noRestart = toDelegate(&noRestartFn);
@@ -909,7 +951,8 @@ private int cmdUpdate(string[] args) {
             stateDir,
             staged.versionString,
             hasFlag(args, "--no-restart") ? noRestart : null,
-            hasFlag(args, "--no-restart") ? noRestart : makeLoopbackHealthChecker(cfg.listen.loopback_bind, cfg.listen.loopback_port)
+            hasFlag(args, "--no-restart") ? noRestart : makeLoopbackHealthChecker(cfg.listen.loopback_bind, cfg.listen.loopback_port),
+            transaction
         );
         writeln(outc.message);
         return outc.ok ? 0 : 1;

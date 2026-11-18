@@ -72,6 +72,16 @@ function Get-ServiceOwnership([string]$Name) {
 }
 
 if ($ManageServices) {
+    $maintenanceTask = Get-ScheduledTask -TaskName "hikari-maintenance" -ErrorAction SilentlyContinue
+    if ($maintenanceTask -and $maintenanceTask.Description -eq "hikari-owned maintenance" -and
+            @($maintenanceTask.Actions).Count -eq 1 -and $maintenanceTask.Actions[0].Execute -eq $InstalledExe -and
+            $maintenanceTask.Actions[0].Arguments -eq "update maintain --config `"$ConfigPath`"") {
+        if ($DryRun) { Write-Host "[dry-run] Would remove hikari-maintenance task" }
+        else {
+            Stop-ScheduledTask -TaskName "hikari-maintenance" -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName "hikari-maintenance" -Confirm:$false
+        }
+    }
     foreach ($svcName in @("hikari-caddy", "hikari")) {
         $own = Get-ServiceOwnership $svcName
         if ($own -eq "absent") { continue }

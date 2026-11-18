@@ -624,7 +624,21 @@ if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$CADDY_DECISION" = "isolated" ]; then
   resolve_isolated_caddy
 fi
 
+# Maintenance is installer-owned too; reject foreign job names before any writes.
+if [ "$TARGET_OS" = macos ]; then
+  MAINTENANCE_JOBS=(io.hikari.maintenance.plist)
+else
+  MAINTENANCE_JOBS=(hikari-maintenance.service hikari-maintenance.timer hikari-maintenance.path)
+fi
+for maintenance_job in "${MAINTENANCE_JOBS[@]}"; do
+  if [ -e "$UNIT_DIR/$maintenance_job" ] && ! grep -q 'hikari-owned maintenance' "$UNIT_DIR/$maintenance_job"; then
+    echo "Refusing foreign maintenance job at $UNIT_DIR/$maintenance_job" >&2
+    exit 1
+  fi
+done
+
 echo "=== hikari ($TARGET_OS) Install Plan ==="
+echo "  Install a short-lived privileged maintenance job: local eligibility every 5 min; network only when update policy permits."
 echo "  Distro/OS:      id=$DISTRO_ID like='$DISTRO_ID_LIKE' pkg=$PKG_FAMILY arch=$ARCH"
 echo "  Target root:    ${ROOT_PREFIX:-/}"
 echo "  Release dir:    $VERSIONS_DIR"
@@ -1117,6 +1131,8 @@ EOF
     log "Skipped systemctl activation (systemd-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
   fi
 fi
+
+bash "$REPO_ROOT/install/maintenance-jobs.sh" "$TARGET_OS" "$ROOT_PREFIX" "$SYSTEMD_MODE" "$SERVICE_USER"
 
 # Test roots deliberately have no live service. Real activation is confirmed only
 # by the expected version responding on the configured loopback listener.

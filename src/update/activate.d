@@ -12,7 +12,7 @@ import std.process : Config, execute;
 import std.string : strip;
 import update.stage;
 import update.verify;
-import platform.command : runLocalCommand;
+import platform.command : runLocalCommand, CommandResult;
 import platform.durable : syncUpdatePath;
 import std.path : dirName;
 
@@ -136,6 +136,41 @@ string readVersionSymlink(string linkPath) {
     }
 }
 
+alias LaunchctlFn = CommandResult delegate(const string[] args, uint timeoutMs, size_t limit);
+
+bool restartLaunchdJob(string target, LaunchctlFn command = null) {
+    import std.functional : toDelegate;
+    import std.string : splitLines, startsWith;
+    import core.time : MonoTime;
+    if (target != "system/io.hikari.agent" && target != "system/io.hikari.caddy") return false;
+    if (command is null) command = toDelegate(&runLocalCommand);
+    string pid(string output) {
+        foreach (line; output.splitLines) {
+            auto text = line.strip;
+            if (text.startsWith("pid = ")) return text[6 .. $].strip;
+        }
+        return "";
+    }
+    auto before = command(["/bin/launchctl", "print", target], 3000, 16384);
+    if (before.status != 0 || before.outputTruncated) return false;
+    auto oldPid = pid(before.output);
+    if (oldPid.length) {
+        // SuccessfulExit=false jobs do not restart after hikari's graceful exit.
+        // Wait for that process to drain before a non-killing kickstart. For
+        // KeepAlive=true jobs an automatic replacement may already be running.
+        if (command(["/bin/launchctl", "kill", "SIGTERM", target], 3000, 4096).status != 0) return false;
+        auto deadline = MonoTime.currTime + msecs(30000);
+        while (true) {
+            auto state = command(["/bin/launchctl", "print", target], 3000, 16384);
+            if (state.status != 0 || state.outputTruncated) return false;
+            if (pid(state.output) != oldPid) break;
+            if (MonoTime.currTime >= deadline) return false;
+            Thread.sleep(msecs(250));
+        }
+    }
+    return command(["/bin/launchctl", "kickstart", target], 10000, 4096).status == 0;
+}
+
 bool defaultRestartHikariServices(string action) {
     version (linux) {
         auto r1 = execute(["systemctl", action, "hikari.service"], null, Config.none, 4096);
@@ -147,12 +182,9 @@ bool defaultRestartHikariServices(string action) {
         }
         return true;
     } else version (OSX) {
-        auto r1 = runLocalCommand(["/bin/launchctl", "kickstart", "-k", "system/io.hikari.agent"], 10000, 4096);
-        if (r1.status != 0) return false;
-        if (exists("/Library/LaunchDaemons/io.hikari.caddy.plist")) {
-            auto r2 = runLocalCommand(["/bin/launchctl", "kickstart", "-k", "system/io.hikari.caddy"], 10000, 4096);
-            if (r2.status != 0) return false;
-        }
+        if (!restartLaunchdJob("system/io.hikari.agent")) return false;
+        if (exists("/Library/LaunchDaemons/io.hikari.caddy.plist") &&
+            !restartLaunchdJob("system/io.hikari.caddy")) return false;
         return true;
     } else version (Windows) {
         if (restartWindowsService("hikari") != ServiceResult.ok) return false;
@@ -194,7 +226,8 @@ ActivationOutcome activateAndVerifyRelease(
     string stateDir,
     string targetVersion,
     ServiceRestartFn serviceHook = null,
-    HealthCheckFn healthHook = null
+    HealthCheckFn healthHook = null,
+    UpdateLock transaction = null
 ) {
     ActivationOutcome outc;
     validateReleaseDirectoryName(targetVersion);
@@ -204,8 +237,10 @@ ActivationOutcome activateAndVerifyRelease(
         return outc;
     }
 
-    auto lock = new UpdateLock(versionsDir);
-    scope (exit) lock.release();
+    auto lock = transaction is null ? new UpdateLock(versionsDir) : transaction;
+    if (!lock.isHeld() || lock.lockPath != versionsDir ~ "/update.lock")
+        throw new Exception("Activation requires the matching held update lock");
+    scope (exit) if (transaction is null) lock.release();
 
     auto pendingPath = versionsDir ~ "/.activation-previous";
     if (exists(pendingPath)) {

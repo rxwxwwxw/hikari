@@ -115,6 +115,12 @@ class UpdateLock {
         }
     }
 
+    bool isHeld() const nothrow {
+        version (Posix) return fd >= 0;
+        else version (Windows) return hLock != INVALID_HANDLE_VALUE;
+        else return false;
+    }
+
     void release() {
         version (Posix) {
             if (fd >= 0) {

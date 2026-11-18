@@ -52,6 +52,7 @@ jobs:
           python3 tests/integration/macos/test-release-verification.py
           python3 tests/integration/macos/test-activation.py
           python3 tests/integration/macos/test-startup.py
+          python3 tests/integration/test-graceful-shutdown.py
 
       - name: Run shellcheck on scripts
         run: shellcheck -S warning install/*.sh tests/integration/linux/*.sh tests/integration/macos/*.sh
@@ -121,6 +122,7 @@ jobs:
           .\bin\hikari.exe snapshot --state-dir "$env:TEMP\hikari-ci" | Out-Null
           .\bin\hikari.exe hardware --state-dir "$env:TEMP\hikari-ci" | Out-Null
           .\tests\integration\windows\test-installer.ps1
+          .\tests\integration\windows\test-maintenance-task.ps1
 
       - name: Native Windows service test (real SCM, includes Caddy-as-service gate)
         shell: pwsh
@@ -178,6 +180,7 @@ jobs:
           python3 tests/integration/macos/test-release-verification.py
           python3 tests/integration/macos/test-activation.py
           python3 tests/integration/macos/test-startup.py
+          python3 tests/integration/test-graceful-shutdown.py
 
       - name: Validate the pinned Caddy on native macOS
         run: bash tests/integration/macos/test-caddy.sh --download-pinned

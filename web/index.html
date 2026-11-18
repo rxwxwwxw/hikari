@@ -575,6 +575,7 @@
     discoveryFollowupTimer: null,
     discoveryFollowups: 0,
     activeControllers: new Set(),
+    hardwareRetryTimer: null,
     isPolling: false,
   };
 
@@ -661,6 +662,8 @@
   }
 
   function abortAllRequests() {
+    clearTimeout(state.hardwareRetryTimer);
+    state.hardwareRetryTimer = null;
     for (const ac of state.activeControllers) {
       try { ac.abort(); } catch (_) {}
     }
@@ -670,7 +673,8 @@
   async function fetchJsonBounded(url, timeoutMs) {
     const ac = new AbortController();
     state.activeControllers.add(ac);
-    const tid = setTimeout(() => ac.abort(), timeoutMs);
+    let timedOut = false;
+    const tid = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
     try {
       const resp = await fetch(url, {
         method: "GET",
@@ -682,6 +686,9 @@
       let json = null;
       try { json = JSON.parse(text); } catch (_) {}
       return { ok: resp.ok, status: resp.status, json };
+    } catch (error) {
+      if (timedOut) throw Object.assign(new Error("Request timed out"), { name: "TimeoutError" });
+      throw error;
     } finally {
       clearTimeout(tid);
       state.activeControllers.delete(ac);
@@ -950,7 +957,10 @@
     }
   }
 
-  async function ensureHardwareLoaded(nodeId, forceRefresh) {
+  async function ensureHardwareLoaded(nodeId, forceRefresh, attempt = 0) {
+    if (document.visibilityState !== "visible") return;
+    clearTimeout(state.hardwareRetryTimer);
+    state.hardwareRetryTimer = null;
     const node = state.nodes.find((n) => n.node_id === nodeId);
     if (!node) return;
     const existing = state.hardwareByNode.get(nodeId);
@@ -973,7 +983,15 @@
       if (res.status === 200 && res.json && res.json.app === "hikari") {
         state.hardwareByNode.set(nodeId, { loading: false, data: res.json, error: null });
       } else if (res.status === 202) {
-        state.hardwareByNode.set(nodeId, { loading: true, data: existing ? existing.data : null, error: "Scanning hardware (202 collecting)..." });
+        state.hardwareByNode.set(nodeId, { loading: false, data: existing ? existing.data : null, error: "Scanning hardware (202 collecting)..." });
+        if (attempt < 10 && document.visibilityState === "visible") {
+          const delay = Math.min(30, Math.max(1, Number(res.json && res.json.retry_after_s) || 1));
+          state.hardwareRetryTimer = setTimeout(() => {
+            state.hardwareRetryTimer = null;
+            if (state.selectedNodeId === nodeId && state.activeTab === "hardware")
+              ensureHardwareLoaded(nodeId, true, attempt + 1);
+          }, delay * 1000);
+        }
       } else {
         state.hardwareByNode.set(nodeId, {
           loading: false,
@@ -982,7 +1000,10 @@
         });
       }
     } catch (e) {
-      if (e && e.name === "AbortError") return;
+      if (e && e.name === "AbortError") {
+        state.hardwareByNode.set(nodeId, { loading: false, data: existing ? existing.data : null, error: "Inventory request paused; reload to retry" });
+        return;
+      }
       state.hardwareByNode.set(nodeId, {
         loading: false,
         data: existing ? existing.data : null,

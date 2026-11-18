@@ -79,3 +79,43 @@ Configuration lives at `/etc/hikari/config.json` on Linux. User settings and unk
 ## Persistent Known Nodes (`/var/lib/hikari/nodes.json`)
 
 Confirmed tailnet machines are stored in `nodes.json` along with operator-owned `alias`, custom `tailnet_port`, `base_path`, `hidden`, and `last_known_hardware_summary`. Machine renames on Tailscale reconcile via `node_id` / `tailscale_node_id` without overwriting operator aliases. Offline nodes are retained indefinitely.
+
+### Automatic release maintenance
+
+Installed services include a short-lived, privileged `hikari-maintenance` job
+(`io.hikari.maintenance` on macOS). The OS runs a local eligibility check every
+five minutes; it does not collect telemetry, discover peers, or contact GitHub
+unless the configured update policy and interval permit it. This low-frequency
+local wakeup is separate from the telemetry agent's request-driven collection.
+In `manual` mode, or without a pinned repository and signing key, it performs no
+network operations. Removing/disabling the maintenance timer, LaunchDaemon, or
+Windows scheduled task disables automatic maintenance completely.
+
+Dashboard activity also triggers the job immediately through a systemd path
+watch, a launchd path watch, or a Windows task with read/execute permission for
+the agent. The five-minute eligibility check supports scheduled mode and recovery.
+Windows task permissions follow [Microsoft’s task security model](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks); the agent cannot edit the privileged task.
+
+In `on_dashboard_open` mode, a successfully served nodes/status response records
+activity at most once per check interval plus a two-minute dispatch allowance. The maintenance job only accepts recent
+activity (two minutes), adds up to sixty seconds of jitter, and verifies the
+signed manifest before trusting its contents. `scheduled` mode uses the same
+interval without requiring dashboard activity. Attempts, including failures,
+are limited across restarts by protected state under `versions/.maintenance`.
+The default release-discovery channel is `stable`; other channels currently need
+explicit signed local inputs with `update apply`.
+
+`auto_install_verified: false` checks and records the verified version without
+installing. Otherwise the separate maintenance process downloads the exact
+platform archive, verifies its signed size/hash, stages it, and performs the
+existing health-checked activation/rollback. The agent stays restricted; the
+privileged job reads the operator-owned configuration and accepts no commands,
+paths, or URLs from the activity request. Downloads use HTTPS only, bounded
+sizes/deadlines and retries. `curl` and an Ed25519-capable `openssl` must be
+available to the maintenance account.
+
+`hikari update check` now fetches and verifies the latest stable release. It does
+not install it. Supplying `--manifest` and `--sig` retains offline verification.
+Install/repair registers the maintenance job; uninstall removes it. Source-only
+`hikari serve` records activity but needs an installed maintenance job for
+unattended updates.

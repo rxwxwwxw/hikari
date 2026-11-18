@@ -40,6 +40,21 @@ exit 0
 EOF
 chmod +x "$MOCK_BIN_DIR/caddy"
 
+# Rootless fixture portability: emulate only ss's listener output on non-Linux
+# hosts, using a real connection to the test's temporary loopback listener.
+if ! command -v ss >/dev/null 2>&1; then
+  cat > "$MOCK_BIN_DIR/ss" <<'SS'
+#!/usr/bin/env python3
+import socket, sys
+port = int(sys.argv[-1].split(":")[-1])
+with socket.socket() as client:
+    client.settimeout(0.1)
+    if client.connect_ex(("127.0.0.1", port)) == 0:
+        print(f"LISTEN 0 1 127.0.0.1:{port} 0.0.0.0:*")
+SS
+  chmod +x "$MOCK_BIN_DIR/ss"
+fi
+
 TS_FIXTURE="$REPO_ROOT/tests/fixtures/tailscale/online_fleet.json"
 
 assert_eq() {
@@ -56,7 +71,7 @@ check_distro_dry_run() {
   local test_root="$TMP_BASE/dry-$label"
   mkdir -p "$test_root"
   local out
-  out=$(PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+  out=$(PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
     --dry-run \
     --root "$test_root" \
     --os-release "$osrel" \
@@ -78,7 +93,7 @@ check_distro_dry_run() {
 if [ "${1:-}" = "--os-release-only" ] && [ -n "${2:-}" ]; then
   # Running inside a real distro container
   echo "  Container os-release check on $2:"
-  PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+  PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
     --dry-run --root "$TMP_BASE/container-dry" --os-release "$2" \
     --binary-source "$HIKARI_BIN" --tailscale-fixture "$TS_FIXTURE" --systemd-mode=skip
 else
@@ -88,7 +103,7 @@ else
   check_distro_dry_run "$REPO_ROOT/tests/fixtures/os-release/armbian" "apt" "armbian"
   check_distro_dry_run "$REPO_ROOT/tests/fixtures/os-release/mint" "apt" "linuxmint"
   if [ -f /etc/os-release ]; then
-    HOST_OUT=$(PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+    HOST_OUT=$(PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
       --dry-run --root "$TMP_BASE/dry-host-osrel" --os-release /etc/os-release \
       --binary-source "$HIKARI_BIN" --tailscale-fixture "$TS_FIXTURE" --systemd-mode=skip)
     echo "$HOST_OUT" | grep -qE "pkg=(dnf|pacman|apt)" || {
@@ -111,7 +126,7 @@ CADDY_SHA_BEFORE=$(sha256sum "$INST_ROOT/etc/caddy/Caddyfile" | awk '{print $1}'
 CADDY_SVC_SHA_BEFORE=$(sha256sum "$INST_ROOT/etc/systemd/system/caddy.service" | awk '{print $1}')
 TS_SHA_BEFORE=$(sha256sum "$INST_ROOT/var/lib/tailscale/tailscaled.state" | awk '{print $1}')
 
-PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
   --root "$INST_ROOT" \
   --os-release "$REPO_ROOT/tests/fixtures/os-release/cachyos" \
   --binary-source "$HIKARI_BIN" \
@@ -123,6 +138,9 @@ test -x "$INST_ROOT/opt/hikari/versions/current/hikari"
 test -f "$INST_ROOT/etc/hikari/config.json"
 test -f "$INST_ROOT/etc/hikari/Caddyfile"
 test -f "$INST_ROOT/etc/systemd/system/hikari.service"
+test -f "$INST_ROOT/etc/systemd/system/hikari-maintenance.timer"
+grep -q "PathChanged=/var/lib/hikari/update-request" "$INST_ROOT/etc/systemd/system/hikari-maintenance.path"
+grep -q "update maintain --config" "$INST_ROOT/etc/systemd/system/hikari-maintenance.service"
 test -f "$INST_ROOT/etc/systemd/system/hikari-caddy.service"
 grep -q "admin off" "$INST_ROOT/etc/hikari/Caddyfile"
 grep -q "bind 100.64.0.10" "$INST_ROOT/etc/hikari/Caddyfile"
@@ -137,7 +155,7 @@ json.dump(d, open(p, "w"), indent=2)
 open("$INST_ROOT/var/lib/hikari/nodes.json", "w").write('{"schema_version":1,"nodes":[{"node_id":"hikari:keep"}]}\n')
 PY
 
-PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
   --repair \
   --root "$INST_ROOT" \
   --os-release "$REPO_ROOT/tests/fixtures/os-release/cachyos" \
@@ -157,7 +175,7 @@ echo "  [pass] clean install + repair preserved user config/state and left syste
 echo "=== 3. Testing --snippet-only mode ==="
 SNIP_ROOT="$TMP_BASE/snip-root"
 mkdir -p "$SNIP_ROOT"
-bash "$REPO_ROOT/install/install.sh" \
+bash "$REPO_ROOT/install/install.sh" --target-os=linux \
   --snippet-only \
   --root "$SNIP_ROOT" \
   --os-release "$REPO_ROOT/tests/fixtures/os-release/fedora" \
@@ -183,7 +201,7 @@ PY
 OCC_PID=$!
 sleep 0.2
 set +e
-HIKARI_TEST_CHECK_HOST_PORTS=1 PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" \
+HIKARI_TEST_CHECK_HOST_PORTS=1 PATH="$MOCK_BIN_DIR:$PATH" bash "$REPO_ROOT/install/install.sh" --target-os=linux \
   --root "$PORT_ROOT" \
   --loopback-port 29191 \
   --os-release "$REPO_ROOT/tests/fixtures/os-release/ubuntu" \
@@ -207,7 +225,7 @@ fi
 echo "  [pass] occupied port failed closed before writing any files"
 
 echo "=== 5. Testing uninstall (state preserved) and uninstall --purge ==="
-bash "$REPO_ROOT/install/uninstall.sh" --root "$INST_ROOT" --systemd-mode=skip >/dev/null
+bash "$REPO_ROOT/install/uninstall.sh" --target-os=linux --root "$INST_ROOT" --systemd-mode=skip >/dev/null
 test ! -e "$INST_ROOT/opt/hikari"
 test ! -e "$INST_ROOT/etc/systemd/system/hikari.service"
 test ! -e "$INST_ROOT/etc/systemd/system/hikari-caddy.service"
@@ -216,11 +234,14 @@ test -f "$INST_ROOT/etc/hikari/config.json"
 test -f "$INST_ROOT/var/lib/hikari/nodes.json"
 assert_eq "$CADDY_SHA_BEFORE" "$(sha256sum "$INST_ROOT/etc/caddy/Caddyfile" | awk '{print $1}')" "Uninstall must leave system Caddy intact"
 
-bash "$REPO_ROOT/install/uninstall.sh" --purge --root "$INST_ROOT" --systemd-mode=skip >/dev/null
+bash "$REPO_ROOT/install/uninstall.sh" --target-os=linux --purge --root "$INST_ROOT" --systemd-mode=skip >/dev/null
 test ! -e "$INST_ROOT/etc/hikari"
 test ! -e "$INST_ROOT/var/lib/hikari"
 assert_eq "$CADDY_SHA_BEFORE" "$(sha256sum "$INST_ROOT/etc/caddy/Caddyfile" | awk '{print $1}')" "--purge must still leave system Caddy intact"
 assert_eq "$TS_SHA_BEFORE" "$(sha256sum "$INST_ROOT/var/lib/tailscale/tailscaled.state" | awk '{print $1}')" "--purge must leave Tailscale state intact"
+test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.path"
+test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.timer"
+test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.service"
 echo "  [pass] uninstall and --purge behaved cleanly"
 
 echo "All Linux installer integration checks PASSED."

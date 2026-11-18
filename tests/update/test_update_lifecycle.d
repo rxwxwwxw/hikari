@@ -11,6 +11,7 @@ import std.process : Config, execute;
 import update.activate;
 import update.stage;
 import update.verify;
+import update.maintenance;
 
 unittest {
     // 1. SemVer comparison (never lexicographic!)
@@ -91,6 +92,97 @@ unittest {
     auto badManifest = root ~ "/bad-manifest.json";
     write(badManifest, readText(manifestPath) ~ " ");
     assertThrown!Exception(verifyVerifiedReleasePackage(cfg, badManifest, sigPath, archive, "0.1.0", "linux", "x86_64"));
+
+    // Automatic maintenance: closed dashboard/manual never downloads; check-only
+    // verifies without activation; a later due activity downloads and activates.
+    import std.file : copy;
+    auto autoCfg = cfg;
+    autoCfg.paths.versions_dir = root ~ "/auto-versions";
+    autoCfg.paths.state_dir = root ~ "/auto-state";
+    mkdirRecurse(autoCfg.paths.versions_dir ~ "/0.1.0");
+    mkdirRecurse(autoCfg.paths.state_dir);
+    copy(root ~ "/versions/0.1.0/hikari", autoCfg.paths.versions_dir ~ "/0.1.0/hikari");
+    atomicSetSymlink(autoCfg.paths.versions_dir ~ "/0.1.0", autoCfg.paths.versions_dir ~ "/current");
+    long now = 100_000;
+    int downloads, restarts;
+    bool invalidSignature;
+    MaintenanceHooks hooks;
+    hooks.now = () => now;
+    hooks.jitter = () {};
+    hooks.download = (string url, string destination, ulong limit) {
+        assert(url.canFind("https://github.com/example/hikari/releases/"));
+        auto source = url.canFind("manifest.json") ? manifestPath : url.canFind("manifest.sig") ? sigPath : archive;
+        assert(getSize(source) <= limit);
+        if (invalidSignature && url.canFind("manifest.sig")) write(destination, "invalid signature");
+        else copy(source, destination);
+        downloads++;
+    };
+    hooks.restart = (string _) {
+        assertThrown!Exception(new UpdateLock(autoCfg.paths.versions_dir));
+        restarts++;
+        return true;
+    };
+    hooks.health = (string _) => true;
+    assert(maintainRelease(autoCfg, "linux", "x86_64", hooks) == 0);
+    assert(downloads == 0);
+    write(autoCfg.paths.state_dir ~ "/update-request", to!string(now));
+    autoCfg.updates.mode = UpdateMode.manual;
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 0);
+    autoCfg.updates.mode = UpdateMode.on_dashboard_open;
+    autoCfg.updates.auto_install_verified = false;
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 2 && restarts == 0);
+    autoCfg.updates.auto_install_verified = true;
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 2, "Persisted interval prevents repeated checks");
+    now += 86400;
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 2, "Expired viewer activity must not permit an idle check");
+    write(autoCfg.paths.state_dir ~ "/update-request", to!string(now));
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 5 && restarts == 1);
+    assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.2.0");
+
+    // Invalid signed input fails closed and persists failure backoff.
+    now += 86400;
+    autoCfg.updates.mode = UpdateMode.scheduled;
+    invalidSignature = true;
+    assertThrown!Exception(maintainRelease(autoCfg, "linux", "x86_64", hooks));
+    assert(downloads == 7 && restarts == 1);
+    assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.2.0");
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(downloads == 7);
+    invalidSignature = false;
+
+    // A failed automatic health check rolls back while the supervisor survives.
+    autoCfg.paths.versions_dir = root ~ "/auto-failure";
+    mkdirRecurse(autoCfg.paths.versions_dir ~ "/0.1.0");
+    copy(root ~ "/versions/0.1.0/hikari", autoCfg.paths.versions_dir ~ "/0.1.0/hikari");
+    atomicSetSymlink(autoCfg.paths.versions_dir ~ "/0.1.0", autoCfg.paths.versions_dir ~ "/current");
+    hooks.health = (string v) => v == "0.1.0";
+    assertThrown!Exception(maintainRelease(autoCfg, "linux", "x86_64", hooks));
+    assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.1.0");
+    assert(!exists(autoCfg.paths.versions_dir ~ "/.activation-previous"));
+
+    // Simulate a newer installer finishing while an old supervisor downloads.
+    autoCfg.paths.versions_dir = root ~ "/auto-race";
+    mkdirRecurse(autoCfg.paths.versions_dir ~ "/0.1.0");
+    mkdirRecurse(autoCfg.paths.versions_dir ~ "/0.3.0");
+    copy(root ~ "/versions/0.1.0/hikari", autoCfg.paths.versions_dir ~ "/0.1.0/hikari");
+    write(autoCfg.paths.versions_dir ~ "/0.3.0/hikari", "newer installed release");
+    atomicSetSymlink(autoCfg.paths.versions_dir ~ "/0.1.0", autoCfg.paths.versions_dir ~ "/current");
+    auto previousDownload = hooks.download;
+    hooks.download = (string url, string destination, ulong limit) {
+        previousDownload(url, destination, limit);
+        if (url.canFind(".tar.gz"))
+            atomicSetSymlink(autoCfg.paths.versions_dir ~ "/0.3.0", autoCfg.paths.versions_dir ~ "/current");
+    };
+    auto restartsBeforeRace = restarts;
+    maintainRelease(autoCfg, "linux", "x86_64", hooks);
+    assert(restarts == restartsBeforeRace);
+    assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.3.0");
+    assert(!exists(autoCfg.paths.versions_dir ~ "/0.2.0"));
 
     // Stage verified archive
     auto release = stageSignedRelease(cfg, manifestPath, sigPath, archive,
@@ -179,4 +271,78 @@ with tarfile.open(sys.argv[1], "w:gz") as tar:
             assertThrown!Exception(inspectTarArchiveSafety(archive));
         }
     }
+}
+
+
+unittest {
+    HikariConfig cfg;
+    cfg.updates.repo = "example/hikari";
+    cfg.updates.public_key = "pinned-test-key";
+    assert(!maintenanceDue(cfg, 100000, 0, 0));
+    assert(maintenanceDue(cfg, 100000, 0, 99999));
+    assert(!maintenanceDue(cfg, 100000, 99999, 100000));
+    assert(!maintenanceDue(cfg, 100000, 0, 100001));
+    assert(!maintenanceDue(cfg, 100000, 0, 99879));
+    cfg.updates.mode = UpdateMode.scheduled;
+    assert(maintenanceDue(cfg, 100000, 0, 0));
+    cfg.updates.mode = UpdateMode.manual;
+    assert(!maintenanceDue(cfg, 100000, 0, 100000));
+    assertThrown!Exception(validateRepository("example/hikari/../../other"));
+    assertThrown!Exception(validateRepository("example/hikari?redirect=other"));
+    assertThrown!Exception(downloadHttps("http://example.invalid", "unused", 10));
+}
+
+
+unittest {
+    import platform.command : CommandResult;
+    int prints, kills, starts;
+    assert(restartLaunchdJob("system/io.hikari.agent", (const string[] args, uint timeout, size_t limit) {
+        CommandResult result;
+        result.status = 0;
+        if (args[1] == "print") result.output = ++prints == 1 ? "pid = 123\n" : "state = not running\n";
+        if (args[1] == "kill") { assert(args[2] == "SIGTERM"); kills++; }
+        if (args[1] == "kickstart") { assert(args.length == 3 && prints == 2); starts++; }
+        return result;
+    }));
+    assert(kills == 1 && starts == 1);
+    assert(!restartLaunchdJob("system/unrelated-service"));
+}
+
+unittest {
+    import platform.update_request : readUpdateTimestampFile;
+    import core.sync.semaphore : Semaphore;
+    import std.uuid : randomUUID;
+    auto root = tempDir() ~ "/hikari-update-request-" ~ randomUUID().toString();
+    mkdirRecurse(root);
+    scope(exit) rmdirRecurse(root);
+    auto file = root ~ "/update-request";
+    assert(readUpdateTimestampFile(file) == "");
+    write(file, "12345");
+    assert(readUpdateTimestampFile(file) == "12345");
+    write(file, new char[100]);
+    assert(readUpdateTimestampFile(file) == "");
+    version (Posix) {
+        import std.file : remove, symlink;
+        import core.sys.posix.sys.stat : mkfifo;
+        import std.string : toStringz;
+        write(root ~ "/target", "12345");
+        remove(file);
+        symlink(root ~ "/target", file);
+        assert(readUpdateTimestampFile(file) == "");
+        remove(file);
+        assert(mkfifo(file.toStringz, 0x180) == 0);
+        assert(readUpdateTimestampFile(file) == "", "A FIFO must not block maintenance");
+        remove(file);
+    }
+    HikariConfig cfg;
+    cfg.paths.state_dir = root;
+    cfg.updates.repo = "example/hikari";
+    cfg.updates.public_key = "test-key";
+    auto completed = new Semaphore;
+    auto request = new DashboardUpdateRequest(cfg, () { completed.notify(); });
+    foreach (_; 0 .. 20) request.completedRequest();
+    completed.wait();
+    assert(readUpdateTimestampFile(file).length > 0);
+    import core.time : msecs;
+    assert(!completed.wait(msecs(20)), "Concurrent responses coalesce into one activity write");
 }

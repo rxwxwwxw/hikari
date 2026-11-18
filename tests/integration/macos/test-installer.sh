@@ -57,6 +57,7 @@ test -f "$INST/Library/Application Support/hikari/config.json"
 test -f "$INST/Library/Application Support/hikari/Caddyfile"
 test -f "$INST/Library/LaunchDaemons/io.hikari.recover.plist"
 test -f "$INST/Library/LaunchDaemons/io.hikari.agent.plist"
+test -f "$INST/Library/LaunchDaemons/io.hikari.maintenance.plist"
 test -f "$INST/Library/LaunchDaemons/io.hikari.caddy.plist"
 grep -q "<string>io.hikari.agent</string>" "$INST/Library/LaunchDaemons/io.hikari.agent.plist"
 grep -q "<key>RunAtLoad</key>" "$INST/Library/LaunchDaemons/io.hikari.agent.plist"
@@ -65,6 +66,11 @@ import pathlib, plistlib, sys
 root = pathlib.Path(sys.argv[1])
 agent = plistlib.loads((root / "Library/LaunchDaemons/io.hikari.agent.plist").read_bytes())
 caddy = plistlib.loads((root / "Library/LaunchDaemons/io.hikari.caddy.plist").read_bytes())
+maintenance = plistlib.loads((root / "Library/LaunchDaemons/io.hikari.maintenance.plist").read_bytes())
+assert maintenance["StartInterval"] == 300
+assert maintenance["WatchPaths"] == ["/Library/Application Support/hikari/state/update-request"]
+assert maintenance["ProgramArguments"] == ["/opt/hikari/versions/current/hikari", "update", "maintain", "--config", "/Library/Application Support/hikari/config.json"]
+assert "UserName" not in maintenance  # A short-lived root job, separate from telemetry.
 assert agent["UserName"] == agent["GroupName"] == "_hikari"
 assert caddy["UserName"] == caddy["GroupName"] == "_hikari_caddy"
 assert caddy["ProgramArguments"][:2] == ["/bin/bash", "/opt/hikari/versions/current/install/macos-caddy.sh"]
@@ -127,6 +133,7 @@ bash "$REPO_ROOT/install/uninstall.sh" --target-os=macos --root "$INST" --servic
 test ! -e "$INST/opt/hikari"
 test ! -e "$INST/Library/LaunchDaemons/io.hikari.recover.plist"
 test ! -e "$INST/Library/LaunchDaemons/io.hikari.agent.plist"
+test ! -e "$INST/Library/LaunchDaemons/io.hikari.maintenance.plist"
 test -f "$INST/Library/Application Support/hikari/config.json"
 
 bash "$REPO_ROOT/install/uninstall.sh" --target-os=macos --purge --root "$INST" --service-mode=skip >/dev/null

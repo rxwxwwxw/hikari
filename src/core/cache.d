@@ -216,25 +216,25 @@ class TelemetryCacheStore {
             resp.groups[cast(string) g] = buildGroupMeta(g, nowMonoNs, nowWallTs);
         }
 
-        if (groups[ProbeGroup.fast].hasSuccess) {
+        if (isUsableStale(ProbeGroup.fast, nowMonoNs, nowWallTs)) {
             resp.cpu = cachedCpu;
             resp.memory = cachedMemory;
             resp.swap = cachedSwap;
             resp.commit = cachedCommit;
             resp.network = cachedNetwork.dup;
         }
-        if (groups[ProbeGroup.processes].hasSuccess) {
+        if (isUsableStale(ProbeGroup.processes, nowMonoNs, nowWallTs)) {
             resp.top_cpu = cachedTopCpu.dup;
             resp.top_mem = cachedTopMem.dup;
         }
-        if (groups[ProbeGroup.filesystems].hasSuccess) {
+        if (isUsableStale(ProbeGroup.filesystems, nowMonoNs, nowWallTs)) {
             resp.mounts = cachedMounts.dup;
         }
-        if (groups[ProbeGroup.device_dynamic].hasSuccess) {
+        if (isUsableStale(ProbeGroup.device_dynamic, nowMonoNs, nowWallTs)) {
             resp.gpus = cachedGpus.dup;
             resp.batteries = cachedBatteries.dup;
         }
-        if (groups[ProbeGroup.maintenance].hasSuccess) {
+        if (isUsableStale(ProbeGroup.maintenance, nowMonoNs, nowWallTs)) {
             resp.drift = cachedDrift;
         }
         return resp;

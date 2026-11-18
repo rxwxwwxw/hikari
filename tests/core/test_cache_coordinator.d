@@ -227,3 +227,67 @@ unittest {
     assert(status.payload.groups["device_dynamic"].error == "battery_access_denied");
     assert(status.payload.batteries.length == 0);
 }
+
+unittest {
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = makeTempStateDir("stale-ceilings");
+    scope(exit) rmdirRecurse(cfg.paths.state_dir);
+    auto store = new TelemetryCacheStore(cfg, "hikari:test");
+    foreach (g; [ProbeGroup.fast, ProbeGroup.processes, ProbeGroup.filesystems,
+            ProbeGroup.device_dynamic, ProbeGroup.maintenance]) {
+        store.groups[g].hasSuccess = true;
+        store.groups[g].lastSuccessMonoNs = 0;
+    }
+    store.config = cfg;
+    store.cachedCpu.pct = 50;
+    store.cachedTopCpu = [ProcessStatus.init];
+    store.cachedTopMem = [ProcessStatus.init];
+    store.cachedMounts = [MountStatus.init];
+    store.cachedGpus = [GpuDynamicStatus.init];
+    store.cachedBatteries = [BatteryStatus.init];
+    store.cachedDrift.reboot_required = true;
+    auto fresh = store.snapshotStatusResponse(1_000_000_000L, 1);
+    assert(fresh.mounts.length == 1 && fresh.top_cpu.length == 1);
+    auto expired = store.snapshotStatusResponse(700_000_000_000_000L, 700000);
+    assert(expired.cpu.pct.isNull && expired.drift.reboot_required.isNull);
+    assert(!expired.top_cpu.length && !expired.top_mem.length && !expired.mounts.length);
+    assert(!expired.gpus.length && !expired.batteries.length);
+    assert(expired.groups["filesystems"].sampled_at.get == 0);
+}
+
+private class SlowPersistenceStore : TelemetryCacheStore {
+    import core.sync.semaphore : Semaphore;
+    Semaphore entered;
+    Semaphore releaseWrite;
+    Semaphore finished;
+    this(HikariConfig cfg) {
+        super(cfg, "hikari:slow-disk");
+        entered = new Semaphore;
+        releaseWrite = new Semaphore;
+        finished = new Semaphore;
+    }
+    override void persistHardware(const ref HardwareInventory hw) {
+        entered.notify();
+        releaseWrite.wait();
+        finished.notify();
+    }
+}
+
+unittest {
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = makeTempStateDir("slow-disk");
+    cfg.collection.cold_wait_ms = 20;
+    scope(exit) rmdirRecurse(cfg.paths.state_dir);
+    auto store = new SlowPersistenceStore(cfg);
+    auto fake = new FakePlatformBackend("desktop-x86_64");
+    auto coord = new RefreshCoordinator(fake, store);
+    // Persistence deliberately cannot finish until after all of these calls.
+    assert(coord.getHardware().httpStatus == 202);
+    store.entered.wait();
+    scope(exit) { store.releaseWrite.notify(); store.finished.wait(); }
+    assert(coord.getInfo().node_id == "hikari:slow-disk");
+    assert(coord.getHealth().node_id == "hikari:slow-disk");
+    assert(coord.getStatus().httpStatus == 200);
+    assert(coord.getHardware(true).httpStatus == 202);
+    assert(fake.counts.hardwareCalls == 1, "No overlapping persistence workers");
+}

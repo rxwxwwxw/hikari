@@ -589,17 +589,22 @@ class RefreshCoordinator {
             return;
         }
 
+        auto hw = hr.inventory;
+        hw.node_id = store.nodeId;
+        hw.collected_at = doneWall;
+        hw.collection.status = GroupStatus.fresh;
+        hw.collection.age_s = 0;
+        hw.collection.refreshing = false;
         synchronized (mtx) {
             if (store.groups[ProbeGroup.hardware].generation != expectedGen) return;
-            auto hw = hr.inventory;
-            hw.node_id = store.nodeId;
-            hw.collected_at = doneWall;
-            hw.collection.status = GroupStatus.fresh;
-            hw.collection.age_s = 0;
-            hw.collection.refreshing = false;
+        }
+        // Only this group's worker waits for disk; other endpoints keep using
+        // their cache. Retain the single-flight reservation through persistence.
+        store.persistHardware(hw);
+        synchronized (mtx) {
+            if (store.groups[ProbeGroup.hardware].generation != expectedGen) return;
             store.cachedHardware = hw;
             store.updateHardwareSummaryFromInventory(hw);
-            store.persistHardware(hw);
             markGroupSuccessLocked(ProbeGroup.hardware, doneMono, doneWall);
         }
     }
