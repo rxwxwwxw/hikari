@@ -608,6 +608,14 @@ fi
 ln -sfn "$REL_DIR" "$VERSIONS_DIR/current"
 log "Installed hikari $APP_VERSION to $REL_DIR"
 
+# Seed the agent's last-known MagicDNS name (hikari-owned state, refreshed by the
+# agent itself); used for Host validation while `tailscale status` is unreadable.
+case "$TS_FQDN" in
+  ''|*[!A-Za-z0-9.-]*) ;;
+  *) mkdir -p "$VAR_HIKARI" && printf '%s
+' "$TS_FQDN" > "$VAR_HIKARI/local_fqdn" ;;
+esac
+
 # 8. Write default config.json ONLY if missing
 if [ ! -f "$CONFIG_PATH" ]; then
   cat > "$CONFIG_PATH" <<EOF

@@ -487,6 +487,13 @@ if (-not (Test-Path $ConfigPath)) {
     Write-Log "Preserved existing operator configuration at $ConfigPath"
 }
 
+# Seed the agent's last-known MagicDNS name (hikari-owned state). The agent uses it
+# for Host validation whenever it cannot read `tailscale status` itself, e.g. as
+# NT SERVICE\hikari without Tailscale's "Run unattended"; it refreshes it on its own.
+if ($TsFqdn -match '^[A-Za-z0-9.-]+$') {
+    Write-Utf8NoBom (Join-Path $StateDir "local_fqdn") ($TsFqdn + "`n")
+}
+
 # ---------------------------------------------------------------------------
 # 7. Generated Caddy config (hikari-owned files only)
 # ---------------------------------------------------------------------------

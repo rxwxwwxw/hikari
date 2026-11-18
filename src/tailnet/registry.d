@@ -28,6 +28,7 @@ class NodeRegistry {
 
     void load() {
         nodes = null;
+        persistedKnown = false;
         if (!exists(filePath)) return;
         try {
             auto j = parseJSON(readText(filePath));
@@ -64,36 +65,70 @@ class NodeRegistry {
                 if (auto p = "hidden" in el.object) nr.hidden = (p.type == JSONType.true_);
                 nodes ~= nr;
             }
+            long genAt = 0;
+            if (auto g = "generated_at" in j.object) if (g.type == JSONType.integer) genAt = g.integer;
+            notePersisted(genAt);
         } catch (Exception) {
             nodes = null;
+            persistedKnown = false;
         }
     }
 
+    /// Contact timestamps (last_seen_ts / last_success_ts) change on every dashboard
+    /// request; persisting them each time would rewrite nodes.json every poll. They
+    /// are written only when something else changed or at most this often.
+    enum long TIMESTAMP_PERSIST_INTERVAL_S = 3600;
+
+    private bool persistedKnown = false;
+    private string persistedStable;   // nodes JSON without contact timestamps
+    private string persistedFull;     // nodes JSON as last written/loaded
+    private long persistedAtWall = 0;
+
+    private static JSONValue nodesJson(const NodeRecord[] list, bool withTimestamps) {
+        NodesResponse resp;
+        foreach (const ref src; list) {
+            NodeRecord n = src;
+            if (!withTimestamps) {
+                n.last_seen_ts.nullify();
+                n.last_success_ts.nullify();
+            }
+            resp.nodes ~= n;
+        }
+        return serializeNodesResponse(resp)["nodes"];
+    }
+
+    private void notePersisted(long atWall) {
+        persistedStable = nodesJson(nodes, false).toString();
+        persistedFull = nodesJson(nodes, true).toString();
+        persistedAtWall = atWall;
+        persistedKnown = true;
+    }
+
+    /// Writes nodes.json only when operator-relevant state changed, or when contact
+    /// timestamps are older on disk than TIMESTAMP_PERSIST_INTERVAL_S. Returns true
+    /// if the file was written.
     bool saveIfChanged(long generatedAt) {
+        auto stable = nodesJson(nodes, false).toString();
+        auto full = nodesJson(nodes, true).toString();
+        if (persistedKnown) {
+            if (full == persistedFull) return false;
+            if (stable == persistedStable && generatedAt - persistedAtWall < TIMESTAMP_PERSIST_INTERVAL_S
+                && generatedAt >= persistedAtWall) {
+                return false;
+            }
+        }
+
         NodesResponse resp;
         resp.generated_at = generatedAt;
         resp.nodes = nodes;
         auto newText = serializeNodesResponse(resp).toPrettyString(JSONOptions.doNotEscapeSlashes) ~ "\n";
-
-        // Compare ignoring generated_at timestamp so we avoid unnecessary disk writes when nothing changed
-        if (exists(filePath)) {
-            try {
-                auto oldJ = parseJSON(readText(filePath));
-                auto newJ = serializeNodesResponse(resp);
-                if (oldJ.type == JSONType.object && "nodes" in oldJ.object && "nodes" in newJ.object) {
-                    if (oldJ["nodes"].toString() == newJ["nodes"].toString()) {
-                        return false;
-                    }
-                }
-            } catch (Exception) {}
-        }
-
         try {
             auto parent = dirName(filePath);
             if (!exists(parent)) mkdirRecurse(parent);
             auto tmp = filePath ~ ".tmp";
             write(tmp, newText);
             rename(tmp, filePath);
+            notePersisted(generatedAt);
             return true;
         } catch (Exception) {
             return false;

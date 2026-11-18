@@ -13,6 +13,10 @@ struct GroupCacheEntry {
     bool hasSuccess = false;
     bool unsupported = false;
     bool inFlight = false;
+    /// True from worker start until the worker thread actually returns. A probe
+    /// that exceeded its deadline is no longer `inFlight`, but its thread may
+    /// still be blocked inside the OS; no second worker starts until it exits.
+    bool workerAlive = false;
     long lastSuccessMonoNs = 0;
     long lastSuccessWallTs = 0;
     long lastAttemptMonoNs = 0;
@@ -159,14 +163,15 @@ class TelemetryCacheStore {
         auto e = groups[g];
         GroupMeta gm;
         gm.refreshing = e.inFlight;
+        bool hung = e.workerAlive && !e.inFlight;
         if (e.hasSuccess) {
             long age = computeGroupAgeS(g, nowMonoNs, nowWallTs);
             gm.sampled_at = e.lastSuccessWallTs;
             gm.age_s = age;
             gm.last_success_at = e.lastSuccessWallTs;
-            if (e.consecutiveFailures > 0) {
+            if (e.consecutiveFailures > 0 || hung) {
                 gm.status = isUsableStale(g, nowMonoNs, nowWallTs) ? GroupStatus.stale : GroupStatus.error;
-                gm.error = e.lastError;
+                gm.error = hung ? "probe_hung" : e.lastError;
             } else if (age < config.collection.ttl_seconds.get(g)) {
                 gm.status = GroupStatus.fresh;
             } else if (age <= config.collection.max_stale_seconds.get(g)) {
@@ -177,9 +182,9 @@ class TelemetryCacheStore {
             }
         } else if (e.unsupported) {
             gm.status = GroupStatus.unsupported;
-        } else if (e.consecutiveFailures > 0) {
+        } else if (e.consecutiveFailures > 0 || hung) {
             gm.status = GroupStatus.error;
-            gm.error = e.lastError;
+            gm.error = hung ? "probe_hung" : e.lastError;
         } else if (e.inFlight) {
             gm.status = GroupStatus.uninitialized;
             gm.refreshing = true;

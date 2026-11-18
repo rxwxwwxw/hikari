@@ -21,9 +21,10 @@
 ## Browser & HTTP Hardening
 
 - **No wildcard CORS:** `Access-Control-Allow-Origin: *` is never emitted. `Origin` headers are validated against same-tailnet MagicDNS FQDNs, known nodes, configured `allowed_origins`, or loopback development origins, echoing the exact authorized origin with `Vary: Origin`.
-- **DNS rebinding protection:** `Host` headers are validated against loopback names and the node's MagicDNS FQDN.
+- **DNS rebinding protection:** `Host` headers are validated against loopback names and the node's MagicDNS FQDN. The last FQDN learned from `tailscale status` (seeded by the installer) is kept in `<state_dir>/local_fqdn`, so validation keeps working while the agent cannot read Tailscale status.
 - **XSS safety:** The dashboard renders all OS-supplied names (hostnames, processes, mounts, hardware strings) strictly via `textContent`, never `innerHTML`, and sanitizes control characters server-side.
-- **No administrative mutations over GET:** Read endpoints are strictly read-only and bounded in request/header size.
+- **No administrative mutations over GET:** Read endpoints are strictly read-only and bounded in request/header size. `?refresh=1` does not force probes over HTTP; forced collection is local CLI only (`hikari snapshot`, `hikari hardware --refresh`). On `/api/v1/nodes`, `?refresh=1` only requests an earlier background peer scan, rate-limited to once per 30 s.
+- **Bounded request work:** requests never wait on the Tailscale CLI (bounded to 5 s, run in the background) or on peer validation (background, once per tailnet TTL; peers Tailscale reports offline and recently identified non-hikari peers are skipped). A probe that hangs past `collection.probe_timeout_ms` is reported as `probe_hung`, and no second collector for that group starts until it returns.
 
 ## Privacy Redaction
 

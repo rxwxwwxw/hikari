@@ -10,6 +10,7 @@ import std.algorithm : canFind, endsWith, startsWith;
 import std.file : exists, readText;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.process : Config, execute;
+import core.proc : executeBounded;
 import std.string : indexOf, strip;
 import std.typecons : Nullable;
 import tailnet.registry;
@@ -185,6 +186,17 @@ PeerValidationResult parsePeerInfoPayload(string bodyText, string expectedFqdn) 
     return res;
 }
 
+/// Upper bound for one `tailscale status --json` invocation. A wedged tailscaled
+/// must never hang request handling or the updater's health checks.
+enum uint TAILSCALE_STATUS_TIMEOUT_MS = 5000;
+/// A failed status read is retried after this long instead of being cached for
+/// the full tailnet TTL (e.g. hikari started before Tailscale was up).
+enum long SNAPSHOT_FAILURE_RETRY_S = 10;
+/// Minimum spacing of operator-forced ("Scan peers") discovery runs.
+enum long FORCED_DISCOVERY_MIN_INTERVAL_S = 30;
+/// Peers that answered but are not hikari are not re-probed for this long.
+enum long NON_HIKARI_RETRY_S = 6 * 3600;
+
 class TailnetDiscoveryService {
     HikariConfig config;
     NodeRegistry registry;
@@ -192,10 +204,24 @@ class TailnetDiscoveryService {
     TailscaleStatusProvider statusProvider;
     PeerInfoFetcher peerFetcher;
 
-    private Mutex mtx;
+    private Mutex mtx;        // registry, snapshot cache and discovery state
+    private Mutex fetchMtx;   // serializes (and so coalesces) tailscale CLI calls
     private TailscaleSnapshot cachedTailnet;
     private long lastTailnetMonoNs = -1;
     private bool hasTailnetCache = false;
+    private bool bgSnapshotRunning = false;
+
+    // Last successfully learned identity; survives later status failures.
+    private string stickySelfFqdn;
+    private string stickyMagicSuffix;
+    private string persistedSelfFqdn;
+
+    private bool discoveryRunning = false;
+    private bool hasDiscoveryRun = false;
+    private long lastDiscoveryStartMonoNs = 0;
+    private Nullable!long lastDiscoveryStartWall;
+    private Nullable!long lastDiscoveryFinishWall;
+    private long[string] nonHikariUntilMono; // keyed by fqdn
 
     this(
         HikariConfig cfg,
@@ -208,6 +234,7 @@ class TailnetDiscoveryService {
         this.registry = registry;
         this.clocks = clocks;
         this.mtx = new Mutex();
+        this.fetchMtx = new Mutex();
 
         if (statusProvider !is null) {
             this.statusProvider = statusProvider;
@@ -221,6 +248,7 @@ class TailnetDiscoveryService {
             import std.functional : toDelegate;
             this.peerFetcher = toDelegate(&defaultHttpsInfoFetcher);
         }
+        loadPersistedSelfFqdn();
     }
 
     /// Service accounts may not inherit an interactive PATH; on Windows prefer the
@@ -245,10 +273,8 @@ class TailnetDiscoveryService {
         if (fixture.length > 0 && exists(fixture)) {
             return readText(fixture);
         }
-        try {
-            auto res = execute([tailscaleCliPath(), "status", "--json"], null, Config.none, 1024 * 1024 * 4);
-            if (res.status == 0) return res.output;
-        } catch (Exception) {}
+        auto res = executeBounded([tailscaleCliPath(), "status", "--json"], TAILSCALE_STATUS_TIMEOUT_MS, 1024 * 1024 * 4);
+        if (res.started && !res.timedOut && !res.truncated && res.status == 0) return res.output;
         return "";
     }
 
@@ -272,8 +298,13 @@ class TailnetDiscoveryService {
                 "--max-time", to!string(cast(int) sec),
                 infoUrl,
             ];
-            auto ex = execute(cmd, null, Config.none, 1024 * 128);
-            if (ex.status != 0) {
+            // curl enforces --max-time itself; the outer bound only guards a stuck curl.
+            auto ex = executeBounded(cmd, cast(uint)(sec * 1000) + 2000, 1024 * 128);
+            if (!ex.started) {
+                res.error = "peer_fetch_exception";
+                return res;
+            }
+            if (ex.timedOut || ex.status != 0) {
                 if (ex.status == 60 || ex.status == 35 || ex.status == 51) {
                     res.tls_error = true;
                     res.error = "tls_verification_failed";
@@ -289,28 +320,298 @@ class TailnetDiscoveryService {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Local Tailscale view
+    // ------------------------------------------------------------------
+
+    private string selfFqdnPath() const {
+        return config.paths.state_dir ~ "/local_fqdn";
+    }
+
+    private void loadPersistedSelfFqdn() {
+        try {
+            auto p = selfFqdnPath();
+            if (!exists(p)) return;
+            auto v = trimTrailingDot(readText(p).strip());
+            if (isPlausibleFqdn(v)) {
+                persistedSelfFqdn = v;
+                stickySelfFqdn = v;
+                auto dot = v.indexOf('.');
+                if (dot > 0) stickyMagicSuffix = v[dot + 1 .. $];
+            }
+        } catch (Exception) {}
+    }
+
+    private static bool isPlausibleFqdn(string v) pure @safe {
+        if (v.length < 3 || v.length > 253 || v.indexOf('.') <= 0) return false;
+        foreach (ch; v) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.')) return false;
+        }
+        return true;
+    }
+
+    /// Records a newly learned self FQDN; persisted (only when it changes) so Host
+    /// validation keeps working after a restart while Tailscale is unavailable.
+    private void rememberSelfLocked(const ref TailscaleSnapshot snap) {
+        if (!snap.available) return;
+        if (snap.magic_dns_suffix.length > 0) stickyMagicSuffix = snap.magic_dns_suffix;
+        auto f = snap.selfNode.fqdn;
+        if (!isPlausibleFqdn(f)) return;
+        stickySelfFqdn = f;
+        if (f == persistedSelfFqdn) return;
+        try {
+            import std.file : mkdirRecurse, rename, write;
+            if (!exists(config.paths.state_dir)) mkdirRecurse(config.paths.state_dir);
+            auto tmp = selfFqdnPath() ~ ".tmp";
+            write(tmp, f ~ "\n");
+            rename(tmp, selfFqdnPath());
+            persistedSelfFqdn = f;
+        } catch (Exception) {}
+    }
+
+    private bool snapshotFreshLocked(long nowMono) const {
+        if (!hasTailnetCache) return false;
+        long ageS = (nowMono - lastTailnetMonoNs) / 1_000_000_000L;
+        long ttl = cachedTailnet.available ? config.collection.ttl_seconds.tailnet : SNAPSHOT_FAILURE_RETRY_S;
+        return ageS >= 0 && ageS < ttl;
+    }
+
+    /// Synchronous read of the local Tailscale view (bounded by
+    /// TAILSCALE_STATUS_TIMEOUT_MS). Concurrent callers share one CLI invocation.
     TailscaleSnapshot getLocalTailscaleSnapshot(bool forceRefresh = false) {
-        long nowMono = clocks.monoNs();
+        long callMono = clocks.monoNs();
         synchronized (mtx) {
-            if (!forceRefresh && hasTailnetCache) {
-                long ageS = (nowMono - lastTailnetMonoNs) / 1_000_000_000L;
-                if (ageS >= 0 && ageS < config.collection.ttl_seconds.tailnet) {
-                    return cachedTailnet;
-                }
+            if (!forceRefresh && snapshotFreshLocked(callMono)) return cachedTailnet;
+        }
+        synchronized (fetchMtx) {
+            synchronized (mtx) {
+                // Another caller refreshed while we waited for fetchMtx.
+                if (hasTailnetCache && lastTailnetMonoNs >= callMono) return cachedTailnet;
+                if (!forceRefresh && snapshotFreshLocked(clocks.monoNs())) return cachedTailnet;
+            }
+            string raw;
+            try {
+                raw = statusProvider();
+            } catch (Exception) {
+                raw = "";
+            }
+            auto snap = parseTailscaleStatusJson(raw);
+            synchronized (mtx) {
+                cachedTailnet = snap;
+                lastTailnetMonoNs = clocks.monoNs();
+                hasTailnetCache = true;
+                rememberSelfLocked(snap);
+            }
+            return snap;
+        }
+    }
+
+    /// Non-blocking: returns the cached view immediately (possibly unavailable) and,
+    /// if it is due, refreshes it on a background thread. Used on request paths.
+    TailscaleSnapshot peekLocalTailscaleSnapshot() {
+        bool start = false;
+        TailscaleSnapshot snap;
+        synchronized (mtx) {
+            snap = cachedTailnet;
+            if (!snapshotFreshLocked(clocks.monoNs()) && !bgSnapshotRunning) {
+                bgSnapshotRunning = true;
+                start = true;
             }
         }
-
-        string raw = statusProvider();
-        auto snap = parseTailscaleStatusJson(raw);
-
-        synchronized (mtx) {
-            cachedTailnet = snap;
-            lastTailnetMonoNs = clocks.monoNs();
-            hasTailnetCache = true;
+        if (start) {
+            auto t = new Thread({
+                scope (exit) endBackgroundSnapshot();
+                try { getLocalTailscaleSnapshot(false); } catch (Exception) {}
+            });
+            t.isDaemon = true;
+            t.start();
         }
         return snap;
     }
 
+    private void endBackgroundSnapshot() {
+        synchronized (mtx) bgSnapshotRunning = false;
+    }
+
+    private void endDiscoveryRun() {
+        long w = clocks.wallTs();
+        synchronized (mtx) {
+            discoveryRunning = false;
+            lastDiscoveryFinishWall = w;
+        }
+    }
+
+    /// This node's MagicDNS name: current view, else the last one learned (also
+    /// across restarts). Empty only if Tailscale has never been readable.
+    string localFqdn() {
+        synchronized (mtx) {
+            if (cachedTailnet.available && cachedTailnet.selfNode.fqdn.length > 0) return cachedTailnet.selfNode.fqdn;
+            return stickySelfFqdn;
+        }
+    }
+
+    string magicDnsSuffix() {
+        synchronized (mtx) {
+            if (cachedTailnet.available && cachedTailnet.magic_dns_suffix.length > 0) return cachedTailnet.magic_dns_suffix;
+            return stickyMagicSuffix;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Registry / discovery
+    // ------------------------------------------------------------------
+
+    private void upsertSelfAndPresenceLocked(const ref TailscaleSnapshot snap, string selfNodeId, const ref InfoResponse selfInfo, long nowWall) {
+        NodeRecord selfRec;
+        selfRec.node_id = selfNodeId;
+        selfRec.tailscale_node_id = snap.available ? snap.selfNode.tailscale_node_id : "";
+        selfRec.name = selfInfo.host;
+        string fqdn = (snap.available && snap.selfNode.fqdn.length > 0) ? snap.selfNode.fqdn : selfInfo.fqdn;
+        if (fqdn.length == 0) fqdn = stickySelfFqdn;
+        selfRec.fqdn = fqdn;
+        selfRec.tailnet_port = config.listen.tailnet_port;
+        selfRec.base_path = config.listen.base_path;
+        selfRec.os = selfInfo.os;
+        selfRec.arch = selfInfo.arch;
+        selfRec.is_self = true;
+        if (snap.available) selfRec.tailscale_online = snap.selfNode.online;
+        selfRec.discovery_state = "confirmed";
+        selfRec.last_seen_ts = nowWall;
+        selfRec.last_success_ts = nowWall;
+        selfRec.last_known_hardware_summary = selfInfo.hardware_summary;
+        registry.upsertConfirmedNode(selfRec);
+
+        // Reconcile local Tailscale peer presence with retained registry entries
+        if (snap.available) {
+            foreach (p; snap.peers) {
+                registry.updateTailscalePresence(p.tailscale_node_id, p.fqdn, p.host_name, p.online);
+            }
+        }
+    }
+
+    /// Validates eligible peers through /api/v1/info with bounded concurrency.
+    /// Skips peers Tailscale reports offline, hidden nodes, and peers recently
+    /// identified as non-hikari endpoints.
+    private void validatePeers(TailscaleSnapshot snap, long nowWall) {
+        if (!snap.available || snap.peers.length == 0) return;
+        struct CandidateJob {
+            TailscalePeerCandidate peer;
+            ushort port;
+            string basePath;
+        }
+
+        long nowMono = clocks.monoNs();
+        CandidateJob[] jobs;
+        synchronized (mtx) {
+            foreach (p; snap.peers) {
+                if (p.fqdn.length == 0) continue; // MagicDNS absent for this peer
+                if (!p.online.isNull && !p.online.get) continue; // Tailscale: offline
+                if (auto until = p.fqdn in nonHikariUntilMono) {
+                    if (nowMono < *until) continue;
+                    nonHikariUntilMono.remove(p.fqdn);
+                }
+                ushort port = config.listen.tailnet_port;
+                string bp = "/";
+                bool hidden = false;
+                foreach (const ref existing; registry.nodes) {
+                    if ((p.tailscale_node_id.length > 0 && existing.tailscale_node_id == p.tailscale_node_id)
+                        || existing.fqdn == p.fqdn) {
+                        hidden = existing.hidden;
+                        if (existing.tailnet_port > 0) port = existing.tailnet_port;
+                        if (existing.base_path.length > 0) bp = existing.base_path;
+                        break;
+                    }
+                }
+                if (hidden) continue;
+                jobs ~= CandidateJob(p, port, bp);
+            }
+        }
+        if (jobs.length == 0) return;
+
+        uint maxConc = config.discovery.max_concurrent_probes;
+        if (maxConc == 0) maxConc = 1;
+
+        struct JobOutcome {
+            CandidateJob job;
+            PeerValidationResult res;
+        }
+        JobOutcome[] outcomes = new JobOutcome[jobs.length];
+        size_t nextIdx = 0;
+        auto jobMtx = new Mutex();
+
+        void workerFn() {
+            while (true) {
+                size_t myIdx;
+                synchronized (jobMtx) {
+                    if (nextIdx >= jobs.length) return;
+                    myIdx = nextIdx++;
+                }
+                auto jb = jobs[myIdx];
+                auto url = buildHttpsUrl(jb.peer.fqdn, jb.port, jb.basePath, "/api/v1/info");
+                outcomes[myIdx].job = jb;
+                try {
+                    outcomes[myIdx].res = peerFetcher(url, jb.peer.fqdn, config.discovery.probe_timeout_ms);
+                } catch (Exception) {
+                    outcomes[myIdx].res.error = "peer_fetch_exception";
+                }
+            }
+        }
+
+        uint workerCount = jobs.length < maxConc ? cast(uint) jobs.length : maxConc;
+        Thread[] pool;
+        foreach (_; 0 .. workerCount) {
+            auto t = new Thread(&workerFn);
+            t.start();
+            pool ~= t;
+        }
+        foreach (t; pool) t.join();
+
+        long doneMono = clocks.monoNs();
+        synchronized (mtx) {
+            foreach (outc; outcomes) {
+                auto p = outc.job.peer;
+                if (outc.res.ok) {
+                    NodeRecord nr;
+                    nr.node_id = outc.res.info.node_id;
+                    nr.tailscale_node_id = p.tailscale_node_id;
+                    nr.name = outc.res.info.host.length > 0 ? outc.res.info.host : p.host_name;
+                    nr.fqdn = p.fqdn;
+                    nr.tailnet_port = outc.job.port;
+                    nr.base_path = outc.job.basePath;
+                    nr.os = outc.res.info.os;
+                    nr.arch = outc.res.info.arch;
+                    nr.is_self = false;
+                    nr.tailscale_online = p.online;
+                    nr.discovery_state = "confirmed";
+                    nr.last_seen_ts = nowWall;
+                    nr.last_success_ts = nowWall;
+                    nr.last_known_hardware_summary = outc.res.info.hardware_summary;
+                    registry.upsertConfirmedNode(nr);
+                } else if (outc.res.incompatible) {
+                    // Only mark incompatible if previously confirmed; don't add non-hikari hosts to registry
+                    registry.markUnreachable("", p.tailscale_node_id, p.fqdn, "incompatible");
+                    if (outc.res.error == "not_a_hikari_endpoint") {
+                        nonHikariUntilMono[p.fqdn] = doneMono + NON_HIKARI_RETRY_S * 1_000_000_000L;
+                    }
+                } else {
+                    // Do not add unvalidated peers; if previously confirmed, retain and mark unreachable
+                    registry.markUnreachable("", p.tailscale_node_id, p.fqdn, "unreachable");
+                }
+            }
+        }
+    }
+
+    private NodesResponse buildResponseLocked(long nowWall) {
+        NodesResponse resp;
+        resp.generated_at = nowWall;
+        foreach (n; registry.nodes) {
+            if (!n.hidden) resp.nodes ~= n;
+        }
+        return resp;
+    }
+
+    /// Synchronous list (+ optional synchronous peer validation). Used by the CLI
+    /// (`hikari nodes list|discover`) where blocking is expected.
     NodesResponse listAndDiscoverNodes(
         string selfNodeId,
         InfoResponse selfInfo,
@@ -319,138 +620,74 @@ class TailnetDiscoveryService {
     ) {
         long nowWall = clocks.wallTs();
         auto snap = getLocalTailscaleSnapshot(forceTailscaleRefresh);
-
-        synchronized (mtx) {
-            // Upsert self node
-            NodeRecord selfRec;
-            selfRec.node_id = selfNodeId;
-            selfRec.tailscale_node_id = snap.available ? snap.selfNode.tailscale_node_id : "";
-            selfRec.name = selfInfo.host;
-            selfRec.fqdn = (snap.available && snap.selfNode.fqdn.length > 0) ? snap.selfNode.fqdn : selfInfo.fqdn;
-            selfRec.tailnet_port = config.listen.tailnet_port;
-            selfRec.base_path = config.listen.base_path;
-            selfRec.os = selfInfo.os;
-            selfRec.arch = selfInfo.arch;
-            selfRec.is_self = true;
-            if (snap.available) selfRec.tailscale_online = snap.selfNode.online;
-            selfRec.discovery_state = "confirmed";
-            selfRec.last_seen_ts = nowWall;
-            selfRec.last_success_ts = nowWall;
-            selfRec.last_known_hardware_summary = selfInfo.hardware_summary;
-            registry.upsertConfirmedNode(selfRec);
-
-            // Reconcile local Tailscale peer presence with retained registry entries
-            if (snap.available) {
-                foreach (p; snap.peers) {
-                    registry.updateTailscalePresence(p.tailscale_node_id, p.fqdn, p.host_name, p.online);
-                }
-            }
-        }
-
-        // Probe candidates on demand with bounded concurrency (default 4)
-        if (probePeers && snap.available && snap.peers.length > 0) {
-            struct CandidateJob {
-                TailscalePeerCandidate peer;
-                ushort port;
-                string basePath;
-            }
-
-            CandidateJob[] jobs;
-            synchronized (mtx) {
-                foreach (p; snap.peers) {
-                    if (p.fqdn.length == 0) continue; // MagicDNS absent for this peer
-                    ushort port = config.listen.tailnet_port;
-                    string bp = "/";
-                    foreach (const ref existing; registry.nodes) {
-                        if ((p.tailscale_node_id.length > 0 && existing.tailscale_node_id == p.tailscale_node_id)
-                            || existing.fqdn == p.fqdn) {
-                            if (existing.hidden) {
-                                port = 0;
-                                break;
-                            }
-                            if (existing.tailnet_port > 0) port = existing.tailnet_port;
-                            if (existing.base_path.length > 0) bp = existing.base_path;
-                            break;
-                        }
-                    }
-                    if (port == 0) continue; // hidden node
-                    jobs ~= CandidateJob(p, port, bp);
-                }
-            }
-
-            uint maxConc = config.discovery.max_concurrent_probes;
-            if (maxConc == 0) maxConc = 1;
-
-            struct JobOutcome {
-                CandidateJob job;
-                PeerValidationResult res;
-            }
-            JobOutcome[] outcomes = new JobOutcome[jobs.length];
-            size_t nextIdx = 0;
-            auto jobMtx = new Mutex();
-
-            void workerFn() {
-                while (true) {
-                    size_t myIdx;
-                    synchronized (jobMtx) {
-                        if (nextIdx >= jobs.length) return;
-                        myIdx = nextIdx++;
-                    }
-                    auto jb = jobs[myIdx];
-                    auto url = buildHttpsUrl(jb.peer.fqdn, jb.port, jb.basePath, "/api/v1/info");
-                    outcomes[myIdx].job = jb;
-                    outcomes[myIdx].res = peerFetcher(url, jb.peer.fqdn, config.discovery.probe_timeout_ms);
-                }
-            }
-
-            uint workerCount = jobs.length < maxConc ? cast(uint) jobs.length : maxConc;
-            Thread[] pool;
-            foreach (_; 0 .. workerCount) {
-                auto t = new Thread(&workerFn);
-                t.start();
-                pool ~= t;
-            }
-            foreach (t; pool) t.join();
-
-            synchronized (mtx) {
-                foreach (outc; outcomes) {
-                    auto p = outc.job.peer;
-                    if (outc.res.ok) {
-                        NodeRecord nr;
-                        nr.node_id = outc.res.info.node_id;
-                        nr.tailscale_node_id = p.tailscale_node_id;
-                        nr.name = outc.res.info.host.length > 0 ? outc.res.info.host : p.host_name;
-                        nr.fqdn = p.fqdn;
-                        nr.tailnet_port = outc.job.port;
-                        nr.base_path = outc.job.basePath;
-                        nr.os = outc.res.info.os;
-                        nr.arch = outc.res.info.arch;
-                        nr.is_self = false;
-                        nr.tailscale_online = p.online;
-                        nr.discovery_state = "confirmed";
-                        nr.last_seen_ts = nowWall;
-                        nr.last_success_ts = nowWall;
-                        nr.last_known_hardware_summary = outc.res.info.hardware_summary;
-                        registry.upsertConfirmedNode(nr);
-                    } else if (outc.res.incompatible) {
-                        // Only mark incompatible if previously confirmed; don't add non-hikari hosts to registry
-                        registry.markUnreachable("", p.tailscale_node_id, p.fqdn, "incompatible");
-                    } else {
-                        // Do not add unvalidated peers; if previously confirmed, retain and mark unreachable
-                        registry.markUnreachable("", p.tailscale_node_id, p.fqdn, "unreachable");
-                    }
-                }
-            }
-        }
-
+        synchronized (mtx) upsertSelfAndPresenceLocked(snap, selfNodeId, selfInfo, nowWall);
+        if (probePeers) validatePeers(snap, nowWall);
         synchronized (mtx) {
             registry.saveIfChanged(nowWall);
-            NodesResponse resp;
-            resp.generated_at = nowWall;
-            foreach (n; registry.nodes) {
-                if (!n.hidden) resp.nodes ~= n;
-            }
-            return resp;
+            return buildResponseLocked(nowWall);
         }
+    }
+
+    /// Request-path variant for GET /api/v1/nodes: never blocks on Tailscale or
+    /// peers. Returns the registry immediately and, when `allowDiscovery` is set
+    /// and a run is due (tailnet TTL since the last one, or FORCED_DISCOVERY_MIN_INTERVAL_S
+    /// when `forced`), validates peers on a single background thread.
+    NodesResponse listNodesAndScheduleDiscovery(string selfNodeId, InfoResponse selfInfo, bool allowDiscovery, bool forced) {
+        long nowWall = clocks.wallTs();
+        long nowMono = clocks.monoNs();
+        auto snap = peekLocalTailscaleSnapshot();
+
+        bool startDiscovery = false;
+        NodesResponse resp;
+        synchronized (mtx) {
+            upsertSelfAndPresenceLocked(snap, selfNodeId, selfInfo, nowWall);
+            if (allowDiscovery && !discoveryRunning) {
+                long sinceS = hasDiscoveryRun ? (nowMono - lastDiscoveryStartMonoNs) / 1_000_000_000L : long.max;
+                long minGap = forced ? FORCED_DISCOVERY_MIN_INTERVAL_S : config.collection.ttl_seconds.tailnet;
+                if (sinceS < 0 || sinceS >= minGap) {
+                    startDiscovery = true;
+                    discoveryRunning = true;
+                    hasDiscoveryRun = true;
+                    lastDiscoveryStartMonoNs = nowMono;
+                    lastDiscoveryStartWall = nowWall;
+                }
+            }
+            registry.saveIfChanged(nowWall);
+            resp = buildResponseLocked(nowWall);
+            DiscoveryMeta dm;
+            dm.running = discoveryRunning;
+            dm.last_started_at = lastDiscoveryStartWall;
+            dm.last_finished_at = lastDiscoveryFinishWall;
+            dm.tailscale_available = snap.available;
+            resp.discovery = dm;
+        }
+
+        if (startDiscovery) {
+            auto t = new Thread({
+                scope (exit) endDiscoveryRun();
+                try {
+                    auto s2 = getLocalTailscaleSnapshot(forced);
+                    long w = clocks.wallTs();
+                    validatePeers(s2, w);
+                    synchronized (mtx) registry.saveIfChanged(w);
+                } catch (Exception) {}
+            });
+            t.isDaemon = true;
+            t.start();
+        }
+        return resp;
+    }
+
+    /// Blocks until a background discovery run (if any) completes. Tests only.
+    bool waitForDiscoveryIdle(uint timeoutMs) {
+        import core.time : MonoTime, msecs;
+        auto deadline = MonoTime.currTime + msecs(timeoutMs);
+        while (MonoTime.currTime < deadline) {
+            synchronized (mtx) {
+                if (!discoveryRunning) return true;
+            }
+            Thread.sleep(msecs(5));
+        }
+        return false;
     }
 }

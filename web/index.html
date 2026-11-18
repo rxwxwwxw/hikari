@@ -572,6 +572,8 @@
     isaFilter: "",
     pollIntervalMs: 15000,
     pollTimer: null,
+    discoveryFollowupTimer: null,
+    discoveryFollowups: 0,
     activeControllers: new Set(),
     isPolling: false,
   };
@@ -961,8 +963,10 @@
     });
     renderDetail();
 
-    let url = resolveEndpointUrl(node, "hardware");
-    if (forceRefresh) url += (url.includes("?") ? "&" : "?") + "refresh=1";
+    // forceRefresh only bypasses this page's cache. A forced rescan on the node is
+    // an administrative action (`hikari hardware --refresh` on that machine); the
+    // server serves its TTL-cached inventory to every GET.
+    const url = resolveEndpointUrl(node, "hardware");
 
     try {
       const res = await fetchJsonBounded(url, 6000);
@@ -1128,7 +1132,7 @@
       ? ("Collected " + formatTs(hwEntry.data.collected_at) + " · status: " + (hwEntry.data.collection ? hwEntry.data.collection.status : "fresh"))
       : "Hardware inventory is fetched lazily when opened.";
     actionBar.appendChild(el("div", { className: "muted", text: statusText }));
-    const refBtn = el("button", { type: "button", className: "btn btn-primary", text: hwEntry && hwEntry.loading ? "Scanning..." : "Refresh Hardware Scan" });
+    const refBtn = el("button", { type: "button", className: "btn btn-primary", text: hwEntry && hwEntry.loading ? "Loading..." : "Reload inventory", title: "Re-fetch the node's cached inventory. Force a rescan on that machine with: hikari hardware --refresh" });
     refBtn.disabled = Boolean(hwEntry && hwEntry.loading);
     refBtn.addEventListener("click", () => ensureHardwareLoaded(node.node_id, true));
     actionBar.appendChild(refBtn);
@@ -1449,6 +1453,7 @@
       const nRes = await fetchJsonBounded(nodesUrl, 6000);
       if (nRes.ok && nRes.json && Array.isArray(nRes.json.nodes)) {
         state.nodes = nRes.json.nodes;
+        scheduleDiscoveryFollowup(nRes.json.discovery, discoverPeers);
         if (!state.selectedNodeId && state.nodes.length > 0) {
           state.selectedNodeId = state.nodes[0].node_id;
         }
@@ -1517,6 +1522,25 @@
     }
   }
 
+  // /api/v1/nodes returns immediately and validates peers in the background; while
+  // that run is in progress, re-read the registry a few times so new peers appear
+  // without waiting for the next poll (or at all, if polling is off).
+  function scheduleDiscoveryFollowup(discovery, startedByUser) {
+    if (startedByUser) state.discoveryFollowups = 0;
+    if (state.discoveryFollowupTimer) return;
+    if (!discovery || !discovery.running) {
+      state.discoveryFollowups = 0;
+      return;
+    }
+    if (state.discoveryFollowups >= 10) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    state.discoveryFollowups++;
+    state.discoveryFollowupTimer = setTimeout(() => {
+      state.discoveryFollowupTimer = null;
+      if (document.visibilityState === "visible") refreshAll(false);
+    }, 3000);
+  }
+
   function schedulePolling() {
     if (state.pollTimer) {
       clearInterval(state.pollTimer);
@@ -1535,6 +1559,10 @@
       if (state.pollTimer) {
         clearInterval(state.pollTimer);
         state.pollTimer = null;
+      }
+      if (state.discoveryFollowupTimer) {
+        clearTimeout(state.discoveryFollowupTimer);
+        state.discoveryFollowupTimer = null;
       }
       abortAllRequests();
       document.getElementById("poll-status-text").textContent = "Paused while tab hidden";

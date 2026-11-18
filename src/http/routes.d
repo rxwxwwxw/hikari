@@ -60,8 +60,18 @@ class HikariRouter {
         resp.headers["X-Content-Type-Options"] = "nosniff";
         resp.headers["Cache-Control"] = "no-store";
 
-        auto snap = discovery !is null ? discovery.getLocalTailscaleSnapshot(false) : TailscaleSnapshot.init;
-        string localFqdn = snap.available ? snap.selfNode.fqdn : "";
+        auto routePath = stripConfiguredBasePath(req.path, config.listen.base_path);
+
+        // Never block a request on the Tailscale CLI: use the cached view (refreshed
+        // in the background when due) and the last learned FQDN if the current read
+        // failed. /healthz does not even schedule a refresh.
+        string localFqdn = "";
+        string magicSuffix = "";
+        if (discovery !is null) {
+            if (routePath != "/healthz") discovery.peekLocalTailscaleSnapshot();
+            localFqdn = discovery.localFqdn();
+            magicSuffix = discovery.magicDnsSuffix();
+        }
         if (localFqdn.length > 0 && coordinator !is null) {
             coordinator.updateFqdn(localFqdn);
         }
@@ -76,7 +86,7 @@ class HikariRouter {
         if (auto pOrig = "origin" in req.headers) originHdr = *pOrig;
 
         auto knownFqdns = registry !is null ? registry.knownFqdns() : null;
-        auto ov = validateRequestOrigin(originHdr, config, localFqdn, snap.magic_dns_suffix, knownFqdns);
+        auto ov = validateRequestOrigin(originHdr, config, localFqdn, magicSuffix, knownFqdns);
         if (!ov.allowed) {
             return jsonError(403, "Forbidden", "origin_denied", "Origin not authorized for this tailnet node", resp.headers);
         }
@@ -99,8 +109,6 @@ class HikariRouter {
             return jsonError(405, "Method Not Allowed", "method_not_allowed", "Only GET/HEAD/OPTIONS permitted", resp.headers);
         }
 
-        auto routePath = stripConfiguredBasePath(req.path, config.listen.base_path);
-
         if (routePath == "/healthz") {
             auto hr = coordinator.getHealth();
             resp.statusCode = 200;
@@ -118,8 +126,9 @@ class HikariRouter {
         }
 
         if (routePath == "/api/v1/status") {
-            bool force = req.query == "refresh=1" || req.query == "refresh=true";
-            auto sr = coordinator.getStatus(force);
+            // Forced refresh is an administrative action (CLI only, AGENTS.md section 5): a
+            // GET from any tailnet member must never bypass TTLs or failure backoff.
+            auto sr = coordinator.getStatus(false);
             final switch (sr.kind) {
                 case EndpointOutcomeKind.ok:
                     resp.statusCode = 200;
@@ -144,8 +153,9 @@ class HikariRouter {
         }
 
         if (routePath == "/api/v1/hardware") {
-            bool force = req.query == "refresh=1" || req.query == "refresh=true";
-            auto hr = coordinator.getHardware(force);
+            // Forced refresh is an administrative action (CLI only, AGENTS.md section 5): a
+            // GET from any tailnet member must never bypass TTLs or failure backoff.
+            auto hr = coordinator.getHardware(false);
             final switch (hr.kind) {
                 case EndpointOutcomeKind.ok:
                     resp.statusCode = 200;
@@ -170,9 +180,12 @@ class HikariRouter {
         }
 
         if (routePath == "/api/v1/nodes") {
-            bool probePeers = config.discovery.enabled_on_dashboard_open && req.query != "probe=0";
+            // Returns the registry immediately; peer validation runs in the background
+            // when due (tailnet TTL, or a rate-limited operator "Scan peers" request).
+            bool probePeers = config.discovery.enabled_on_dashboard_open && !queryHas(req.query, "probe=0");
+            bool forced = queryHas(req.query, "refresh=1");
             auto info = coordinator.getInfo();
-            auto nr = discovery.listAndDiscoverNodes(info.node_id, info, probePeers, req.query == "refresh=1");
+            auto nr = discovery.listNodesAndScheduleDiscovery(info.node_id, info, probePeers, forced);
             resp.statusCode = 200;
             resp.statusText = "OK";
             resp.bodyText = toJsonText(serializeNodesResponse(nr));
@@ -190,6 +203,14 @@ class HikariRouter {
         }
 
         return jsonError(404, "Not Found", "not_found", "Endpoint not found", resp.headers);
+    }
+
+    private static bool queryHas(string query, string param) pure @safe {
+        import std.algorithm : splitter;
+        foreach (part; query.splitter('&')) {
+            if (part == param) return true;
+        }
+        return false;
     }
 
     private static string toStringUint(uint v) pure @safe {
