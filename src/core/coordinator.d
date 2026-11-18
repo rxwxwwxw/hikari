@@ -322,6 +322,7 @@ class RefreshCoordinator {
         e.lastAttemptMonoNs = nowMono;
         e.inFlightStartedMonoNs = nowMono;
         ulong launchGen = e.generation;
+        e.workerGeneration = launchGen;
         store.groups[g] = e;
 
         auto worker = new Thread({
@@ -331,9 +332,10 @@ class RefreshCoordinator {
         worker.start();
     }
 
-    private void clearWorkerAlive(ProbeGroup g) {
+    private void clearWorkerAlive(ProbeGroup g, ulong expectedGen) {
         synchronized (mtx) {
             auto e = store.groups[g];
+            if (e.workerGeneration != expectedGen) return;
             e.workerAlive = false;
             store.groups[g] = e;
             cond.notifyAll();
@@ -343,7 +345,7 @@ class RefreshCoordinator {
     private void runProbe(ProbeGroup g, ulong expectedGen) {
         // (A helper call rather than `synchronized` inside scope(exit): LDC's
         // Windows funclet EH miscompiles nested synchronized in cleanup blocks.)
-        scope (exit) clearWorkerAlive(g);
+        scope (exit) clearWorkerAlive(g, expectedGen);
         try {
             final switch (g) {
                 case ProbeGroup.fast:
@@ -607,6 +609,7 @@ class RefreshCoordinator {
         e.hasSuccess = true;
         e.unsupported = false;
         e.inFlight = false;
+        e.workerAlive = false;
         e.lastSuccessMonoNs = doneMono;
         e.lastSuccessWallTs = doneWall;
         e.consecutiveFailures = 0;
@@ -628,6 +631,7 @@ class RefreshCoordinator {
     private void markGroupFailureLocked(ProbeGroup g, long nowMono, string err) {
         auto e = store.groups[g];
         e.inFlight = false;
+        e.workerAlive = false;
         e.consecutiveFailures++;
         e.lastError = sanitizeOsString(err, 128);
         e.backoffUntilMonoNs = nowMono + computeBackoffNs(e.consecutiveFailures);
@@ -642,6 +646,7 @@ class RefreshCoordinator {
             if (store.groups[g].generation != expectedGen) return;
             auto e = store.groups[g];
             e.inFlight = false;
+            e.workerAlive = false;
             e.unsupported = true;
             e.lastAttemptMonoNs = nowMono;
             e.consecutiveFailures = 0;

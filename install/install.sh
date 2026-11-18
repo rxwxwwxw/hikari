@@ -415,12 +415,6 @@ except Exception:
   TS_IP="${TS_IP//$'\r'/}"
 fi
 
-# Serialize activation, dependency provisioning and account creation with updates.
-if [ "$DRY_RUN" -eq 0 ] && [ "${HIKARI_INSTALL_LOCKED:-0}" != 1 ]; then
-  exec python3 "$REPO_ROOT/install/locked-run.py" "$VERSIONS_DIR" \
-    bash "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
-fi
-
 # 4b. Caddy mode: explicit flag > operator config > auto. Then hikari's own read-only analysis
 #     of any existing Caddy (nothing is changed here).
 CONFIG_PATH="$ETC_HIKARI/config.json"
@@ -477,6 +471,13 @@ if [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrat
   fi
 elif [ "$EFFECTIVE_CADDY_MODE" = "isolated" ]; then
   CADDY_DECISION_REASON="caddy mode is 'isolated'"
+fi
+
+# Refuse unsafe explicit integration before creating even the update lock directory.
+# Re-execution repeats the read-only analysis under the lock before any mutation.
+if [ "$DRY_RUN" -eq 0 ] && [ "${HIKARI_INSTALL_LOCKED:-0}" != 1 ]; then
+  exec python3 "$REPO_ROOT/install/locked-run.py" "$VERSIONS_DIR" \
+    bash "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
 fi
 
 # 5. Caddy binary for the isolated instance (an existing Caddy binary is used read-only; its

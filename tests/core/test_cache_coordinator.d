@@ -18,6 +18,27 @@ private string makeTempStateDir(string suffix) {
 }
 
 unittest {
+    // A worker finishing cleanup after publishing success is not a hung probe.
+    auto stateDir = makeTempStateDir("completion-meta");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = stateDir;
+    auto store = new TelemetryCacheStore(cfg, "hikari:completion-meta");
+    auto entry = store.groups[ProbeGroup.fast];
+    entry.hasSuccess = true;
+    entry.lastSuccessMonoNs = 10_000_000_000L;
+    entry.lastSuccessWallTs = 100;
+    entry.workerAlive = true;
+    entry.inFlight = false;
+    store.groups[ProbeGroup.fast] = entry;
+    assert(store.buildGroupMeta(ProbeGroup.fast, 10_000_000_000L, 100).status == GroupStatus.fresh);
+    entry.lastError = "probe_timeout";
+    entry.consecutiveFailures = 1;
+    store.groups[ProbeGroup.fast] = entry;
+    assert(store.buildGroupMeta(ProbeGroup.fast, 10_000_000_000L, 100).error == "probe_hung");
+}
+
+unittest {
     // Fresh hit does NOT invoke probes; stale triggers async single-flight; /status NEVER scans hardware; /info NEVER probes
     auto stateDir = makeTempStateDir("ttl");
     scope (exit) { if (exists(stateDir)) rmdirRecurse(stateDir); }

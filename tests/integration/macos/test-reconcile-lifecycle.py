@@ -88,7 +88,7 @@ while True:
             second_pid = observed("start")[-1]["pid"]
             source.write_text("offline")
             wait_for(lambda: any(e["pid"] == second_pid for e in observed("stop")), "identity loss did not stop Caddy")
-            assert not alive(second_pid)
+            wait_for(lambda: not alive(second_pid), "stopped Caddy process did not exit", 5)
             assert len(observed("start")) == 2, "unavailable identity spawned another Caddy process"
             source.write_text("configuration-C")
             wait_for(lambda: len(observed("start")) == 3, "Caddy did not recover after identity returned")
