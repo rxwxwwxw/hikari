@@ -702,7 +702,23 @@ fi
 
 if [ -d "$REL_DIR" ]; then
   # A live version is immutable; reinstall/repair must never unlink its binary.
-  if ! diff -qr "$STAGING_DIR" "$REL_DIR" >/dev/null; then
+  if ! python3 - "$STAGING_DIR" "$REL_DIR" <<'PY'
+import filecmp, pathlib, sys
+def identical(left, right):
+    comparison = filecmp.dircmp(left, right)
+    if comparison.left_only or comparison.right_only or comparison.common_funny:
+        return False
+    for name in comparison.common_files:
+        a, b = pathlib.Path(left, name), pathlib.Path(right, name)
+        if a.is_symlink() or b.is_symlink() or not filecmp.cmp(a, b, shallow=False):
+            return False
+    return all(not pathlib.Path(left, name).is_symlink()
+               and not pathlib.Path(right, name).is_symlink()
+               and identical(pathlib.Path(left, name), pathlib.Path(right, name))
+               for name in comparison.common_dirs)
+sys.exit(0 if identical(*sys.argv[1:]) else 1)
+PY
+  then
     rm -rf "$STAGING_DIR"
     echo "Release $APP_VERSION already exists with different content; use a new version." >&2
     exit 1
