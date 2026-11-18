@@ -12,7 +12,7 @@ The goal is a useful, low-overhead personal tailnet monitor that can be installe
 |---|---|---|---|
 | **1 — Linux** | Fedora; CachyOS/Arch; Ubuntu-family (Ubuntu, Mint, Armbian); x86-64 and ARM64 where available | **systemd system service** | Tailscale already installed on real target; install Caddy if necessary |
 | **2 — Windows** | Windows 11 x86-64 first; other supported Windows versions only after explicit testing | **Windows Service Control Manager**, native service support (no wrapper), not a login task | Tailscale already installed; bundled/private Caddy if missing |
-| **3 — macOS** | Apple Silicon and Intel Macs on supported macOS releases | **system-domain launchd LaunchDaemons**, not LaunchAgents | Tailscale already installed; Homebrew installed; install Caddy if missing |
+| **3 — macOS** | Apple Silicon Macs on supported macOS releases; Intel macOS deferred | **system-domain launchd LaunchDaemons**, not LaunchAgents | Tailscale already installed; Homebrew installed; install Caddy if missing |
 
 **Definition of platform parity:** From a browser on another tailnet device, a machine can be discovered, shown in the fleet dashboard, queried for truthful cached telemetry, inspected through readable hardware cards, and maintained by an installer/updater that survives reboot, restart, logout, disconnection, and interrupted updates. Unsupported *individual hardware metrics* are allowed if correctly labeled; missing **core lifecycle functionality** is not.
 
@@ -212,18 +212,20 @@ Linux is **done** only when all of the following are true:
 
 ---
 
-## 3. Stage 3 — macOS, system-level launchd and Intel/Apple Silicon parity
+## 3. Stage 3 — Apple Silicon macOS and system-level launchd
+
+**Scope:** Apple Silicon only for this release. The owner's older Intel Mac runs Linux and is covered by the Linux targets. Intel macOS support is deferred; existing compatibility code and fixtures may remain, but native Intel validation and release artifacts are not release requirements.
 
 **Goal:** hikari stays available before interactive login and after logout; no user-space `brew services start` or `LaunchAgent` is required. The installer may use Homebrew to obtain Caddy, but the actual service is **hikari-owned and system-level**.
 
 ### M0 — macOS builds, hardware inventory, and telemetry
 
-- Native Darwin arm64 and x86-64 LDC builds and CI; paths under `/Library/Application Support/hikari/` and `/opt/hikari/versions/` as specified in `AGENTS.md`.
+- Native Darwin arm64 LDC builds and CI; paths under `/Library/Application Support/hikari/` and `/opt/hikari/versions/` as specified in `AGENTS.md`.
 - Mach/sysctl `CPU`, memory, network, process and filesystem probes; battery, GPU, reboot/updates where genuinely supported; no private or unsafe APIs just to manufacture GPU utilization.
-- Intel x86 CPU ISA checks and Apple Silicon ARM capabilities, with friendly human-readable cards; `hw.model`/Apple model ID when PC-style motherboard info is unavailable. IOKit/IORegistry for safely obtainable hardware facts.
+- Apple Silicon ARM capabilities, with friendly human-readable cards; `hw.model`/Apple model ID when PC-style motherboard info is unavailable. IOKit/IORegistry for safely obtainable hardware facts.
 - CPU/GPU/battery/system readouts properly reflect `unknown`, `unsupported`, and permission restrictions.
 
-**Exit:** local CLI and loopback HTTP status/hardware are correct on an Intel Mac and an Apple Silicon Mac, or a missing hardware test is explicitly documented with a fixture and scheduled real-host gate before release.
+**Exit:** local CLI and loopback HTTP status/hardware are correct on an Apple Silicon Mac.
 
 ### M1 — System LaunchDaemons and Homebrew-aware Caddy installation
 
@@ -241,9 +243,27 @@ Linux is **done** only when all of the following are true:
 - Full machine hardware card and dashboard parity with Linux and Windows, with platform-appropriate unavailable states.
 - Verified signed archive, versioned installation, launchd restart/health check, failure rollback and preservation of config/state/certificates.
 - Idempotent reinstall/repair/uninstall; existing macOS Caddy services/configs untouched; normal Homebrew management not hijacked.
-- CI native tests for Apple Silicon and Intel where available; real-host checks for **logout, login window, sleep/wake, Tailscale app variant, certificate access, reboot and version rollback**.
+- CI native tests for Apple Silicon; real-host checks for **logout, login window, sleep/wake, Tailscale app variant, certificate access, reboot and version rollback**.
 
-**Stage 3 is done only when:** both Mac architectures have validated builds, the service works without a logged-in user, the hardware inventory is useful and accurate, signed update/rollback works, and the unchanged dashboard can mix all three OSes in one fleet. Windows and Linux regression suites still pass.
+**Stage 3 is done only when:** Apple Silicon has validated builds, the service works without a logged-in user, the hardware inventory is useful and accurate, signed update/rollback works, and the unchanged dashboard can mix all three OSes in one fleet. Windows and Linux regression suites still pass.
+
+---
+
+### Stage 3 execution record — 2026-11-17
+
+M0–M2 implementation is in progress. These checks do **not** waive the exit gates above.
+See [`docs/testing-macos.md`](docs/testing-macos.md) for commands, interpretation and the real-host matrix.
+
+- [x] Local Apple Silicon debug/release builds, nine native D test modules, browser regression tests, CLI status/hardware smoke, and a measured idle-agent observation.
+- [x] Native Mach/sysctl/libproc/64-bit NIC counters, public battery APIs, sanitized IOKit storage/GPU inventory, and friendly NIC labels exercised on an M1.
+- [x] Rootless installer/repair/uninstall and Caddy-reconciler fixtures; actual pinned-Caddy validation of spaced macOS paths, prefixed routes and the tailnet-only listener.
+- [x] Signed-input verification, immutable releases, failed-health rollback and interrupted-activation recovery exercised through local fixtures.
+- [x] Separate x86_64 release/test binaries linked with official LDC; nine modules passed under existing Rosetta before Intel macOS was deferred.
+- [ ] Linux/Windows regression runs on the updated code.
+- [x] User-run Apple Silicon temporary system LaunchDaemon passed low-privilege startup and crash recovery.
+- [x] Apple Silicon CI passed real installer-account/permission tests, repair, retained-state uninstall and temporary system LaunchDaemon recovery (run 44210913386).
+- [ ] Real Tailscale variant/service-context certificate permissions, a mixed fleet over HTTPS, and preservation of an existing Caddy/Tailscale deployment.
+- [ ] Logout/login-window, reboot, sleep/wake, address-change, full installed-stack idle measurements and signed service-update/rollback gates.
 
 ---
 
@@ -314,7 +334,7 @@ By the **end of Stage 1**, provide:
 
 By the **end of Stage 2**, add `docs/install-windows.md`, administrator setup, service-account rationale, child/multiple-user and logged-out behavior, repair/update/uninstall, and Windows firewall/service troubleshooting (never change it silently).
 
-By the **end of Stage 3**, add `docs/install-macos.md`, Intel/Apple Silicon, Homebrew-aware Caddy installation, LaunchDaemon setup, Tailscale variant limitations, noninteractive permissions, login-window validation and rollback.
+By the **end of Stage 3**, add `docs/install-macos.md`, Apple Silicon, Homebrew-aware Caddy installation, LaunchDaemon setup, Tailscale variant limitations, noninteractive permissions, login-window validation and rollback.
 
 Every installer should explain **what it will change before modifying the host**, report meaningful errors, make repeated invocations safe, and print the real dashboard URL only after validating the relevant prerequisites. A first-time installation should not require hand-editing a Caddyfile.
 

@@ -44,7 +44,9 @@ RunResult runIsolated(string[] argv, uint timeoutMs = 20_000, bool isolateStorag
     try {
         auto outF = File(outPath, "wb");
         auto errF = File(errPath, "wb");
-        auto pid = spawnProcess(argv, File.init, outF, errF, env, Config.none);
+        version (Windows) auto inF = File("NUL", "r");
+        else auto inF = File("/dev/null", "r");
+        auto pid = spawnProcess(argv, inF, outF, errF, env, Config.none);
         outF.close();
         errF.close();
         uint waited = 0;

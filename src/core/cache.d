@@ -13,10 +13,11 @@ struct GroupCacheEntry {
     bool hasSuccess = false;
     bool unsupported = false;
     bool inFlight = false;
-    /// True from worker start until the worker thread actually returns. A probe
+    /// True while the worker can still be collecting. A probe
     /// that exceeded its deadline is no longer `inFlight`, but its thread may
     /// still be blocked inside the OS; no second worker starts until it exits.
     bool workerAlive = false;
+    ulong workerGeneration = 0;
     long lastSuccessMonoNs = 0;
     long lastSuccessWallTs = 0;
     long lastAttemptMonoNs = 0;
@@ -163,7 +164,9 @@ class TelemetryCacheStore {
         auto e = groups[g];
         GroupMeta gm;
         gm.refreshing = e.inFlight;
-        bool hung = e.workerAlive && !e.inFlight;
+        // A completed probe publishes its sample before its thread exits. Only
+        // a worker reaped for timeout is hung during that short cleanup window.
+        bool hung = e.workerAlive && !e.inFlight && e.lastError == "probe_timeout";
         if (e.hasSuccess) {
             long age = computeGroupAgeS(g, nowMonoNs, nowWallTs);
             gm.sampled_at = e.lastSuccessWallTs;

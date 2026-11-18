@@ -18,6 +18,27 @@ private string makeTempStateDir(string suffix) {
 }
 
 unittest {
+    // A worker finishing cleanup after publishing success is not a hung probe.
+    auto stateDir = makeTempStateDir("completion-meta");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = stateDir;
+    auto store = new TelemetryCacheStore(cfg, "hikari:completion-meta");
+    auto entry = store.groups[ProbeGroup.fast];
+    entry.hasSuccess = true;
+    entry.lastSuccessMonoNs = 10_000_000_000L;
+    entry.lastSuccessWallTs = 100;
+    entry.workerAlive = true;
+    entry.inFlight = false;
+    store.groups[ProbeGroup.fast] = entry;
+    assert(store.buildGroupMeta(ProbeGroup.fast, 10_000_000_000L, 100).status == GroupStatus.fresh);
+    entry.lastError = "probe_timeout";
+    entry.consecutiveFailures = 1;
+    store.groups[ProbeGroup.fast] = entry;
+    assert(store.buildGroupMeta(ProbeGroup.fast, 10_000_000_000L, 100).error == "probe_hung");
+}
+
+unittest {
     // Fresh hit does NOT invoke probes; stale triggers async single-flight; /status NEVER scans hardware; /info NEVER probes
     auto stateDir = makeTempStateDir("ttl");
     scope (exit) { if (exists(stateDir)) rmdirRecurse(stateDir); }
@@ -164,4 +185,45 @@ unittest {
     assert(resFast.httpStatus == 200, "Hung mount/GPU must not prevent 200 fast CPU telemetry");
     assert(resFast.payload.groups["fast"].status == GroupStatus.fresh);
     assert(resFast.payload.groups["device_dynamic"].status == GroupStatus.error);
+}
+
+unittest {
+    // A failed network refresh must not redate previously cached traffic as fresh.
+    auto stateDir = makeTempStateDir("network-error");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = stateDir;
+    auto fake = new FakePlatformBackend;
+    auto coord = new RefreshCoordinator(fake, new TelemetryCacheStore(cfg, "hikari:network-error"));
+    auto first = coord.getStatus();
+    assert(first.httpStatus == 200 && first.payload.network.length);
+    auto sampled = first.payload.groups["fast"].sampled_at;
+    fake.failNetwork = true;
+    coord.getStatus(true);
+    Thread.sleep(core.time.msecs(50));
+    auto failed = coord.getStatus();
+    assert(failed.payload.groups["fast"].status == GroupStatus.stale);
+    assert(failed.payload.groups["fast"].error == "simulated_network_permission_failure");
+    assert(failed.payload.groups["fast"].sampled_at == sampled);
+    assert(failed.payload.network.length == first.payload.network.length);
+}
+
+unittest {
+    class RestrictedBattery : FakePlatformBackend {
+        this() { super("arm64-sbc"); }
+        override RawBatteryResult sampleBatteries() {
+            return RawBatteryResult(CapabilityState.permission_denied, "battery_access_denied", null);
+        }
+    }
+    auto stateDir = makeTempStateDir("battery-permission");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = stateDir;
+    auto coord = new RefreshCoordinator(new RestrictedBattery,
+        new TelemetryCacheStore(cfg, "hikari:battery-permission"));
+    auto status = coord.getStatus();
+    assert(status.httpStatus == 200);
+    assert(status.payload.groups["device_dynamic"].status == GroupStatus.error);
+    assert(status.payload.groups["device_dynamic"].error == "battery_access_denied");
+    assert(status.payload.batteries.length == 0);
 }

@@ -181,7 +181,7 @@ version (Windows) unittest {
     assert(readText(versions ~ `\current\hikari.exe`) == "old");
 
     // Failed health check: automatic rollback, old binary untouched.
-    auto bad = activateAndVerifyRelease(versions, state, "0.2.0", (string _) => true, (string _) => false);
+    auto bad = activateAndVerifyRelease(versions, state, "0.2.0", (string _) => true, (string v) => v == "0.1.0");
     assert(!bad.ok && bad.rolledBack);
     assert(readVersionSymlink(versions ~ `\current`) == "0.1.0");
     assert(readText(versions ~ `\current\hikari.exe`) == "old");

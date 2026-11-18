@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+INSTALL_ARGS=("$@")
 
 # hikari Unix system installer (Linux systemd & macOS LaunchDaemons)
 # Linux: Fedora/dnf, Arch/CachyOS/pacman, Ubuntu/Mint/Armbian/Debian/apt
@@ -40,6 +41,8 @@ TARGET_OS="auto" # auto | linux | macos
 SERVICE_USER="hikari"
 TRUST_REPO=""
 TRUST_PUBKEY=""
+MANIFEST=""
+SIGNATURE=""
 ALLOW_ROOT_USER_SKIP=0
 
 usage() {
@@ -67,6 +70,8 @@ Options:
   --systemd-mode=<auto|skip>        Manage systemd/launchd services or skip activation (default: auto)
   --service-mode=<auto|skip>        Alias for --systemd-mode
   --repo <owner/repo>               Pinned GitHub release repository for signed updates
+  --manifest <path>                 Signed release manifest (required for archive install)
+  --sig <path>                      Detached Ed25519 manifest signature
   --pubkey <path>                   Trusted Ed25519 public key PEM path
   -h, --help                        Show help
 EOF
@@ -108,6 +113,8 @@ while [ "$#" -gt 0 ]; do
     --systemd-mode|--service-mode) SYSTEMD_MODE="${2:?}"; shift 2 ;;
     --repo=*) TRUST_REPO="${1#*=}"; shift ;;
     --repo) TRUST_REPO="${2:?}"; shift 2 ;;
+    --manifest) MANIFEST="${2:?}"; shift 2 ;;
+    --sig) SIGNATURE="${2:?}"; shift 2 ;;
     --pubkey=*) TRUST_PUBKEY="${1#*=}"; shift ;;
     --pubkey) TRUST_PUBKEY="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -166,6 +173,8 @@ BREW_BIN=""
 
 if [ "$TARGET_OS" = "macos" ]; then
   DISTRO_ID="macos"
+  SERVICE_USER="_hikari"
+  CADDY_SERVICE_USER="_hikari_caddy"
   if [ -x /opt/homebrew/bin/brew ]; then
     BREW_BIN="/opt/homebrew/bin/brew"
   elif [ -x /usr/local/bin/brew ]; then
@@ -219,7 +228,8 @@ else
 fi
 
 log() {
-  local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+  local msg
+  msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
   echo "$msg"
   if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$(dirname "$LOG_FILE")"
@@ -240,6 +250,10 @@ compute_sha512() {
 }
 
 # 2. Elevation & preflight checks BEFORE modifying the host
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Python 3 is required for installer locking and release verification; install it separately before continuing." >&2
+  exit 1
+fi
 if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
   echo "System installation requires root privileges. Re-run with sudo or use --dry-run / --root <dir>." >&2
   exit 1
@@ -256,6 +270,60 @@ fi
 
 if [ ! -e "$BINARY_SOURCE" ]; then
   echo "Binary source not found: $BINARY_SOURCE" >&2
+  exit 1
+fi
+
+# Snippet export is deliberately isolated from installation and service management.
+if [ "$SNIPPET_ONLY" -eq 1 ]; then
+  if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
+    echo "Snippet export requires a trusted local executable, not an archive." >&2; exit 1
+  fi
+  if [ "$BASE_PATH" = "/" ]; then BASE_PATH="/hikari"; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] Would write only $ETC_HIKARI/hikari-snippet.caddy"
+    exit 0
+  fi
+  mkdir -p "$ETC_HIKARI"
+  "$BINARY_SOURCE" caddy snippet --config "$ETC_HIKARI/config.json" \
+    --template "$REPO_ROOT/caddy/snippet.caddy.tmpl" --base-path "$BASE_PATH" \
+    --web-dir "/opt/hikari/versions/current/web" --out "$ETC_HIKARI/hikari-snippet.caddy"
+  echo "Wrote $ETC_HIKARI/hikari-snippet.caddy; import and reload remain operator actions."
+  exit 0
+fi
+
+# Keep a single private copy of the chosen trust key throughout a real install.
+if [ "${HIKARI_INSTALL_LOCKED:-0}" = 1 ] && [ -n "$TRUST_PUBKEY" ]; then
+  INSTALL_TRUST_DIR=$(mktemp -d /tmp/hikari-install-trust-XXXXXX)
+  trap 'rm -rf "$INSTALL_TRUST_DIR"' EXIT
+  cp "$TRUST_PUBKEY" "$INSTALL_TRUST_DIR/key.pem"
+  TRUST_PUBKEY="$INSTALL_TRUST_DIR/key.pem"
+fi
+
+# Verify archives against an operator-pinned trust root before any host mutation.
+APP_VERSION=$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "0.1.0")
+if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
+  if [ -z "$MANIFEST" ] || [ -z "$SIGNATURE" ] || [ -z "$TRUST_REPO" ] || [ -z "$TRUST_PUBKEY" ]; then
+    echo "Archive installation requires --manifest, --sig, --repo and --pubkey." >&2
+    exit 1
+  fi
+  RELEASE_OS="$TARGET_OS"
+  if [ "$RELEASE_OS" = "macos" ]; then RELEASE_OS="darwin"; fi
+  APP_VERSION=$(python3 "$REPO_ROOT/install/verify-release.py" --archive "$BINARY_SOURCE" \
+    --manifest "$MANIFEST" --signature "$SIGNATURE" --repo "$TRUST_REPO" \
+    --public-key "$TRUST_PUBKEY" --os "$RELEASE_OS" --arch "$ARCH")
+fi
+
+# Persisted operator endpoints take precedence over defaults on rerun/repair.
+if [ -f "$ETC_HIKARI/config.json" ]; then
+  read -r TAILNET_PORT LOOPBACK_PORT BASE_PATH < <(python3 -c '
+import json, sys
+c=json.load(open(sys.argv[1])).get("listen", {})
+print(c.get("tailnet_port",9100), c.get("loopback_port",19100), c.get("base_path","/"))
+' "$ETC_HIKARI/config.json")
+fi
+
+if [ -f "$VERSIONS_DIR/.activation-previous" ]; then
+  echo "Interrupted activation pending; run hikari update recover before installing or repairing." >&2
   exit 1
 fi
 
@@ -283,9 +351,19 @@ check_port_free_or_hikari() {
       fi
     fi
   elif [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ] && command -v lsof >/dev/null 2>&1; then
-    if [ "$REPAIR" -eq 0 ] && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-      echo "Port conflict: $label port $port is already in use." >&2
-      exit 1
+    local owners job job_pid owner parent
+    owners=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u || true)
+    if [ -n "$owners" ]; then
+      job="io.hikari.agent"
+      if [ "$label" = "tailnet" ]; then job="io.hikari.caddy"; fi
+      job_pid=$(launchctl print "system/$job" 2>/dev/null | awk '/pid =/ {print $3; exit}' || true)
+      for owner in $owners; do
+        parent=$(ps -p "$owner" -o ppid= | tr -d ' ')
+        if [ -z "$job_pid" ] || { [ "$owner" != "$job_pid" ] && { [ "$label" != "tailnet" ] || [ "$parent" != "$job_pid" ]; }; }; then
+          echo "Port conflict: $label port $port belongs to another process (pid $owner)." >&2
+          exit 1
+        fi
+      done
     fi
   fi
 }
@@ -305,6 +383,10 @@ if [ -z "$TAILSCALE_FIXTURE" ]; then
   fi
 fi
 
+if [ -z "$TAILSCALE_FIXTURE" ] && [ -z "$TAILSCALE_BIN" ] && [ -z "$ROOT_PREFIX" ]; then
+  echo "Tailscale CLI unavailable. Install/enroll Tailscale separately and expose its supported noninteractive CLI." >&2
+  exit 1
+fi
 TS_JSON=""
 if [ -n "$TAILSCALE_FIXTURE" ]; then
   if [ ! -f "$TAILSCALE_FIXTURE" ]; then
@@ -389,6 +471,13 @@ if [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrat
   fi
 elif [ "$EFFECTIVE_CADDY_MODE" = "isolated" ]; then
   CADDY_DECISION_REASON="caddy mode is 'isolated'"
+fi
+
+# Refuse unsafe explicit integration before creating even the update lock directory.
+# Re-execution repeats the read-only analysis under the lock before any mutation.
+if [ "$DRY_RUN" -eq 0 ] && [ "${HIKARI_INSTALL_LOCKED:-0}" != 1 ]; then
+  exec python3 "$REPO_ROOT/install/locked-run.py" "$VERSIONS_DIR" \
+    bash "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
 fi
 
 # 5. Caddy binary for the isolated instance (an existing Caddy binary is used read-only; its
@@ -570,17 +659,31 @@ if [ "$TARGET_OS" = "linux" ] && [ "$ALLOW_ROOT_USER_SKIP" -eq 0 ] && ! id "$SER
     || useradd --system --no-create-home --shell /sbin/nologin "$SERVICE_USER"
 fi
 
+if [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ]; then
+  # shellcheck source=install/macos-accounts.sh
+  source "$REPO_ROOT/install/macos-accounts.sh"
+  create_macos_account "$SERVICE_USER" "$REAL_VAR_HIKARI"
+  create_macos_account "$CADDY_SERVICE_USER" "$REAL_VAR_HIKARI/caddy"
+  create_macos_config_group
+fi
 mkdir -p "$VERSIONS_DIR" "$ETC_HIKARI" "$VAR_HIKARI/caddy" "$UNIT_DIR" "$LOG_DIR"
 
 # 7. Install versioned release directory
-APP_VERSION=$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "0.1.0")
 REL_DIR="$VERSIONS_DIR/$APP_VERSION"
 STAGING_DIR="$VERSIONS_DIR/.install-tmp-$APP_VERSION"
 rm -rf "$STAGING_DIR"
-mkdir -p "$STAGING_DIR/web" "$STAGING_DIR/caddy"
+mkdir -p "$STAGING_DIR/web" "$STAGING_DIR/caddy" "$STAGING_DIR/install"
 
 if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
-  tar -xzf "$BINARY_SOURCE" -C "$STAGING_DIR"
+  EXTRACTED_VERSION=$(python3 "$REPO_ROOT/install/verify-release.py" --archive "$BINARY_SOURCE" \
+    --manifest "$MANIFEST" --signature "$SIGNATURE" --repo "$TRUST_REPO" \
+    --public-key "$TRUST_PUBKEY" --os "$RELEASE_OS" --arch "$ARCH" \
+    --extract-dir "$STAGING_DIR")
+  if [ "$EXTRACTED_VERSION" != "$APP_VERSION" ]; then
+    rm -rf "$STAGING_DIR"
+    echo "Release changed during installation; refusing activation." >&2
+    exit 1
+  fi
 else
   cp "$BINARY_SOURCE" "$STAGING_DIR/hikari"
   chmod 0755 "$STAGING_DIR/hikari"
@@ -588,6 +691,7 @@ else
   cp "$REPO_ROOT/caddy/Caddyfile.tmpl" "$STAGING_DIR/caddy/Caddyfile.tmpl"
   cp "$REPO_ROOT/caddy/snippet.caddy.tmpl" "$STAGING_DIR/caddy/snippet.caddy.tmpl"
   cp "$REPO_ROOT/VERSION" "$STAGING_DIR/VERSION"
+  cp "$REPO_ROOT/install/"*.sh "$REPO_ROOT/install/"*.py "$STAGING_DIR/install/"
 fi
 
 if [ ! -x "$STAGING_DIR/hikari" ]; then
@@ -596,17 +700,38 @@ if [ ! -x "$STAGING_DIR/hikari" ]; then
   exit 1
 fi
 
-rm -rf "$REL_DIR"
-mv "$STAGING_DIR" "$REL_DIR"
-
-if [ -L "$VERSIONS_DIR/current" ]; then
-  OLD_TARGET=$(readlink "$VERSIONS_DIR/current" || true)
-  if [ -n "$OLD_TARGET" ] && [ "$OLD_TARGET" != "$REL_DIR" ] && [ -d "$OLD_TARGET" ]; then
-    ln -sfn "$OLD_TARGET" "$VERSIONS_DIR/previous"
+if [ -d "$REL_DIR" ]; then
+  # A live version is immutable; reinstall/repair must never unlink its binary.
+  if ! python3 - "$STAGING_DIR" "$REL_DIR" <<'PY'
+import filecmp, pathlib, sys
+def identical(left, right):
+    comparison = filecmp.dircmp(left, right)
+    if comparison.left_only or comparison.right_only or comparison.common_funny:
+        return False
+    for name in comparison.common_files:
+        a, b = pathlib.Path(left, name), pathlib.Path(right, name)
+        if a.is_symlink() or b.is_symlink() or not filecmp.cmp(a, b, shallow=False):
+            return False
+    return all(not pathlib.Path(left, name).is_symlink()
+               and not pathlib.Path(right, name).is_symlink()
+               and identical(pathlib.Path(left, name), pathlib.Path(right, name))
+               for name in comparison.common_dirs)
+sys.exit(0 if identical(*sys.argv[1:]) else 1)
+PY
+  then
+    rm -rf "$STAGING_DIR"
+    echo "Release $APP_VERSION already exists with different content; use a new version." >&2
+    exit 1
   fi
+  rm -rf "$STAGING_DIR"
+else
+  mv "$STAGING_DIR" "$REL_DIR"
 fi
-ln -sfn "$REL_DIR" "$VERSIONS_DIR/current"
-log "Installed hikari $APP_VERSION to $REL_DIR"
+
+log "Staged hikari $APP_VERSION at $REL_DIR; activation follows generated-config validation"
+activate_install_release() {
+  python3 "$REPO_ROOT/install/activate-release.py" begin "$VERSIONS_DIR" "$APP_VERSION"
+}
 
 # Seed the agent's last-known MagicDNS name (hikari-owned state, refreshed by the
 # agent itself); used for Host validation while `tailscale status` is unreadable.
@@ -618,6 +743,11 @@ esac
 
 # 8. Write default config.json ONLY if missing
 if [ ! -f "$CONFIG_PATH" ]; then
+  if [ -n "$TRUST_PUBKEY" ]; then
+    cp "$TRUST_PUBKEY" "$ETC_HIKARI/release-public-key.pem"
+    chmod 0644 "$ETC_HIKARI/release-public-key.pem"
+    TRUST_PUBKEY="$REAL_ETC_HIKARI/release-public-key.pem"
+  fi
   cat > "$CONFIG_PATH" <<EOF
 {
   "schema_version": 1,
@@ -752,6 +882,31 @@ fi
 
 # 10. Generate system-domain service definitions (systemd on Linux, LaunchDaemons on macOS)
 if [ "$TARGET_OS" = "macos" ]; then
+  mkdir -p "$PRIVATE_BIN_DIR"
+  cp "$REL_DIR/install/macos-recover.sh" "$PRIVATE_BIN_DIR/macos-recover.sh.next"
+  chmod 0755 "$PRIVATE_BIN_DIR/macos-recover.sh.next"
+  mv -f "$PRIVATE_BIN_DIR/macos-recover.sh.next" "$PRIVATE_BIN_DIR/macos-recover.sh"
+  cat > "$UNIT_DIR/io.hikari.recover.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.hikari.recover</string>
+  <key>UserName</key><string>root</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>/opt/hikari/bin/macos-recover.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardErrorPath</key><string>/var/log/hikari/recovery.stderr.log</string>
+</dict></plist>
+EOF
+  chmod 0644 "$UNIT_DIR/io.hikari.recover.plist"
+  if [ ! -f "$ETC_HIKARI/network-reconcile-seconds" ]; then
+    printf '60\n' > "$ETC_HIKARI/network-reconcile-seconds"
+    chmod 0644 "$ETC_HIKARI/network-reconcile-seconds"
+  fi
   cat > "$UNIT_DIR/io.hikari.agent.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -759,6 +914,16 @@ if [ "$TARGET_OS" = "macos" ]; then
 <dict>
   <key>Label</key>
   <string>io.hikari.agent</string>
+  <key>UserName</key>
+  <string>${SERVICE_USER}</string>
+  <key>GroupName</key>
+  <string>${SERVICE_USER}</string>
+  <key>InitGroups</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/opt/hikari/versions/current</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string></dict>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/hikari/versions/current/hikari</string>
@@ -766,6 +931,8 @@ if [ "$TARGET_OS" = "macos" ]; then
     <string>--config</string>
     <string>/Library/Application Support/hikari/config.json</string>
   </array>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -794,6 +961,7 @@ EOF
   fi
 
   if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
+    RESOLVED_CADDY_XML=$(printf '%s' "$RESOLVED_CADDY_BIN" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
     cat > "$UNIT_DIR/io.hikari.caddy.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -801,15 +969,29 @@ EOF
 <dict>
   <key>Label</key>
   <string>io.hikari.caddy</string>
+  <key>UserName</key>
+  <string>${CADDY_SERVICE_USER}</string>
+  <key>GroupName</key>
+  <string>${CADDY_SERVICE_USER}</string>
+  <key>InitGroups</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/opt/hikari/versions/current</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+    <key>HOME</key><string>/Library/Application Support/hikari/state/caddy</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
-    <string>${RESOLVED_CADDY_BIN}</string>
-    <string>run</string>
-    <string>--config</string>
-    <string>/Library/Application Support/hikari/Caddyfile</string>
-    <string>--adapter</string>
-    <string>caddyfile</string>
+    <string>/bin/bash</string>
+    <string>/opt/hikari/versions/current/install/macos-caddy.sh</string>
+    <string>/Library/Application Support/hikari/config.json</string>
+    <string>${RESOLVED_CADDY_XML}</string>
+    <string>/Library/Application Support/hikari/state/caddy</string>
   </array>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -826,6 +1008,28 @@ EOF
     chmod 0644 "$UNIT_DIR/io.hikari.caddy.plist"
   fi
 
+  if [ -z "$ROOT_PREFIX" ]; then
+    find "$VAR_HIKARI" -path "$VAR_HIKARI/caddy" -prune -o -exec chown "${SERVICE_USER}:${SERVICE_USER}" {} \;
+    find "$VAR_HIKARI" -path "$VAR_HIKARI/caddy" -prune -o -type f -exec chmod 0600 {} \;
+    find "$VAR_HIKARI" -path "$VAR_HIKARI/caddy" -prune -o -type d -exec chmod 0700 {} \;
+    # Root owns the sticky shared parent: neither daemon can replace the other
+    # daemon's directory entry. Only the agent group may create state files.
+    chown "root:${SERVICE_USER}" "$VAR_HIKARI"
+    chmod 1771 "$VAR_HIKARI"
+    chown root:_hikari_config "$ETC_HIKARI" "$CONFIG_PATH"
+    chmod 0750 "$ETC_HIKARI"
+    chmod 0640 "$CONFIG_PATH"
+    chown -R "${CADDY_SERVICE_USER}:${CADDY_SERVICE_USER}" "$VAR_HIKARI/caddy"
+    chmod 0700 "$VAR_HIKARI/caddy"
+    touch "$LOG_DIR/agent.stdout.log" "$LOG_DIR/agent.stderr.log" "$LOG_DIR/caddy.stdout.log" "$LOG_DIR/caddy.stderr.log"
+    chown "${SERVICE_USER}:${SERVICE_USER}" "$LOG_DIR/agent.stdout.log" "$LOG_DIR/agent.stderr.log"
+    chown "${CADDY_SERVICE_USER}:${CADDY_SERVICE_USER}" "$LOG_DIR/caddy.stdout.log" "$LOG_DIR/caddy.stderr.log"
+    chmod 0600 "$LOG_DIR/"*.log
+    /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.recover.plist"
+    /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.agent.plist"
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.caddy.plist"; fi
+  fi
+  activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system/io.hikari.agent 2>/dev/null || true
     launchctl bootstrap system "$UNIT_DIR/io.hikari.agent.plist"
@@ -833,6 +1037,8 @@ EOF
       launchctl bootout system/io.hikari.caddy 2>/dev/null || true
       launchctl bootstrap system "$UNIT_DIR/io.hikari.caddy.plist"
     fi
+    launchctl bootout system/io.hikari.recover 2>/dev/null || true
+    launchctl bootstrap system "$UNIT_DIR/io.hikari.recover.plist"
     log "Loaded system-domain LaunchDaemons via launchctl"
   else
     log "Skipped launchctl activation (service-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
@@ -899,6 +1105,7 @@ EOF
     chmod 0640 "$CONFIG_PATH"
   fi
 
+  activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now hikari.service
@@ -909,6 +1116,14 @@ EOF
   else
     log "Skipped systemctl activation (systemd-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
   fi
+fi
+
+# Test roots deliberately have no live service. Real activation is confirmed only
+# by the expected version responding on the configured loopback listener.
+if [ -n "$ROOT_PREFIX" ]; then
+  python3 "$REPO_ROOT/install/activate-release.py" confirm "$VERSIONS_DIR" "$APP_VERSION"
+elif [ "$SYSTEMD_MODE" = "auto" ]; then
+  python3 "$REPO_ROOT/install/activate-release.py" health-confirm "$VERSIONS_DIR" "$APP_VERSION" "$CONFIG_PATH"
 fi
 
 # 11. Reload the existing Caddy only when asked (after hikari-caddy released the port).
@@ -953,4 +1168,12 @@ else
   fi
 fi
 echo "  Install log:      $LOG_FILE"
-echo "  Recovery/status:  hikari doctor"
+echo "  Recovery/status:  /opt/hikari/versions/current/hikari doctor"
+
+if [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ] && [ "$SYSTEMD_MODE" = "auto" ]; then
+  echo "Readiness report (service context and TLS are checked independently):"
+  "$REL_DIR/hikari" doctor --config "$CONFIG_PATH" --caddy-bin "$RESOLVED_CADDY_BIN" || {
+    echo "Installation files are in place; readiness checks need attention. See the report and $LOG_DIR." >&2
+    exit 1
+  }
+fi

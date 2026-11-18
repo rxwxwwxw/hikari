@@ -4,7 +4,9 @@ import core.config : HikariConfig;
 import std.algorithm : canFind, startsWith;
 import std.conv : to;
 import std.digest.sha : sha256Of, toHexString;
-import std.file : exists, getSize, read, tempDir, write, remove;
+import std.file : exists, getSize, read, tempDir, write, remove, mkdirRecurse, rmdirRecurse;
+import std.uuid : randomUUID;
+import platform.command : runLocalCommand;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.process : Config, execute;
@@ -135,30 +137,42 @@ private void removeQuietly(string p) nothrow {
     try { remove(p); } catch (Exception) {}
 }
 
+private void removeDirectoryQuietly(string p) nothrow {
+    try { rmdirRecurse(p); } catch (Exception) {}
+}
+
 bool verifySignatureWithOpenSsl(string manifestPath, string sigPath, string publicKeyPemOrPath) {
     if (!exists(manifestPath) || !exists(sigPath) || publicKeyPemOrPath.strip().length == 0) return false;
     string keyPath = publicKeyPemOrPath.strip();
     bool createdTempKey = false;
     if (keyPath.canFind("BEGIN PUBLIC KEY")) {
-        keyPath = tempDir() ~ "/hikari-verify-pub.pem";
+        auto directory = tempDir() ~ "/hikari-verify-" ~ randomUUID().toString();
+        mkdirRecurse(directory);
+        version (Posix) {
+            import std.file : setAttributes;
+            setAttributes(directory, 0x1c0); // 0700
+        }
+        keyPath = directory ~ "/key.pem";
         write(keyPath, publicKeyPemOrPath);
         createdTempKey = true;
     }
     scope (exit) {
         if (createdTempKey && exists(keyPath)) {
             removeQuietly(keyPath);
+            import std.path : dirName;
+            removeDirectoryQuietly(dirName(keyPath));
         }
     }
     if (!exists(keyPath)) return false;
 
     try {
-        auto res = execute([
+        auto res = runLocalCommand([
             "openssl", "pkeyutl", "-verify",
             "-pubin", "-inkey", keyPath,
             "-rawin", "-in", manifestPath,
             "-sigfile", sigPath,
-        ], null, Config.none, 4096);
-        return res.status == 0;
+        ], 10000, 4096);
+        return res.status == 0 && !res.outputTruncated;
     } catch (Exception) {
         return false;
     }
@@ -188,6 +202,8 @@ void verifyVerifiedReleasePackage(
         throw new Exception("Missing manifest, signature, or archive file");
     }
 
+    if (getSize(manifestPath) > 1024 * 1024 || getSize(sigPath) > 4096)
+        throw new Exception("Manifest or signature exceeds size limit");
     import std.functional : toDelegate;
     auto verifier = sigVerifier !is null ? sigVerifier : toDelegate(&verifySignatureWithOpenSsl);
     if (!verifier(manifestPath, sigPath, cfg.updates.public_key)) {

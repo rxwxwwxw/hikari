@@ -316,10 +316,9 @@ private string defaultReader(string path) @trusted {
 
 /// Loads a Caddyfile and everything it imports. Parse errors propagate as exceptions.
 CaddyConfigTree loadCaddyConfig(string mainPath, FileReader reader = null, GlobLister lister = null, uint maxDepth = 16) @safe {
-    import std.functional : toDelegate;
     import std.path : absolutePath, buildNormalizedPath;
-    if (reader is null) reader = toDelegate(&defaultReader);
-    if (lister is null) lister = toDelegate(&defaultGlobLister);
+    if (reader is null) reader = (string path) => defaultReader(path);
+    if (lister is null) lister = (string dir, string pattern) => defaultGlobLister(dir, pattern);
 
     CaddyConfigTree tree;
     auto mainAbs = buildNormalizedPath(absolutePath(mainPath));

@@ -14,6 +14,7 @@ import core.proc : executeBounded;
 import std.string : indexOf, strip;
 import std.typecons : Nullable;
 import tailnet.registry;
+import platform.command : tailscaleExecutable;
 
 struct TailscalePeerCandidate {
     string tailscale_node_id;
@@ -262,7 +263,7 @@ class TailnetDiscoveryService {
                 if (exists(cand)) return cand;
             }
         }
-        return "tailscale";
+        return tailscaleExecutable();
     }
 
     private string defaultTailscaleProvider() {

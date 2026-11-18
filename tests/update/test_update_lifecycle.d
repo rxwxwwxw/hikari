@@ -93,8 +93,15 @@ unittest {
     assertThrown!Exception(verifyVerifiedReleasePackage(cfg, badManifest, sigPath, archive, "0.1.0", "linux", "x86_64"));
 
     // Stage verified archive
-    auto staged = stageVerifiedArchive(archive, root ~ "/versions", "0.2.0");
+    auto release = stageSignedRelease(cfg, manifestPath, sigPath, archive,
+        root ~ "/versions", "0.1.0", "linux", "x86_64");
+    assert(release.versionString == "0.2.0");
+    auto staged = release.directory;
     assert(exists(staged ~ "/hikari"));
+
+    assertThrown!Exception(stageVerifiedArchive(archive, root ~ "/versions", "0.2.0"));
+    assertThrown!Exception(validateReleaseDirectoryName("../escape"));
+    assertThrown!Exception(validateReleaseDirectoryName("current"));
 
     // Lock contention check
     auto lck = new UpdateLock(root ~ "/state");
@@ -107,7 +114,7 @@ unittest {
         root ~ "/state",
         "0.2.0",
         (string _) => true,
-        (string _) => false // bad health check!
+        (string v) => v == "0.1.0" // bad new release; prior version remains healthy
     );
     assert(!failOutcome.ok && failOutcome.rolledBack);
     assert(readVersionSymlink(root ~ "/versions/current") == "0.1.0", "Must automatically roll back to 0.1.0");
@@ -124,5 +131,52 @@ unittest {
     assert(okOutcome.ok && !okOutcome.rolledBack);
     assert(readVersionSymlink(root ~ "/versions/current") == "0.2.0");
     assert(readVersionSymlink(root ~ "/versions/previous") == "0.1.0");
+    auto failedRollback = rollbackToPrevious(root ~ "/versions", root ~ "/state",
+        (string _) => true, (string v) => v == "0.2.0");
+    assert(!failedRollback.ok);
+    assert(readVersionSymlink(root ~ "/versions/current") == "0.2.0");
+    assert(!exists(root ~ "/versions/.activation-previous"));
+    // Model power loss after pointer switch but before health confirmation.
+    write(root ~ "/versions/.activation-previous", "0.1.0\n");
+    auto recovered = recoverInterruptedActivation(root ~ "/versions", root ~ "/state",
+        (string _) => true, (string v) => v == "0.1.0");
+    assert(recovered.ok && recovered.rolledBack);
+    assert(readVersionSymlink(root ~ "/versions/current") == "0.1.0");
+    assert(!exists(root ~ "/versions/.activation-previous"));
+    }
+}
+
+unittest {
+    version (Posix) {
+        auto root = tempDir() ~ "/hikari-test-archive-metadata";
+        if (exists(root)) rmdirRecurse(root);
+        mkdirRecurse(root);
+        scope (exit) rmdirRecurse(root);
+        auto script = root ~ "/make.py";
+        write(script, `import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as tar:
+    info = tarfile.TarInfo(sys.argv[2])
+    if sys.argv[3] == "link":
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+    elif sys.argv[3] == "huge":
+        info.size = 513 * 1024 * 1024
+        class Zeros:
+            def read(self, size): return b"\0" * size
+        tar.addfile(info, Zeros())
+        sys.exit(0)
+    tar.addfile(info)
+`);
+        auto archive = root ~ "/test.tgz";
+        assert(execute(["python3", script, archive, "file with spaces", "file"]).status == 0);
+        inspectTarArchiveSafety(archive);
+        foreach (name; ["../outside", "/absolute", "dir/../../outside"]) {
+            assert(execute(["python3", script, archive, name, "file"]).status == 0);
+            assertThrown!Exception(inspectTarArchiveSafety(archive));
+        }
+        foreach (kind; ["link", "huge"]) {
+            assert(execute(["python3", script, archive, "entry", kind]).status == 0);
+            assertThrown!Exception(inspectTarArchiveSafety(archive));
+        }
     }
 }

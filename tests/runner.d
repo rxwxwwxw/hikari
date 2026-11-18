@@ -11,6 +11,7 @@ import tests.core.test_log;
 import tests.platform.test_linux_parsers;
 import tests.platform.test_hardware_isa;
 import tests.platform.test_cross_platform;
+import tests.platform.test_darwin;
 import tests.platform.test_windows_parsers;
 import tests.platform.test_winservice;
 import tests.caddyfile.test_caddyfile;

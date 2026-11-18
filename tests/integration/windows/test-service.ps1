@@ -179,7 +179,9 @@ https://localhost:$CaddyPort {
         New-Item -ItemType Directory -Force -Path $UserDir | Out-Null
         $UserCf = Join-Path $UserDir "Caddyfile"
         $userStore = ($UserDir -replace '\\', '/') + "/storage"
-        $userCfText = "{`n`tadmin localhost:$UserAdminPort`n`tstorage file_system $userStore`n`tskip_install_trust`n}`n`nhttp://:$UserSitePort {`n`tbind 127.0.0.1`n`trespond `"user site`"`n}`n"
+        # Keep this disposable service on its allocated ports: adding an HTTPS
+        # site must not make the fixture attempt the runner's reserved port 80.
+        $userCfText = "{`n`tadmin localhost:$UserAdminPort`n`tauto_https disable_redirects`n`tstorage file_system $userStore`n`tskip_install_trust`n}`n`nhttp://:$UserSitePort {`n`tbind 127.0.0.1`n`trespond `"user site`"`n}`n"
         [System.IO.File]::WriteAllText($UserCf, $userCfText, (New-Object System.Text.UTF8Encoding($false)))
         $origUserHash = (Get-FileHash $UserCf).Hash
         & sc.exe create $UserCaddySvc binPath= "`"$((Resolve-Path $CaddyExe).Path)`" run --config `"$UserCf`" --adapter caddyfile" start= demand | Out-Null

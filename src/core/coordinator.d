@@ -9,6 +9,7 @@ import core.sync.mutex;
 import core.thread;
 import core.time : MonoTime, msecs;
 import platform.api;
+import platform.clock : continuousBootNanoseconds;
 import std.algorithm : sort;
 import std.datetime.systime : Clock;
 import std.typecons : Nullable;
@@ -44,17 +45,7 @@ struct ClockSource {
             return secs * 1_000_000_000L + (rem * 1_000_000_000L) / tps;
         };
         cs.wallTs = () => Clock.currTime.toUnixTime();
-        cs.bootNs = () {
-            version (linux) {
-                import core.sys.posix.time : clock_gettime, timespec;
-                enum int CLOCK_BOOTTIME_ID = 7;
-                timespec ts;
-                if (clock_gettime(CLOCK_BOOTTIME_ID, &ts) == 0) {
-                    return cast(long) ts.tv_sec * 1_000_000_000L + cast(long) ts.tv_nsec;
-                }
-            }
-            return -1L;
-        };
+        cs.bootNs = () => continuousBootNanoseconds();
         return cs;
     }
 }
@@ -103,7 +94,7 @@ class RefreshCoordinator {
         try {
             this.store.cachedIdentity = backend.identity();
         } catch (Exception) {
-            this.store.cachedIdentity = PlatformIdentity("unknown", "linux", "unknown", "", Nullable!long.init);
+            this.store.cachedIdentity = PlatformIdentity("unknown", "unknown", "unknown", "", Nullable!long.init);
         }
     }
 
@@ -331,6 +322,7 @@ class RefreshCoordinator {
         e.lastAttemptMonoNs = nowMono;
         e.inFlightStartedMonoNs = nowMono;
         ulong launchGen = e.generation;
+        e.workerGeneration = launchGen;
         store.groups[g] = e;
 
         auto worker = new Thread({
@@ -340,9 +332,10 @@ class RefreshCoordinator {
         worker.start();
     }
 
-    private void clearWorkerAlive(ProbeGroup g) {
+    private void clearWorkerAlive(ProbeGroup g, ulong expectedGen) {
         synchronized (mtx) {
             auto e = store.groups[g];
+            if (e.workerGeneration != expectedGen) return;
             e.workerAlive = false;
             store.groups[g] = e;
             cond.notifyAll();
@@ -352,7 +345,7 @@ class RefreshCoordinator {
     private void runProbe(ProbeGroup g, ulong expectedGen) {
         // (A helper call rather than `synchronized` inside scope(exit): LDC's
         // Windows funclet EH miscompiles nested synchronized in cleanup blocks.)
-        scope (exit) clearWorkerAlive(g);
+        scope (exit) clearWorkerAlive(g, expectedGen);
         try {
             final switch (g) {
                 case ProbeGroup.fast:
@@ -391,8 +384,10 @@ class RefreshCoordinator {
         long doneWall = clocks.wallTs();
         long doneBoot = clocks.bootNs();
 
-        if (cpu.state == CapabilityState.error || mem.state == CapabilityState.error) {
-            string err = cpu.state == CapabilityState.error ? cpu.error : mem.error;
+        if (cpu.state != CapabilityState.ok || mem.state != CapabilityState.ok
+            || net.state != CapabilityState.ok) {
+            string err = cpu.state != CapabilityState.ok ? cpu.error
+                : mem.state != CapabilityState.ok ? mem.error : net.error;
             markGroupFailure(ProbeGroup.fast, expectedGen, err.length > 0 ? err : "fast_probe_error");
             return;
         }
@@ -456,7 +451,7 @@ class RefreshCoordinator {
         long doneWall = clocks.wallTs();
         long doneBoot = clocks.bootNs();
 
-        if (pr.state == CapabilityState.error) {
+        if (pr.state != CapabilityState.ok && pr.state != CapabilityState.unsupported) {
             markGroupFailure(ProbeGroup.processes, expectedGen, pr.error.length > 0 ? pr.error : "process_probe_error");
             return;
         }
@@ -500,7 +495,7 @@ class RefreshCoordinator {
         long doneMono = clocks.monoNs();
         long doneWall = clocks.wallTs();
 
-        if (fs.state == CapabilityState.error) {
+        if (fs.state != CapabilityState.ok && fs.state != CapabilityState.unsupported) {
             markGroupFailure(ProbeGroup.filesystems, expectedGen, fs.error.length > 0 ? fs.error : "filesystem_probe_error");
             return;
         }
@@ -522,8 +517,9 @@ class RefreshCoordinator {
         long doneMono = clocks.monoNs();
         long doneWall = clocks.wallTs();
 
-        if (gpus.state == CapabilityState.error && bats.state == CapabilityState.error) {
-            markGroupFailure(ProbeGroup.device_dynamic, expectedGen, gpus.error.length > 0 ? gpus.error : "device_dynamic_error");
+        if ((bats.state != CapabilityState.ok && bats.state != CapabilityState.unsupported)
+            || (gpus.state != CapabilityState.ok && gpus.state != CapabilityState.unsupported)) {
+            markGroupFailure(ProbeGroup.device_dynamic, expectedGen, gpus.error.length > 0 ? gpus.error : bats.error.length > 0 ? bats.error : "device_dynamic_error");
             return;
         }
 
@@ -563,7 +559,7 @@ class RefreshCoordinator {
         long doneMono = clocks.monoNs();
         long doneWall = clocks.wallTs();
 
-        if (mr.state == CapabilityState.error) {
+        if (mr.state != CapabilityState.ok && mr.state != CapabilityState.unsupported) {
             markGroupFailure(ProbeGroup.maintenance, expectedGen, mr.error.length > 0 ? mr.error : "maintenance_probe_error");
             return;
         }
@@ -584,7 +580,7 @@ class RefreshCoordinator {
         long doneMono = clocks.monoNs();
         long doneWall = clocks.wallTs();
 
-        if (hr.state == CapabilityState.error) {
+        if (hr.state != CapabilityState.ok && hr.state != CapabilityState.unsupported) {
             markGroupFailure(ProbeGroup.hardware, expectedGen, hr.error.length > 0 ? hr.error : "hardware_scan_error");
             return;
         }
@@ -613,6 +609,7 @@ class RefreshCoordinator {
         e.hasSuccess = true;
         e.unsupported = false;
         e.inFlight = false;
+        e.workerAlive = false;
         e.lastSuccessMonoNs = doneMono;
         e.lastSuccessWallTs = doneWall;
         e.consecutiveFailures = 0;
@@ -634,6 +631,7 @@ class RefreshCoordinator {
     private void markGroupFailureLocked(ProbeGroup g, long nowMono, string err) {
         auto e = store.groups[g];
         e.inFlight = false;
+        e.workerAlive = false;
         e.consecutiveFailures++;
         e.lastError = sanitizeOsString(err, 128);
         e.backoffUntilMonoNs = nowMono + computeBackoffNs(e.consecutiveFailures);
@@ -648,6 +646,7 @@ class RefreshCoordinator {
             if (store.groups[g].generation != expectedGen) return;
             auto e = store.groups[g];
             e.inFlight = false;
+            e.workerAlive = false;
             e.unsupported = true;
             e.lastAttemptMonoNs = nowMono;
             e.consecutiveFailures = 0;

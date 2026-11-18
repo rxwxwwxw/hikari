@@ -68,7 +68,7 @@ class HikariRouter {
         string localFqdn = "";
         string magicSuffix = "";
         if (discovery !is null) {
-            if (routePath != "/healthz") discovery.peekLocalTailscaleSnapshot();
+            if (routePath != "/healthz" && routePath != "/api/v1/info") discovery.peekLocalTailscaleSnapshot();
             localFqdn = discovery.localFqdn();
             magicSuffix = discovery.magicDnsSuffix();
         }

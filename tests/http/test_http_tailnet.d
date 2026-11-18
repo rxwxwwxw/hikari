@@ -129,6 +129,13 @@ unittest {
     assertThrown!Exception(renderCaddyfile("caddy/Caddyfile.tmpl", "box.tail.ts.net", 9100, "", 19100, "/", "/var/lib/hikari", "/opt/hikari/web"));
     auto cf = renderCaddyfile("caddy/Caddyfile.tmpl", "box.tail.ts.net", 9100, "100.64.0.10", 19100, "/hikari", "/var/lib/hikari", "/opt/hikari/web");
     assert(cf.canFind("admin off") && cf.canFind("bind 100.64.0.10") && cf.canFind("/hikari/api/v1/*"));
+    auto macCf = renderCaddyfile("caddy/Caddyfile.tmpl", "box.tail.ts.net", 9100,
+        "100.64.0.10", 19100, "/", "/Library/Application Support/hikari/state", "/opt/hikari/web assets");
+    assert(macCf.canFind(`storage file_system "/Library/Application Support/hikari/state/caddy"`));
+    assert(macCf.canFind(`root * "/opt/hikari/web assets"`));
+    assertThrown!Exception(renderCaddyfile("", "box.tail.ts.net", 9100, "0.0.0.0", 19100, "/", "/state", "/web"));
+    assertThrown!Exception(renderCaddyfile("", "box.tail.ts.net", 9100, "127.0.0.1", 19100, "/", "/state", "/web"));
+    assertThrown!Exception(renderCaddyfile("", "evil.example.com", 9100, "100.64.0.10", 19100, "/", "/state", "/web"));
     auto snip = renderCaddySnippet("caddy/snippet.caddy.tmpl", 19100, "/", "/opt/hikari/web");
     assert(snip.canFind("handle_path /hikari/*"));
 
@@ -147,6 +154,9 @@ unittest {
     auto coord = new RefreshCoordinator(fake, store);
     auto reg = new NodeRegistry(stateDir);
     auto disc = new TailnetDiscoveryService(cfg, reg);
+    // Establish the known tailnet before testing CORS. Request handling refreshes
+    // discovery asynchronously, so a preceding request is not a readiness gate.
+    assert(disc.getLocalTailscaleSnapshot().available);
     auto router = new HikariRouter(cfg, coord, disc, reg, "web/index.html");
     auto srv = new LoopbackHttpServer("127.0.0.1", 0, router);
     srv.startBackground();
@@ -178,4 +188,32 @@ unittest {
     assert(rStatus.canFind("200 OK"), "Expected 200 OK, got:\n" ~ rStatus);
     assert(rStatus.canFind("Access-Control-Allow-Origin: https://nas-box.tail1234.ts.net:9100"));
     assert(rStatus.canFind("Cache-Control: no-store"));
+}
+
+unittest {
+    // Health and discovery validation stay cheap even with a cold/expired local
+    // Tailscale cache; neither endpoint may launch a command or OS collection.
+    auto state = tempDir() ~ "/hikari-cheap-info";
+    mkdirRecurse(state);
+    scope (exit) rmdirRecurse(state);
+    HikariConfig cfg;
+    cfg.paths.state_dir = state;
+    auto backend = new FakePlatformBackend;
+    auto coordinator = new RefreshCoordinator(backend, new TelemetryCacheStore(cfg, "hikari:cheap"));
+    auto registry = new NodeRegistry(state);
+    uint statusCalls;
+    auto discovery = new TailnetDiscoveryService(cfg, registry, ClockSource.system(), () {
+        statusCalls++;
+        return "";
+    });
+    auto router = new HikariRouter(cfg, coordinator, discovery, registry);
+    foreach (path; ["/healthz", "/api/v1/info"]) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = path;
+        request.headers["host"] = "127.0.0.1";
+        assert(router.handle(request).statusCode == 200);
+    }
+    assert(statusCalls == 0);
+    assert(backend.counts.cpuCalls == 0 && backend.counts.hardwareCalls == 0);
 }

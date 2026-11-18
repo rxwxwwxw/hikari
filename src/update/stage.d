@@ -1,13 +1,73 @@
 module update.stage;
 
-import std.algorithm : canFind, startsWith;
-import std.file : exists, mkdirRecurse, rename, rmdirRecurse, write, remove;
+import std.algorithm : canFind, startsWith, all;
+import std.file : exists, mkdirRecurse, rename, rmdirRecurse, write, remove, readText, getSize;
 import std.path : buildNormalizedPath, dirName;
 import std.process : Config, execute;
 import std.string : indexOf, split, strip, toLower;
+import std.ascii : isAlphaNum, isDigit;
+import std.uuid : randomUUID;
+import update.verify : SemVer, verifyVerifiedReleasePackage, parseReleaseManifest;
+import core.config : HikariConfig;
+import platform.command : runLocalCommand;
+import platform.durable : syncUpdatePath;
+
+struct StagedRelease { string versionString; string directory; }
+
+StagedRelease stageSignedRelease(const ref HikariConfig config, string manifestPath,
+    string signaturePath, string archivePath, string versionsDir, string currentVersion,
+    string osName, string architecture) {
+    // Snapshot untrusted input paths before verification; extraction must see the
+    // same bytes whose signature and digest were checked, even under a root CLI.
+    auto privateDir = versionsDir ~ "/.verified-" ~ randomUUID().toString();
+    mkdirRecurse(privateDir);
+    version (Posix) {
+        import std.file : setAttributes;
+        setAttributes(privateDir, 0x1c0); // 0700
+    }
+    scope (exit) rmdirRecurse(privateDir);
+    void snapshot(string source, string destination, ulong limit) {
+        import std.stdio : File;
+        auto input = File(source, "rb");
+        auto output = File(destination, "wb");
+        ubyte[65536] buffer;
+        ulong total;
+        while (!input.eof) {
+            auto bytes = input.rawRead(buffer[]);
+            total += bytes.length;
+            if (total > limit) throw new Exception("Update input exceeds size limit");
+            output.rawWrite(bytes);
+        }
+        output.close();
+    }
+    snapshot(manifestPath, privateDir ~ "/manifest.json", 1024 * 1024);
+    snapshot(signaturePath, privateDir ~ "/manifest.sig", 4096);
+    snapshot(archivePath, privateDir ~ "/archive", 150UL * 1024 * 1024);
+    HikariConfig cfg;
+    cfg.updates = config.updates;
+    auto keyPath = privateDir ~ "/key.pem";
+    if (cfg.updates.public_key.canFind("BEGIN PUBLIC KEY")) write(keyPath, cfg.updates.public_key);
+    else snapshot(cfg.updates.public_key, keyPath, 65536);
+    cfg.updates.public_key = keyPath;
+    verifyVerifiedReleasePackage(cfg, privateDir ~ "/manifest.json", privateDir ~ "/manifest.sig",
+        privateDir ~ "/archive", currentVersion, osName, architecture);
+    auto manifest = parseReleaseManifest(readText(privateDir ~ "/manifest.json"));
+    return StagedRelease(manifest.version_str,
+        stageVerifiedArchive(privateDir ~ "/archive", versionsDir, manifest.version_str));
+}
+
+void validateReleaseDirectoryName(string value) {
+    if (value.length == 0 || value == "." || value == "..")
+        throw new Exception("Invalid release directory name");
+    foreach (c; value)
+        if (!isAlphaNum(c) && c != '.' && c != '-')
+            throw new Exception("Invalid release directory name");
+    if (SemVer.parse(value).toString() != value)
+        throw new Exception("Release directory must be a canonical version");
+}
 
 version (Posix) {
-    import core.sys.posix.fcntl : O_CREAT, O_RDWR, open;
+    import core.sys.posix.fcntl : O_CREAT, O_RDWR, O_NOFOLLOW, open;
     import core.sys.posix.unistd : close;
     private extern (C) int flock(int fd, int operation) nothrow @nogc;
     private enum int H_LOCK_EX = 2;
@@ -31,7 +91,7 @@ class UpdateLock {
         lockPath = stateDir ~ "/update.lock";
         version (Posix) {
             import std.string : toStringz;
-            fd = open(lockPath.toStringz(), O_CREAT | O_RDWR, 0x180); // 0600
+            fd = open(lockPath.toStringz(), O_CREAT | O_RDWR | O_NOFOLLOW, 0x180); // 0600
             if (fd < 0) throw new Exception("Unable to open update lock: " ~ lockPath);
             if (flock(fd, H_LOCK_EX | H_LOCK_NB) != 0) {
                 close(fd);
@@ -96,38 +156,51 @@ void validateArchiveEntryName(string entryName, bool isSymlinkOrHardlink = false
 
 void inspectTarArchiveSafety(string archivePath) {
     if (!exists(archivePath)) throw new Exception("Archive not found: " ~ archivePath);
-    auto res = execute(["tar", "-tvf", archivePath], null, Config.none, 1024 * 1024 * 4);
-    if (res.status != 0) {
-        throw new Exception("Failed to inspect archive with tar: " ~ res.output);
+    auto names = runLocalCommand(["tar", "-tf", archivePath], 10000, 1024 * 1024 * 4);
+    if (names.status != 0 || names.outputTruncated)
+        throw new Exception("Unable to list complete archive paths");
+    size_t nameCount;
+    foreach (name; names.output.split('\n')) {
+        if (!name.length) continue;
+        if (++nameCount > 4096) throw new Exception("Archive contains too many entries");
+        validateArchiveEntryName(name);
     }
+    // GNU and BSD tar have different verbose columns. Never obtain paths by
+    // guessing a whitespace column: BSD's column 5 is the month, not the name.
+    auto res = runLocalCommand(["tar", "--numeric-owner", "-tvf", archivePath], 10000, 1024 * 1024 * 4);
+    if (res.status != 0 || res.outputTruncated)
+        throw new Exception("Unable to inspect complete archive metadata");
+    ulong expanded;
+    size_t metadataCount;
     foreach (line; res.output.split('\n')) {
-        auto s = line.strip();
-        if (s.length == 0) continue;
-        // First char of tar -tvf permissions: '-' regular, 'd' dir, 'l' symlink, 'h' hardlink, 'b'/'c'/'p' device
-        char ftype = s[0];
-        bool unsafeType = (ftype != '-' && ftype != 'd');
-
-        // Extract entry path (after 5+ whitespace fields; symlink lines contain " -> ")
-        auto cols = s.split();
-        if (cols.length < 6) continue;
-        string pathPart = cols[5 .. $].length > 0 ? cols[5] : "";
-        // Handle "name -> target" in symlinks/hardlinks
-        auto arrow = s.indexOf(" -> ");
-        if (arrow > 0) {
-            unsafeType = true;
-            auto beforeArrow = s[0 .. arrow].split();
-            if (beforeArrow.length >= 6) pathPart = beforeArrow[$ - 1];
-        }
-        validateArchiveEntryName(pathPart, unsafeType);
+        auto row = line.strip();
+        if (!row.length) continue;
+        auto cols = row.split();
+        if (cols.length < 6 || (row[0] != '-' && row[0] != 'd'))
+            throw new Exception("Archive contains a link, special file or invalid metadata");
+        import std.conv : to;
+        size_t sizeColumn = cols[1].all!isDigit ? 4 : 2;
+        ulong size = to!ulong(cols[sizeColumn]);
+        if (size > 512UL * 1024 * 1024 - expanded)
+            throw new Exception("Expanded archive exceeds size limit");
+        expanded += size;
+        metadataCount++;
     }
+    if (!nameCount || metadataCount != nameCount)
+        throw new Exception("Archive metadata is incomplete or ambiguous");
+
 }
 
 string stageVerifiedArchive(string archivePath, string versionsDir, string targetVersion) {
+    validateReleaseDirectoryName(targetVersion);
     inspectTarArchiveSafety(archivePath);
 
     if (!exists(versionsDir)) mkdirRecurse(versionsDir);
-    auto stageDir = versionsDir ~ "/.staging-" ~ targetVersion;
+    auto stageDir = versionsDir ~ "/.staging-" ~ targetVersion ~ "-" ~ randomUUID().toString();
     auto finalDir = versionsDir ~ "/" ~ targetVersion;
+
+    // Never replace a version that a running service or rollback pointer uses.
+    if (exists(finalDir)) throw new Exception("Release already exists; installed versions are immutable");
 
     if (exists(stageDir)) rmdirRecurse(stageDir);
     mkdirRecurse(stageDir);
@@ -139,10 +212,10 @@ string stageVerifiedArchive(string archivePath, string versionsDir, string targe
     }
 
     version (linux) {
-        auto ex = execute(["tar", "--no-same-owner", "--no-same-permissions", "-xzf", archivePath, "-C", stageDir], null, Config.none, 1024 * 1024);
+        auto ex = runLocalCommand(["tar", "--no-same-owner", "--no-same-permissions", "-xzf", archivePath, "-C", stageDir], 30000, 1024 * 1024);
     } else {
         // macOS and Windows bsdtar support both .tar.gz and .zip via -xf
-        auto ex = execute(["tar", "-xf", archivePath, "-C", stageDir], null, Config.none, 1024 * 1024);
+        auto ex = runLocalCommand(["tar", "-xf", archivePath, "-C", stageDir], 30000, 1024 * 1024);
     }
     if (ex.status != 0) {
         throw new Exception("Archive extraction failed: " ~ ex.output);
@@ -163,14 +236,20 @@ string stageVerifiedArchive(string archivePath, string versionsDir, string targe
     }
 
     // Verify staged binary executes cleanly and reports expected version
-    auto verCheck = execute([stageDir ~ binRel, "version"], null, Config.none, 4096);
+    auto verCheck = runLocalCommand([stageDir ~ binRel, "version"], 5000, 4096);
     if (verCheck.status != 0 || !verCheck.output.canFind(targetVersion)) {
         throw new Exception("Staged hikari binary failed version validation");
     }
 
-    if (exists(finalDir)) {
-        rmdirRecurse(finalDir);
+    version (Posix) {
+        import std.file : dirEntries, SpanMode;
+        foreach (entry; dirEntries(stageDir, SpanMode.depth))
+            if (entry.isFile) syncUpdatePath(entry.name);
+        foreach (entry; dirEntries(stageDir, SpanMode.depth))
+            if (entry.isDir) syncUpdatePath(entry.name, true);
+        syncUpdatePath(stageDir, true);
     }
     rename(stageDir, finalDir);
+    syncUpdatePath(versionsDir, true);
     return finalDir;
 }

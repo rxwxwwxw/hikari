@@ -18,8 +18,20 @@ import std.exception : assertThrown;
 import std.file : copy, dirEntries, exists, mkdirRecurse, read, readText, rmdirRecurse, SpanMode, tempDir, write;
 import std.json;
 import std.path : buildPath, dirName;
+import std.string : strip;
 
 private enum FIXTURES = "tests/fixtures/caddyfiles";
+
+unittest {
+    // Real subprocess creation must receive an open stdin handle, capture stdout
+    // separately from diagnostics, and supply EOF without waiting for input.
+    version (Windows) auto command = ["cmd", "/c", "more & echo hikari-ok & echo diagnostic 1>&2"];
+    else auto command = ["/bin/sh", "-c", "cat; printf hikari-ok; printf diagnostic >&2"];
+    auto result = runIsolated(command, 5000);
+    assert(result.status == 0 && !result.timedOut, result.stderr_);
+    assert(result.stdout_.strip() == "hikari-ok");
+    assert(result.stderr_.canFind("diagnostic"));
+}
 
 private JSONValue expectations() {
     return parseJSON(readText(buildPath(FIXTURES, "expectations.json")));

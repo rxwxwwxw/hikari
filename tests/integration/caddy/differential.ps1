@@ -35,7 +35,8 @@ $failures = @()
 
 function Invoke-HikariJson([string[]]$HArgs) {
     $ErrorActionPreference = "Continue"
-    $out = (& $Hikari @HArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $diagnostics = Join-Path $Work "stderr.txt"
+    $out = (& $Hikari @HArgs 2> $diagnostics | ForEach-Object { "$_" }) -join "`n"
     $start = $out.IndexOf("{")
     if ($start -lt 0) { throw "no JSON from hikari $($HArgs -join ' '):`n$out" }
     return ($out.Substring($start) | ConvertFrom-Json)
@@ -45,7 +46,7 @@ function Get-Bytes([string]$p) { return [Convert]::ToBase64String([IO.File]::Rea
 
 try {
     New-Item -ItemType Directory -Force -Path $Work | Out-Null
-    $common = @("--caddy", $Caddy, "--fqdn", $Ex.fqdn, "--tailscale-ip", $Ex.tailscale_ip, "--port", "$($Ex.port)", "--config", $NoConfig, "--json")
+    $common = @("--caddy", $Caddy, "--fqdn", $Ex.fqdn, "--tailscale-ip", $Ex.tailscale_ip, "--port", "$($Ex.port)", "--config", $NoConfig, "--state-dir", (Join-Path $Work "state"), "--json")
 
     foreach ($f in $Ex.fixtures) {
         $mode = if ($f.PSObject.Properties.Name -contains "adapt") { $f.adapt } else { "compare" }

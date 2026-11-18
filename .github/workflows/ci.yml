@@ -26,7 +26,7 @@ jobs:
       - name: Install LDC2, DUB, and tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y ldc dub nodejs openssl curl tar iproute2 shellcheck python3
+          sudo apt-get install -y ldc dub zlib1g-dev nodejs openssl curl tar iproute2 shellcheck python3
 
       - name: Build debug and release binaries
         run: |
@@ -47,9 +47,14 @@ jobs:
         run: |
           node tests/browser/test_dashboard.js
           bash tests/integration/macos/test-installer.sh
+          bash tests/integration/macos/test-reconciler.sh
+          python3 tests/integration/macos/test-reconcile-lifecycle.py
+          python3 tests/integration/macos/test-release-verification.py
+          python3 tests/integration/macos/test-activation.py
+          python3 tests/integration/macos/test-startup.py
 
       - name: Run shellcheck on scripts
-        run: shellcheck -S warning install/install.sh install/uninstall.sh tests/integration/linux/*.sh tests/integration/macos/*.sh
+        run: shellcheck -S warning install/*.sh tests/integration/linux/*.sh tests/integration/macos/*.sh
 
       - name: Caddyfile differential test against real Caddy
         shell: bash
@@ -102,7 +107,9 @@ jobs:
           }
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -ErrorAction SilentlyContinue
           if (Get-Module -ListAvailable PSScriptAnalyzer) {
-            $issues = Invoke-ScriptAnalyzer -Path install, tests/integration/windows, tests/integration/caddy -Recurse -Severity Error
+            $issues = @('install', 'tests/integration/windows', 'tests/integration/caddy') | ForEach-Object {
+              Invoke-ScriptAnalyzer -Path $_ -Recurse -Severity Error
+            }
             if ($issues) { $issues | Format-Table -AutoSize | Out-String | Write-Host; $failed = $true }
           }
           if ($failed) { exit 1 }
@@ -145,14 +152,14 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14
-          - arch: x86_64
-            runner: macos-13
+            runner: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install LDC2 and DUB
-        run: brew install ldc dub
+        run: |
+          brew install ldc dub openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
 
       - name: Build debug and release binaries
         run: |
@@ -166,3 +173,17 @@ jobs:
           ./bin/hikari snapshot --state-dir /tmp/hikari-mac-ci > /tmp/snap.json
           ./bin/hikari hardware --state-dir /tmp/hikari-mac-ci > /tmp/hw.json
           bash tests/integration/macos/test-installer.sh
+          bash tests/integration/macos/test-reconciler.sh
+          python3 tests/integration/macos/test-reconcile-lifecycle.py
+          python3 tests/integration/macos/test-release-verification.py
+          python3 tests/integration/macos/test-activation.py
+          python3 tests/integration/macos/test-startup.py
+
+      - name: Validate the pinned Caddy on native macOS
+        run: bash tests/integration/macos/test-caddy.sh --download-pinned
+
+      - name: Exercise a temporary system LaunchDaemon
+        run: sudo bash tests/integration/macos/test-services.sh --system-test
+
+      - name: Exercise real installer identities and permissions
+        run: sudo bash tests/integration/macos/test-system-install.sh --system-test
