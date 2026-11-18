@@ -2,7 +2,7 @@
 	admin off
 	auto_https disable_redirects
 	storage file_system __STATE_DIR__/caddy
-}
+__WINDOWS_LOG_BLOCK__}
 
 https://__MAGIC_DNS_FQDN__:__PORT__ {
 	bind __TAILSCALE_IP__

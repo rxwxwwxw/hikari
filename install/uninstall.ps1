@@ -6,7 +6,7 @@ Uninstaller for hikari on Windows.
 Stops and removes only the hikari-owned `hikari` and `hikari-caddy` services and binaries.
 Preserves config.json and state (node registry, hardware cache, Caddy certificates) unless
 -Purge is given. Never touches Tailscale, a shared/system Caddy, the firewall, or any service
-that hikari did not install.
+that hikari did not install. Also removes services left by earlier WinSW-based installs.
 #>
 [CmdletBinding()]
 param(
@@ -24,6 +24,9 @@ $VersionsDir = Join-Path $ProgramDataBase "versions"
 $PrivateBinDir = Join-Path $ProgramDataBase "bin"
 $ConfigDir = Join-Path $ProgramDataBase "config"
 $StateDir = Join-Path $ProgramDataBase "state"
+$ConfigPath = Join-Path $ConfigDir "config.json"
+$CaddyfilePath = Join-Path $ConfigDir "Caddyfile"
+$InstalledExe = Join-Path $VersionsDir "current\hikari.exe"
 $ManageServices = ($ServiceMode -eq "auto") -and (-not $Root)
 
 if ($ManageServices -and -not $DryRun) {
@@ -34,25 +37,45 @@ if ($ManageServices -and -not $DryRun) {
     }
 }
 
+function Get-ServiceOwnership([string]$Name) {
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if (-not $svc) { return "absent" }
+    $p = [string]$svc.PathName
+    if ($p -like "*$(Join-Path $PrivateBinDir "$Name-service.exe")*") { return "legacy" }
+    if ($Name -eq "hikari" -and $p -like "*\hikari.exe*serve --service --config*" -and $p -like "*$ConfigPath*") { return "native" }
+    if ($Name -eq "hikari-caddy" -and $p -like "* run --config *" -and $p -like "*$CaddyfilePath*") { return "native" }
+    return "foreign"
+}
+
 if ($ManageServices) {
     foreach ($svcName in @("hikari-caddy", "hikari")) {
-        $svc = Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
-        if (-not $svc) { continue }
-        $wrapper = Join-Path $PrivateBinDir "$svcName-service.exe"
-        if ($svc.PathName -notlike "*$wrapper*") {
-            Write-Warning "Service '$svcName' is not managed by hikari ($($svc.PathName)); leaving it untouched."
+        $own = Get-ServiceOwnership $svcName
+        if ($own -eq "absent") { continue }
+        if ($own -eq "foreign") {
+            Write-Warning "Service '$svcName' is not managed by hikari; leaving it untouched."
             continue
         }
         if ($DryRun) {
-            Write-Host "[dry-run] Would stop and remove service $svcName"
+            Write-Host "[dry-run] Would stop and remove service $svcName ($own)"
             continue
         }
-        $s = Get-Service -Name $svcName
-        if ($s.Status -ne "Stopped") {
-            Stop-Service -Name $svcName -Force
-            $s.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+        if ($own -eq "native" -and (Test-Path $InstalledExe)) {
+            $kindArgs = if ($svcName -eq "hikari") { @("--kind", "agent", "--config", $ConfigPath) } else { @("--kind", "caddy", "--caddyfile", $CaddyfilePath) }
+            $ErrorActionPreference = "Continue"
+            $out = (& $InstalledExe service uninstall --name $svcName @kindArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = "Stop"
+            if ($code -ne 0) { throw "Failed to remove ${svcName}: $out" }
+        } else {
+            # Legacy WinSW service, or our binary is already gone: ownership was verified above.
+            $s = Get-Service -Name $svcName
+            if ($s.Status -ne "Stopped") {
+                Stop-Service -Name $svcName -Force
+                $s.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+            }
+            $wrapper = Join-Path $PrivateBinDir "$svcName-service.exe"
+            if ($own -eq "legacy" -and (Test-Path $wrapper)) { & $wrapper uninstall | Out-Null } else { & sc.exe delete $svcName | Out-Null }
         }
-        if (Test-Path $wrapper) { & $wrapper uninstall | Out-Null } else { & sc.exe delete $svcName | Out-Null }
         Write-Host "Removed service $svcName"
     }
 }
@@ -80,12 +103,9 @@ foreach ($j in @("current", "previous", "current.new", "current.old", "previous.
 }
 Remove-SafePath $VersionsDir
 Remove-SafePath $PrivateBinDir
-Remove-SafePath (Join-Path $ConfigDir "Caddyfile")
-Remove-SafePath (Join-Path $ConfigDir "Caddyfile.bak")
-Remove-SafePath (Join-Path $ConfigDir "Caddyfile.new")
-Remove-SafePath (Join-Path $ConfigDir "hikari-snippet.caddy")
-Remove-SafePath (Join-Path $ConfigDir "hikari-service.xml")
-Remove-SafePath (Join-Path $ConfigDir "hikari-caddy-service.xml")
+foreach ($f in @("Caddyfile", "Caddyfile.bak", "Caddyfile.new", "hikari-snippet.caddy", "hikari-service.xml", "hikari-caddy-service.xml")) {
+    Remove-SafePath (Join-Path $ConfigDir $f)
+}
 
 if ($Purge) {
     Remove-SafePath $ProgramDataBase

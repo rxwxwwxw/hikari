@@ -97,6 +97,20 @@ jobs:
           .\bin\hikari.exe hardware --state-dir "$env:TEMP\hikari-ci" | Out-Null
           .\tests\integration\windows\test-installer.ps1
 
+      - name: Native Windows service test (real SCM, includes Caddy-as-service gate)
+        shell: pwsh
+        run: |
+          # Same pinned, checksum-verified Caddy the installer uses.
+          $ver = (Select-String -Path install/install.ps1 -Pattern '^\$CaddyPinnedVersion = "(.+)"').Matches[0].Groups[1].Value
+          $sha = (Select-String -Path install/install.ps1 -Pattern '^\$CaddySha512WinAmd64 = "(.+)"').Matches[0].Groups[1].Value
+          $dl = Join-Path $env:RUNNER_TEMP "caddy-dl"
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/caddyserver/caddy/releases/download/v$ver/caddy_${ver}_windows_amd64.zip" -OutFile "$dl\caddy.zip"
+          $got = (Get-FileHash "$dl\caddy.zip" -Algorithm SHA512).Hash.ToLower()
+          if ($got -ne $sha) { throw "Pinned Caddy SHA-512 mismatch: expected $sha got $got" }
+          Expand-Archive "$dl\caddy.zip" -DestinationPath "$dl\x" -Force
+          .\tests\integration\windows\test-service.ps1 -CaddyExe "$dl\x\caddy.exe" -RequireCaddy
+
   macos-build-and-test:
     name: macOS (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

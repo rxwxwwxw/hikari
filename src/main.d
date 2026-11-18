@@ -3,6 +3,7 @@ module main;
 import core.cache;
 import core.config;
 import core.coordinator;
+import core.log : Logger;
 import core.model;
 import core.serializer;
 import core.thread;
@@ -143,8 +144,61 @@ private int cmdHardware(string[] args) {
 }
 
 private int cmdServe(string[] args) {
+    if (hasFlag(args, "--service")) {
+        version (Windows) {
+            import platform.winservice : runAsService, ServiceHooks;
+            auto log = new Logger(serviceLogPath(args));
+            ServiceHooks hooks;
+            hooks.log = log;
+            hooks.requestStop = &hikariRequestStop;
+            hooks.onResume = &noteSystemResume;
+            hooks.body_ = (void delegate() reportRunning) => serveMain(args, log, reportRunning);
+            auto rc = runAsService("hikari", hooks);
+            log.close();
+            return rc;
+        } else {
+            stderr.writeln("hikari: --service is only used by the Windows Service Control Manager; use `hikari serve`.");
+            return 2;
+        }
+    }
+    return serveMain(args, new Logger(), null);
+}
+
+/// Default service log: <ProgramData>\hikari\logs\hikari.log (sibling of the state dir).
+private string serviceLogPath(string[] args) {
+    import std.path : buildPath, dirName;
+    auto explicit = getFlagValue(args, "--log-file", "");
+    if (explicit.length > 0) return explicit;
+    string stateDir = PathsConfig.init.state_dir;
+    try {
+        auto cfg = loadConfig(getFlagValue(args, "--config", defaultConfigPath()));
+        stateDir = getFlagValue(args, "--state-dir", cfg.paths.state_dir);
+    } catch (Exception) {}
+    return buildPath(dirName(stateDir), "logs", "hikari.log");
+}
+
+/// Makes a relative web_dir independent of the working directory (services start in
+/// C:\Windows\System32): prefer <exe dir>/<web_dir> when it exists.
+private void resolveRelativePaths(ref HikariConfig cfg) {
+    import std.file : thisExePath;
+    import std.path : absolutePath, buildNormalizedPath, dirName, isAbsolute;
+    if (cfg.paths.web_dir.length > 0 && !isAbsolute(cfg.paths.web_dir)) {
+        try {
+            auto besideExe = buildNormalizedPath(dirName(thisExePath()), cfg.paths.web_dir);
+            if (exists(besideExe)) cfg.paths.web_dir = besideExe;
+        } catch (Exception) {}
+    }
+}
+
+private int serveMain(string[] args, Logger log, void delegate() reportRunning) {
     auto cfgPath = getFlagValue(args, "--config", defaultConfigPath());
-    auto cfg = loadConfig(cfgPath);
+    HikariConfig cfg;
+    try {
+        cfg = loadConfig(cfgPath);
+    } catch (Exception e) {
+        log.error("invalid configuration " ~ cfgPath ~ ": " ~ e.msg);
+        return 3;
+    }
     auto fixture = getFlagValue(args, "--fixture", "");
     auto tsFixture = getFlagValue(args, "--tailscale-fixture", "");
     if (tsFixture.length > 0) cfg.tailscale_fixture = tsFixture;
@@ -155,7 +209,13 @@ private int cmdServe(string[] args) {
     auto stateDirFlag = getFlagValue(args, "--state-dir", "");
     if (stateDirFlag.length > 0) cfg.paths.state_dir = stateDirFlag;
 
-    validateConfig(cfg);
+    resolveRelativePaths(cfg);
+    try {
+        validateConfig(cfg);
+    } catch (Exception e) {
+        log.error("invalid configuration " ~ cfgPath ~ ": " ~ e.msg);
+        return 3;
+    }
 
     auto nodeId = loadOrCreateNodeId(cfg.paths.state_dir);
     auto backend = makeBackend(fixture, cfg);
@@ -168,6 +228,8 @@ private int cmdServe(string[] args) {
     auto snap = disc.getLocalTailscaleSnapshot(false);
     if (snap.available && snap.selfNode.fqdn.length > 0) {
         coord.updateFqdn(snap.selfNode.fqdn);
+    } else {
+        log.warn("local Tailscale status unavailable to this account (" ~ snap.error ~ "); peer discovery and Host validation are degraded");
     }
 
     string webIndex = hasFlag(args, "--serve-web") || fixture.length > 0 || tsFixture.length > 0
@@ -180,24 +242,32 @@ private int cmdServe(string[] args) {
         server.startListening();
     } catch (Exception e) {
         // Never take over or share a port owned by another process.
-        stderr.writefln("hikari: cannot listen on %s:%u (%s). Another process owns this port; choose a different listen.loopback_port.",
-            server.bindAddr, cfg.listen.loopback_port, e.msg);
+        log.error(format!"cannot listen on %s:%u (%s). Another process owns this port; choose a different listen.loopback_port."(
+            server.bindAddr, cfg.listen.loopback_port, e.msg));
         return 1;
     }
 
-    stdout.writefln("hikari %s listening on http://%s:%u%s (node_id=%s)",
-        AGENT_VERSION, server.bindAddr, server.actualPort(),
-        cfg.listen.base_path == "/" ? "" : cfg.listen.base_path, nodeId);
-    stdout.flush();
-
     installStopHandlers(server);
+    if (reportRunning !is null) reportRunning();
+    log.info(format!"hikari %s listening on http://%s:%u%s (node_id=%s, config=%s, state=%s, web=%s)"(
+        AGENT_VERSION, server.bindAddr, server.actualPort(),
+        cfg.listen.base_path == "/" ? "" : cfg.listen.base_path, nodeId, cfgPath, cfg.paths.state_dir, cfg.paths.web_dir));
+
     server.serveLoop();
-    stdout.writeln("hikari stopped");
-    stdout.flush();
+    log.info("hikari stopped");
     return 0;
 }
 
 private __gshared LoopbackHttpServer gStopTarget;
+private shared bool gStopRequested = false;
+
+/// Stop entry point shared by the SCM control handler and the console handler.
+/// Safe to call from any thread, before or after the listener exists.
+private void hikariRequestStop() nothrow @nogc {
+    import core.atomic : atomicStore;
+    atomicStore(gStopRequested, true);
+    if (gStopTarget !is null) gStopTarget.requestStop();
+}
 
 version (Windows) {
     import core.sys.windows.windef : BOOL, DWORD, FALSE, TRUE;
@@ -206,12 +276,11 @@ version (Windows) {
         enum : DWORD { CTRL_C = 0, CTRL_BREAK = 1, CTRL_CLOSE = 2, CTRL_LOGOFF = 5, CTRL_SHUTDOWN = 6 }
         switch (ctrlType) {
             case CTRL_LOGOFF:
-                // Delivered to service processes whenever ANY user signs out. hikari must
-                // keep running across sign-out and Fast User Switching, so swallow it.
+                // Delivered to service processes whenever ANY user signs out; the C runtime's
+                // default handler would exit. hikari must survive sign-out, so swallow it.
                 return TRUE;
             case CTRL_C, CTRL_BREAK, CTRL_CLOSE, CTRL_SHUTDOWN:
-                // WinSW stops its child by sending Ctrl+C; shut down cleanly.
-                if (gStopTarget !is null) gStopTarget.requestStop();
+                hikariRequestStop();
                 return TRUE;
             default:
                 return FALSE;
@@ -220,11 +289,14 @@ version (Windows) {
 }
 
 private void installStopHandlers(LoopbackHttpServer server) {
+    import core.atomic : atomicLoad;
     gStopTarget = server;
     version (Windows) {
         import core.sys.windows.wincon : SetConsoleCtrlHandler;
         SetConsoleCtrlHandler(&hikariConsoleCtrlHandler, TRUE);
     }
+    // A stop that arrived during startup must not be lost.
+    if (atomicLoad(gStopRequested)) server.requestStop();
 }
 
 private int cmdNodes(string[] args) {
@@ -590,7 +662,7 @@ private int cmdUpdate(string[] args) {
 int main(string[] args) {
     if (args.length < 2) {
         writeln("hikari ", AGENT_VERSION, " — decentralized tailnet monitor");
-        writeln("Commands: version | serve | snapshot | hardware | nodes | caddy | update | doctor");
+        writeln("Commands: version | serve | snapshot | hardware | nodes | caddy | update | doctor | service (Windows)");
         return 0;
     }
 
@@ -616,6 +688,14 @@ int main(string[] args) {
             return cmdUpdate(rest);
         case "doctor":
             return cmdDoctor(rest);
+        case "service":
+            version (Windows) {
+                import platform.winservice : cmdService;
+                return cmdService(rest);
+            } else {
+                stderr.writeln("hikari service: Windows only (Linux uses systemd units, macOS uses launchd; see install/)");
+                return 2;
+            }
         default:
             stderr.writeln("Unknown command: ", cmd);
             return 2;

@@ -11,7 +11,7 @@ The goal is a useful, low-overhead personal tailnet monitor that can be installe
 | Stage | Primary targets | Service owner | Installation prerequisites |
 |---|---|---|---|
 | **1 — Linux** | Fedora; CachyOS/Arch; Ubuntu-family (Ubuntu, Mint, Armbian); x86-64 and ARM64 where available | **systemd system service** | Tailscale already installed on real target; install Caddy if necessary |
-| **2 — Windows** | Windows 11 x86-64 first; other supported Windows versions only after explicit testing | **Windows Service Control Manager**, via WinSW or equivalent, not a login task | Tailscale already installed; bundled/private Caddy if missing |
+| **2 — Windows** | Windows 11 x86-64 first; other supported Windows versions only after explicit testing | **Windows Service Control Manager**, native service support (no wrapper), not a login task | Tailscale already installed; bundled/private Caddy if missing |
 | **3 — macOS** | Apple Silicon and Intel Macs on supported macOS releases | **system-domain launchd LaunchDaemons**, not LaunchAgents | Tailscale already installed; Homebrew installed; install Caddy if missing |
 
 **Definition of platform parity:** From a browser on another tailnet device, a machine can be discovered, shown in the fleet dashboard, queried for truthful cached telemetry, inspected through readable hardware cards, and maintained by an installer/updater that survives reboot, restart, logout, disconnection, and interrupted updates. Unsupported *individual hardware metrics* are allowed if correctly labeled; missing **core lifecycle functionality** is not.
@@ -181,7 +181,7 @@ Linux is **done** only when all of the following are true:
 ### W1 — True Windows services and automatic Caddy provisioning
 
 - Elevated, idempotent `install.ps1` plus `uninstall.ps1`; clear checks for PowerShell, administrator permission, architecture, Tailscale service/CLI, permissions, certificate prerequisites and existing Caddy.
-- Register **two machine-wide Windows services** (`hikari` and `hikari-caddy`) under the Service Control Manager, using a verified/pinned WinSW binary or tested equivalent. Explicit service account policy (prefer restricted built-in/service-specific identity over default `LocalSystem` when feasible), ACLs on config/state, automatic startup and recovery/backoff.
+- Register **two machine-wide Windows services** (`hikari` and `hikari-caddy`) under the Service Control Manager as native services: `hikari.exe` implements the SCM protocol (`serve --service`) and Caddy uses its built-in service support; no wrapper binary. Explicit service account policy (prefer restricted built-in/service-specific identity over default `LocalSystem` when feasible), ACLs on config/state, automatic startup and recovery/backoff.
 - If Caddy is absent, install a **private pinned, verified Caddy executable**; don't require Chocolatey/Scoop/winget, alter IIS, or change an unrelated Caddy service. If Caddy is present, use a compatible executable path without modifying its existing service.
 - Verify Tailscale access **from the actual service identity**, not just from an interactive administrator shell. If a Tailscale installation is only usable inside an interactive user's context, report an actionable incompatibility instead of installing a login-dependent workaround.
 - Windows-safe versioned paths and installer-owned service/launcher management; do not overwrite running `.exe` or depend on a console window.
@@ -199,7 +199,7 @@ Linux is **done** only when all of the following are true:
 
 ### W3 — Windows updater, repair, and release gate
 
-- Verified archive and WinSW/helper downloads; signed manifest trust bootstrap; versioned atomic activation and rollback coordinated with Service Control Manager.
+- Verified archive and helper (Caddy) downloads; signed manifest trust bootstrap; versioned atomic activation and rollback coordinated with Service Control Manager.
 - Idempotent install/repair/uninstall, preservation of `ProgramData` state and aliases, optional intentional purge; no accidental removal of shared Caddy or Tailscale.
 - Test service stopping/restarting, interrupted downloads, failed health check, Windows file locks, Defender/SmartScreen friction, restricted service account permissions, and Caddy TLS provisioning.
 - CI: x86-64 build, tests, PowerShell static checks, install-service smoke tests in suitable Windows VM/runner; **real Windows host** integration is mandatory for the release gate.
@@ -337,7 +337,8 @@ The default product remains: **boot-persistent, on-demand, decentralized monitor
 - [Caddy installation and distribution packages](https://caddyserver.com/docs/install)
 - [Caddy / Tailscale HTTPS certificates and local daemon permissions](https://tailscale.com/docs/integrations/web-servers/caddy/caddy-certificates)
 - [Tailscale macOS variants and differences](https://tailscale.com/docs/concepts/macos-variants)
-- [WinSW Windows service wrapper and configuration](https://github.com/winsw/winsw)
+- [Microsoft: service programs (ServiceMain, control handlers, SetServiceStatus)](https://learn.microsoft.com/en-us/windows/win32/services/service-programs)
+- [Caddy: running as a Windows service](https://caddyserver.com/docs/running#windows-service)
 - [Microsoft Windows Services documentation](https://learn.microsoft.com/en-us/windows/win32/services/services)
 - [Apple launchd LaunchDaemons and LaunchAgents](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 - [Homebrew command and service behavior](https://docs.brew.sh/Manpage)

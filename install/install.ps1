@@ -4,8 +4,9 @@ Idempotent machine-wide Windows installer for hikari (Stage 2).
 
 .DESCRIPTION
 Registers two Service Control Manager services, `hikari` (loopback telemetry agent) and
-`hikari-caddy` (isolated HTTPS proxy bound to the Tailscale address), via WinSW. Services
-start at boot and keep running with no user signed in, during Fast User Switching and
+`hikari-caddy` (isolated HTTPS proxy bound to the Tailscale address). Both are native
+services: hikari.exe implements the SCM protocol itself and Caddy supports it natively, so
+no wrapper binary is involved. Services start at boot and keep running with no user signed in, during Fast User Switching and
 after every user signs out.
 
 Guarantees:
@@ -28,15 +29,14 @@ param(
     [string]$Root = "",
     [string]$BinarySource = "",
     [string]$CaddyBin = "",
-    [string]$WinSWBin = "",
-    [string]$WinSWSha256 = "",
     [string]$TailscaleFixture = "",
     [ValidateSet("auto", "skip")]
     [string]$ServiceMode = "auto",
-    # Restricted built-in account by default. LocalSystem gives full process visibility
-    # (other users' games/apps in the Top Processes list) at the cost of least privilege.
-    [ValidateSet("LocalService", "LocalSystem")]
-    [string]$AgentAccount = "LocalService",
+    # Per-service virtual account (NT SERVICE\hikari) by default: no password, no privileges
+    # beyond traverse checking, and file access granted to this service alone. LocalSystem
+    # adds visibility of other users' processes at the cost of least privilege.
+    [ValidateSet("Virtual", "LocalSystem")]
+    [string]$AgentAccount = "Virtual",
     [string]$Repo = "OWNER/REPO",
     [string]$PubKey = ""
 )
@@ -46,12 +46,6 @@ $ErrorActionPreference = "Stop"
 $CaddyPinnedVersion = "2.9.1"
 # Official Caddy v2.9.1 windows_amd64.zip SHA-512 from caddy_2.9.1_checksums.txt
 $CaddySha512WinAmd64 = "4f0f85b42015ff2276d08705751472e6a98bdc7fda5ec76dd41b7a0c16fee90af012f1a7beb226164408cfbe656bd3453ed5ccbb596f80c45d0fa1c749fc8da2"
-
-# WinSW is downloaded only when its SHA-256 is pinned here (release maintainers) or passed via
-# -WinSWSha256. Without a trusted hash the installer fails closed and asks for -WinSWBin.
-$WinSWPinnedVersion = "2.12.0"
-$WinSWPinnedSha256X64 = ""
-$WinSWUrl = "https://github.com/winsw/winsw/releases/download/v$WinSWPinnedVersion/WinSW-x64.exe"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
@@ -64,6 +58,7 @@ $StateDir = Join-Path $ProgramDataBase "state"
 $LogsDir = Join-Path $ProgramDataBase "logs"
 $LogFile = Join-Path $LogsDir "install.log"
 $ConfigPath = Join-Path $ConfigDir "config.json"
+$CaddyfilePath = Join-Path $ConfigDir "Caddyfile"
 $CurrentJunction = Join-Path $VersionsDir "current"
 $ManageServices = ($ServiceMode -eq "auto") -and (-not $Root)
 
@@ -122,17 +117,29 @@ if (-not $BinarySource -or -not (Test-Path $BinarySource)) {
     throw "hikari.exe binary not found. Pass -BinarySource <path> or build with dub build --compiler=ldc2 --build=release."
 }
 
-# A service with our name that runs something outside our bin dir is not ours: never touch it.
+# Classify existing services named hikari/hikari-caddy:
+#   native  - registered by this installation (hikari.exe serve --service / Caddy with our Caddyfile)
+#   legacy  - an earlier hikari install that used the WinSW wrapper (migrated below)
+#   foreign - anything else: never touched
+function Get-ServiceOwnership([string]$Name) {
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if (-not $svc) { return "absent" }
+    $p = [string]$svc.PathName
+    if ($p -like "*$(Join-Path $PrivateBinDir "$Name-service.exe")*") { return "legacy" }
+    if ($Name -eq "hikari" -and $p -like "*\hikari.exe*serve --service --config*" -and $p -like "*$ConfigPath*") { return "native" }
+    if ($Name -eq "hikari-caddy" -and $p -like "* run --config *" -and $p -like "*$CaddyfilePath*") { return "native" }
+    return "foreign"
+}
 $OwnedServices = @{}
+$LegacyServices = @()
 foreach ($svcName in $(if ($ManageServices) { @("hikari", "hikari-caddy") } else { @() })) {
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
-    if ($svc) {
-        $expected = Join-Path $PrivateBinDir "$svcName-service.exe"
-        if ($svc.PathName -notlike "*$expected*") {
-            throw "A service named '$svcName' already exists and is not managed by hikari ($($svc.PathName)). Refusing to modify it."
-        }
-        $OwnedServices[$svcName] = $svc
+    $own = Get-ServiceOwnership $svcName
+    if ($own -eq "foreign") {
+        $pn = (Get-CimInstance Win32_Service -Filter "Name='$svcName'").PathName
+        throw "A service named '$svcName' already exists and is not managed by hikari ($pn). Refusing to modify it."
     }
+    if ($own -ne "absent") { $OwnedServices[$svcName] = Get-CimInstance Win32_Service -Filter "Name='$svcName'" }
+    if ($own -eq "legacy") { $LegacyServices += $svcName }
 }
 
 # Read-only Tailscale status (prefer the standard install path; services may lack PATH).
@@ -199,23 +206,6 @@ if (-not $SnippetOnly) {
     }
 }
 
-# WinSW resolution.
-$PrivateWinSW = Join-Path $PrivateBinDir "winsw.exe"
-$WinSWPlan = "not needed"
-$TrustedWinSWHash = if ($WinSWSha256) { $WinSWSha256.ToLower() } else { $WinSWPinnedSha256X64.ToLower() }
-if ($ManageServices) {
-    if ($WinSWBin) {
-        if (-not (Test-Path $WinSWBin)) { throw "WinSW binary not found: $WinSWBin" }
-        $WinSWPlan = "operator-supplied $WinSWBin"
-    } elseif (Test-Path $PrivateWinSW) {
-        $WinSWPlan = "existing $PrivateWinSW"
-    } elseif ($TrustedWinSWHash) {
-        $WinSWPlan = "download WinSW v$WinSWPinnedVersion and verify SHA-256"
-    } else {
-        $WinSWPlan = "UNAVAILABLE (pass -WinSWBin <WinSW-x64.exe> or -WinSWSha256 <hash>); service XML will be generated only"
-    }
-}
-
 $AppVersion = if (Test-Path (Join-Path $RepoRoot "VERSION")) { (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim() } else { "0.1.0" }
 
 Write-Host "=== hikari Windows install plan ==="
@@ -224,8 +214,11 @@ Write-Host "  Config / state:   $ConfigDir (config.json preserved if present) / 
 Write-Host "  Ports:            tailnet=$TailnetPort loopback=127.0.0.1:$LoopbackPort base_path=$BasePath"
 Write-Host "  Caddy binary:     $(if ($ResolvedCaddy) { $ResolvedCaddy } else { '<none>' }) ($CaddyOrigin$(if ($NeedCaddyDownload) { ', will download pinned v' + $CaddyPinnedVersion }))"
 Write-Host "  Tailscale:        FQDN=$(if ($TsFqdn) { $TsFqdn } else { '<unavailable>' }) IP=$(if ($TsIp) { $TsIp } else { '<none>' }) service=$(if ($TsServicePresent) { 'present' } else { 'absent' })"
-Write-Host "  Services:         $(if ($ManageServices) { "hikari ($AgentAccount), hikari-caddy (LocalSystem); WinSW: $WinSWPlan" } else { 'not managed (-Root or -ServiceMode skip)' })"
-Write-Host "  ACLs:             $(if ($Root) { 'skipped (-Root)' } else { 'restrict ProgramData\hikari to SYSTEM/Administrators (+agent account where needed)' })"
+Write-Host "  Services:         $(if ($ManageServices) { "native SCM: hikari ($(if ($AgentAccount -eq 'Virtual') { 'NT SERVICE\hikari' } else { 'LocalSystem' })), hikari-caddy (LocalSystem)" } else { 'not managed (-Root or -ServiceMode skip)' })"
+if ($LegacyServices.Count -gt 0) {
+    Write-Host "  Migration:        replace WinSW-wrapped $($LegacyServices -join ', ') with native services (config/state kept)"
+}
+Write-Host "  ACLs:             $(if ($Root) { 'skipped (-Root)' } else { 'restrict ProgramData\hikari to SYSTEM/Administrators; agent service gets config read + state/logs write' })"
 Write-Host "  Not modified:     Tailscale, firewall, IIS, any other Caddy, any other service"
 if ($ManageServices -and -not $TsServicePresent) {
     Write-Host "  WARNING: Tailscale service not found. hikari-caddy will retry with backoff until Tailscale is installed and up."
@@ -241,25 +234,20 @@ if ($DryRun) {
 # ---------------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $VersionsDir, $PrivateBinDir, $ConfigDir, (Join-Path $StateDir "caddy"), $LogsDir | Out-Null
 
+# Well-known SIDs (locale independent).
+$S_SYSTEM = "*S-1-5-18"; $S_ADMINS = "*S-1-5-32-544"; $S_USERS = "*S-1-5-32-545"
+function Set-Acl-Strict([string]$Path, [string[]]$Grants) {
+    $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $Grants
+    & icacls.exe @icaclsArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed for $Path" }
+}
 if (-not $Root) {
-    # Well-known SIDs (locale independent).
-    $S_SYSTEM = "*S-1-5-18"; $S_ADMINS = "*S-1-5-32-544"; $S_USERS = "*S-1-5-32-545"; $S_LOCALSERVICE = "*S-1-5-19"
-    function Set-Acl-Strict([string]$Path, [string[]]$Grants) {
-        $icaclsArgs = @($Path, "/inheritance:r", "/grant:r") + $Grants
-        & icacls.exe @icaclsArgs | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "icacls failed for $Path" }
-    }
     # Default ProgramData lets standard users create files; a child account must not be able
     # to plant or replace binaries that run as a service.
-    $baseGrants = @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F", "${S_USERS}:(OI)(CI)RX")
-    if ($AgentAccount -eq "LocalService") { $baseGrants += "${S_LOCALSERVICE}:(OI)(CI)RX" }
-    Set-Acl-Strict $ProgramDataBase $baseGrants
-    $privGrants = @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F")
-    $cfgGrants = $privGrants + $(if ($AgentAccount -eq "LocalService") { @("${S_LOCALSERVICE}:(OI)(CI)R") } else { @() })
-    $rwGrants = $privGrants + $(if ($AgentAccount -eq "LocalService") { @("${S_LOCALSERVICE}:(OI)(CI)M") } else { @() })
-    Set-Acl-Strict $ConfigDir $cfgGrants
-    Set-Acl-Strict $StateDir $rwGrants
-    Set-Acl-Strict $LogsDir $rwGrants
+    Set-Acl-Strict $ProgramDataBase @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F", "${S_USERS}:(OI)(CI)RX")
+    Set-Acl-Strict $ConfigDir @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F")
+    Set-Acl-Strict $StateDir @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F")
+    Set-Acl-Strict $LogsDir @("${S_SYSTEM}:(OI)(CI)F", "${S_ADMINS}:(OI)(CI)F")
     Write-Log "Applied restricted ACLs under $ProgramDataBase"
 }
 
@@ -284,27 +272,6 @@ if ($NeedCaddyDownload) {
     }
 }
 
-$WinSWSource = ""
-if ($ManageServices) {
-    if ($WinSWBin) {
-        $WinSWSource = $WinSWBin
-    } elseif (Test-Path $PrivateWinSW) {
-        $WinSWSource = $PrivateWinSW
-    } elseif ($TrustedWinSWHash) {
-        $tmpExe = Join-Path $env:TEMP ("hikari-winsw-" + [guid]::NewGuid().ToString("N") + ".exe")
-        try {
-            Write-Log "Downloading WinSW v$WinSWPinnedVersion..."
-            Invoke-WebRequest -Uri $WinSWUrl -OutFile $tmpExe -UseBasicParsing
-            $h = (Get-FileHash -Path $tmpExe -Algorithm SHA256).Hash.ToLower()
-            if ($h -ne $TrustedWinSWHash) { throw "WinSW checksum mismatch! expected=$TrustedWinSWHash actual=$h" }
-            Copy-Item $tmpExe $PrivateWinSW -Force
-            $WinSWSource = $PrivateWinSW
-        } finally {
-            Remove-Item -Force $tmpExe -ErrorAction SilentlyContinue
-        }
-    }
-}
-
 # ---------------------------------------------------------------------------
 # 4. Service helpers (hikari-owned services only)
 # ---------------------------------------------------------------------------
@@ -319,6 +286,19 @@ function Stop-OwnedService([string]$Name) {
         $script:StoppedForUpgrade += $Name
     }
 }
+
+# Migrate WinSW-wrapped services from earlier hikari installs (config and state untouched).
+foreach ($n in $LegacyServices) {
+    $wrapper = Join-Path $PrivateBinDir "$n-service.exe"
+    Stop-OwnedService $n
+    if (Test-Path $wrapper) { & $wrapper uninstall | Out-Null } else { & sc.exe delete $n | Out-Null }
+    foreach ($f in @("$n-service.exe", "$n-service.xml")) { Remove-Item -Force (Join-Path $PrivateBinDir $f) -ErrorAction SilentlyContinue }
+    Remove-Item -Force (Join-Path $ConfigDir "$n-service.xml") -ErrorAction SilentlyContinue
+    $OwnedServices.Remove($n)
+    $StoppedForUpgrade = @($StoppedForUpgrade | Where-Object { $_ -ne $n })
+    Write-Log "Removed legacy WinSW wrapper for $n"
+}
+if ($LegacyServices.Count -gt 0) { Remove-Item -Force (Join-Path $PrivateBinDir "winsw.exe") -ErrorAction SilentlyContinue }
 
 # ---------------------------------------------------------------------------
 # 5. Versioned release (never overwrite a running executable)
@@ -423,7 +403,7 @@ if (-not (Test-Path $ConfigPath)) {
 # 7. Generated Caddy config (hikari-owned files only)
 # ---------------------------------------------------------------------------
 $InstalledExe = Join-Path $CurrentJunction "hikari.exe"
-$CaddyfilePath = Join-Path $ConfigDir "Caddyfile"
+$CaddyfileChanged = $false
 if ($SnippetOnly) {
     $SnippetPath = Join-Path $ConfigDir "hikari-snippet.caddy"
     & $InstalledExe caddy snippet --config $ConfigPath --template (Join-Path $RelDir "caddy\snippet.caddy.tmpl") --out $SnippetPath
@@ -442,6 +422,7 @@ if ($SnippetOnly) {
     } else {
         if (Test-Path $CaddyfilePath) { Copy-Item $CaddyfilePath "$CaddyfilePath.bak" -Force }
         Move-Item -Force $newCaddyfile $CaddyfilePath
+        $CaddyfileChanged = $true
         Write-Log "Wrote validated isolated Caddyfile at $CaddyfilePath"
     }
 } else {
@@ -449,112 +430,52 @@ if ($SnippetOnly) {
 }
 
 # ---------------------------------------------------------------------------
-# 8. WinSW service descriptors
+# 8. Native services (hikari.exe registers them with typed SCM APIs)
 # ---------------------------------------------------------------------------
-function ConvertTo-XmlText([string]$s) { return [System.Security.SecurityElement]::Escape($s) }
-$xExe = ConvertTo-XmlText $InstalledExe
-$xCfg = ConvertTo-XmlText $ConfigPath
-$xLogs = ConvertTo-XmlText $LogsDir
-
-# No <depend> on Tailscale or between our services: a dependency would make SCM refuse to
-# stop/upgrade Tailscale (or hikari) while dependents run. Restart-with-backoff covers ordering.
-$HikariXml = @"
-<service>
-  <id>hikari</id>
-  <name>hikari Telemetry Agent</name>
-  <description>On-demand Tailscale fleet telemetry and hardware inventory agent (loopback only)</description>
-  <executable>$xExe</executable>
-  <arguments>serve --config "$xCfg"</arguments>
-  <startmode>Automatic</startmode>
-  <stoptimeout>15 sec</stoptimeout>
-  <onfailure action="restart" delay="5 sec"/>
-  <onfailure action="restart" delay="30 sec"/>
-  <onfailure action="restart" delay="2 min"/>
-  <resetfailure>1 hour</resetfailure>
-  <logpath>$xLogs</logpath>
-  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>3</keepFiles></log>
-</service>
-"@
-$CaddyXml = $null
-if (-not $SnippetOnly) {
-    $xCaddy = ConvertTo-XmlText $ResolvedCaddy
-    $xCaddyfile = ConvertTo-XmlText $CaddyfilePath
-    $CaddyXml = @"
-<service>
-  <id>hikari-caddy</id>
-  <name>hikari Isolated Tailscale Caddy</name>
-  <description>Isolated HTTPS proxy for hikari bound only to this machine's Tailscale address</description>
-  <executable>$xCaddy</executable>
-  <arguments>run --config "$xCaddyfile" --adapter caddyfile</arguments>
-  <startmode>Automatic</startmode>
-  <delayedAutoStart>true</delayedAutoStart>
-  <stoptimeout>15 sec</stoptimeout>
-  <onfailure action="restart" delay="10 sec"/>
-  <onfailure action="restart" delay="30 sec"/>
-  <onfailure action="restart" delay="2 min"/>
-  <resetfailure>1 hour</resetfailure>
-  <logpath>$xLogs</logpath>
-  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>3</keepFiles></log>
-</service>
-"@
-}
-Write-Utf8NoBom (Join-Path $ConfigDir "hikari-service.xml") $HikariXml
-if ($CaddyXml) { Write-Utf8NoBom (Join-Path $ConfigDir "hikari-caddy-service.xml") $CaddyXml }
-
-# ---------------------------------------------------------------------------
-# 9. Register / reconcile services
-# ---------------------------------------------------------------------------
-function Set-ServiceAccount([string]$Name, [string]$Account) {
-    $startName = if ($Account -eq "LocalService") { "NT AUTHORITY\LocalService" } else { "LocalSystem" }
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'"
-    if ($svc.StartName -ne $startName) {
-        $r = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ StartName = $startName; StartPassword = "" }
-        if ($r.ReturnValue -ne 0) { throw "Failed to set $Name service account to $startName (Win32_Service.Change=$($r.ReturnValue))" }
-        Write-Log "Service $Name runs as $startName"
-    }
-}
-
-function Sync-WinSWService([string]$Name, [string]$XmlText, [string]$Account) {
-    $wrapper = Join-Path $PrivateBinDir "$Name-service.exe"
-    $wrapperXml = Join-Path $PrivateBinDir "$Name-service.xml"
-    $exists = [bool](Get-Service -Name $Name -ErrorAction SilentlyContinue)
-    $xmlChanged = -not (Test-Path $wrapperXml) -or ([System.IO.File]::ReadAllText($wrapperXml) -ne $XmlText)
-    $wrapperChanged = -not (Test-SameFile $WinSWSource $wrapper)
-
-    if ($exists -and ($xmlChanged -or $wrapperChanged)) {
-        Stop-OwnedService $Name
-        & $wrapper uninstall | Out-Null
-        $exists = $false
-    }
-    if ($wrapperChanged) { Copy-Item $WinSWSource $wrapper -Force }
-    Write-Utf8NoBom $wrapperXml $XmlText
-    if (-not $exists) {
-        & $wrapper install | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "WinSW failed to install service $Name" }
-        $script:OwnedServices[$Name] = $true
-        Write-Log "Registered service $Name"
-    }
-    Set-ServiceAccount $Name $Account
-    $s = Get-Service -Name $Name
-    if ($s.Status -ne "Running") {
-        Start-Service -Name $Name
-        Write-Log "Started service $Name"
-    }
+function Invoke-HikariService([string[]]$ServiceArgs) {
+    # Windows PowerShell turns native stderr into terminating errors under "Stop"; read it as text.
+    $ErrorActionPreference = "Continue"
+    $out = (& $InstalledExe service @ServiceArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "hikari service $($ServiceArgs -join ' ') failed: $out" }
+    Write-Log $out
+    return $out
 }
 
 if ($ManageServices) {
-    if ($WinSWSource) {
-        Sync-WinSWService "hikari" $HikariXml $AgentAccount
-        if ($CaddyXml -and (Test-Path $CaddyfilePath)) {
-            Sync-WinSWService "hikari-caddy" $CaddyXml "LocalSystem"
+    $acct = if ($AgentAccount -eq "Virtual") { "virtual" } else { "localsystem" }
+    $agentResult = Invoke-HikariService @("install", "--name", "hikari", "--kind", "agent", "--config", $ConfigPath, "--exe", $InstalledExe, "--account", $acct)
+    $script:OwnedServices["hikari"] = $true
+
+    # Service SID now exists: grant the agent exactly what it needs.
+    $agentPrincipal = if ($AgentAccount -eq "Virtual") { "NT SERVICE\hikari" } else { $null }
+    if ($agentPrincipal) {
+        & icacls.exe $ConfigDir /grant:r "${agentPrincipal}:(OI)(CI)R" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls failed granting $agentPrincipal read on $ConfigDir" }
+        foreach ($d in @($StateDir, $LogsDir)) {
+            & icacls.exe $d /grant:r "${agentPrincipal}:(OI)(CI)M" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls failed granting $agentPrincipal modify on $d" }
         }
-        # Restart anything we stopped that the sync did not already bring back.
-        foreach ($n in $StoppedForUpgrade) {
-            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
-            if ($s -and $s.Status -ne "Running") { Start-Service -Name $n }
+    }
+
+    $caddyResult = ""
+    if (-not $SnippetOnly -and $ResolvedCaddy -and (Test-Path $CaddyfilePath)) {
+        $caddyResult = Invoke-HikariService @("install", "--name", "hikari-caddy", "--kind", "caddy", "--caddy", $ResolvedCaddy, "--caddyfile", $CaddyfilePath)
+        $script:OwnedServices["hikari-caddy"] = $true
+    }
+
+    # Restart only what changed; start anything not running.
+    $restartAgent = $agentResult -match ": updated" -and -not ($StoppedForUpgrade -contains "hikari")
+    if ($restartAgent) { Invoke-HikariService @("stop", "--name", "hikari") | Out-Null }
+    Invoke-HikariService @("start", "--name", "hikari") | Out-Null
+    if ($caddyResult) {
+        $restartCaddy = ($caddyResult -match ": updated" -or $CaddyfileChanged) -and -not ($StoppedForUpgrade -contains "hikari-caddy")
+        if ($restartCaddy) { Invoke-HikariService @("stop", "--name", "hikari-caddy") | Out-Null }
+        try {
+            Invoke-HikariService @("start", "--name", "hikari-caddy") | Out-Null
+        } catch {
+            # Expected before Tailscale is up; SCM recovery keeps retrying with backoff.
+            Write-Log "WARNING: hikari-caddy did not start yet ($($_.Exception.Message)). It retries automatically; check $LogsDir\caddy.log."
         }
-    } else {
-        Write-Log "WinSW unavailable; generated service XML in $ConfigDir. Re-run with -WinSWBin <WinSW-x64.exe> -Repair to register services."
     }
 } elseif ($StoppedForUpgrade.Count -gt 0) {
     foreach ($n in $StoppedForUpgrade) { Start-Service -Name $n -ErrorAction SilentlyContinue }
@@ -564,7 +485,7 @@ if ($ManageServices) {
 # 10. Post-install verification from the real service identity
 # ---------------------------------------------------------------------------
 $ServiceTailscaleOk = $null
-if ($ManageServices -and $WinSWSource) {
+if ($ManageServices) {
     $healthy = $false
     foreach ($i in 1..30) {
         try {
@@ -573,7 +494,7 @@ if ($ManageServices -and $WinSWSource) {
         } catch { Start-Sleep -Milliseconds 500 }
     }
     if (-not $healthy) {
-        Write-Log "WARNING: hikari service did not answer /healthz on 127.0.0.1:$LoopbackPort; see $LogsDir"
+        Write-Log "WARNING: hikari service did not answer /healthz on 127.0.0.1:$LoopbackPort; see $LogsDir\hikari.log"
     } else {
         try {
             $info = Invoke-RestMethod -TimeoutSec 5 -Uri "http://127.0.0.1:$LoopbackPort/api/v1/info"
@@ -592,7 +513,7 @@ if ($ManageServices -and $WinSWSource) {
 Write-Host "`n=== hikari Windows installation complete ==="
 Write-Host "  Version:       $AppVersion"
 Write-Host "  Config:        $ConfigPath"
-Write-Host "  Service XMLs:  $ConfigDir\hikari*-service.xml"
+Write-Host "  Logs:          $LogsDir (hikari.log, caddy.log, install.log)"
 if ($TsFqdn -and -not $SnippetOnly -and (Test-Path $CaddyfilePath)) {
     Write-Host "  Dashboard URL: https://${TsFqdn}:${TailnetPort}$($BasePath.TrimEnd('/'))/"
     Write-Host "  Note: restrict TCP $TailnetPort in your Tailscale ACLs; hikari does not change Windows Firewall or Tailscale policy."

@@ -23,7 +23,7 @@ string renderCaddyfile(
     }
     string tmpl = exists(tmplPath)
         ? readText(tmplPath)
-        : "{\n\tadmin off\n\tauto_https disable_redirects\n\tstorage file_system __STATE_DIR__/caddy\n}\n\nhttps://__MAGIC_DNS_FQDN__:__PORT__ {\n\tbind __TAILSCALE_IP__\n\n\thandle __BASE_PATH_API__ {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
+        : "{\n\tadmin off\n\tauto_https disable_redirects\n\tstorage file_system __STATE_DIR__/caddy\n__WINDOWS_LOG_BLOCK__}\n\nhttps://__MAGIC_DNS_FQDN__:__PORT__ {\n\tbind __TAILSCALE_IP__\n\n\thandle __BASE_PATH_API__ {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
 
     auto bp = normalizeBasePath(basePath);
     string apiPattern = (bp == "/") ? "/api/v1/*" : (bp ~ "/api/v1/*");
@@ -35,7 +35,8 @@ string renderCaddyfile(
         .replace("__TAILSCALE_IP__", tailscaleIp)
         .replace("__BASE_PATH_API__", apiPattern)
         .replace("__LOCAL_PORT__", to!string(loopbackPort))
-        .replace("__WEB_DIR__", webDir);
+        .replace("__WEB_DIR__", webDir)
+        .replace("__WINDOWS_LOG_BLOCK__", windowsCaddyLogBlock(stateDir));
 
     if (bp != "/") {
         rendered = rendered.replace(
@@ -45,6 +46,25 @@ string renderCaddyfile(
     }
     return rendered;
 }
+
+/// Windows services have no console or journal, so the isolated Caddy writes its own
+/// size-rotated log next to hikari's (<ProgramData>/hikari/logs/caddy.log). On Linux and
+/// macOS this renders empty and logs keep going to journald/launchd.
+string windowsCaddyLogBlock(string stateDir, bool forWindows = isWindowsTarget) pure @safe {
+    if (!forWindows) return "";
+    import std.path : dirName;
+    auto logsDir = dirName(stateDir.replace("\\", "/")) ~ "/logs";
+    return "	log {
+		output file " ~ logsDir ~ "/caddy.log {
+			roll_size 1MiB
+			roll_keep 3
+		}
+	}
+";
+}
+
+version (Windows) private enum bool isWindowsTarget = true;
+else private enum bool isWindowsTarget = false;
 
 string renderCaddySnippet(
     string tmplPath,

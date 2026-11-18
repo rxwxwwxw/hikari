@@ -573,7 +573,7 @@ Use GitHub Releases from a **pinned repository** with a trusted signing key dist
 2. Download exact platform/arch archive and signed manifest to a staging area with size limits, deadlines and retries. Verify manifest signature and all file hashes **before extraction or execution**. Prevent path traversal and symlink extraction attacks.
 3. Acquire a cross-process update lock; reject overlapping installer/maintenance jobs. Verify enough disk space and clean incomplete staging safely.
 4. Extract into a **new version directory**. Validate embedded config/schema compatibility and Caddy config in an isolated test invocation.
-5. Activate through an **OS-specific atomic pointer/service switch** and restart **only** hikari-owned services. On Windows, use an installer-owned helper/WinSW orchestration; **never overwrite a running `.exe`**.
+5. Activate through an **OS-specific atomic pointer/service switch** and restart **only** hikari-owned services. On Windows, `hikari.exe` is itself a native Service Control Manager service (no wrapper binary) and activation swaps the versioned junction, then restarts the services through the SCM API; **never overwrite a running `.exe`**.
 6. Probe local `/healthz`, confirm expected version, and require bounded successful startup. On failure, switch back to the previous complete version and preserve useful diagnostics.
 7. Preserve the last known-good release, state, config, hardware cache, user aliases, and the local Caddy certificate store. Garbage-collect older verified releases later, never during the critical activation step.
 
@@ -601,7 +601,7 @@ Regenerate only **hikari-owned generated files** when a release template or rele
 
 - **Linux:** POSIX shell installer; `systemd` service and hardening options. Do not assume every distribution has the same package manager or Linux directory conventions.
 - **macOS:** shell installer; `launchd` service using documented paths and appropriate account permissions. Support native arm64 and x86-64 builds.
-- **Windows:** PowerShell installer; WinSW (or a documented native service wrapper) for the D executable and dedicated Caddy instance; verified helper downloads; startup dependencies/retries. Use version-specific executable paths and Windows-safe service activation. Support x86-64; arm64 is a later capability unless a release is shipped and tested.
+- **Windows:** PowerShell installer; native SCM services for the D executable (`hikari serve --service`) and the dedicated Caddy instance (Caddy's built-in service support), registered by `hikari service install`; per-service virtual account, minimal privileges and SCM recovery actions; verified helper downloads; startup dependencies/retries. Use version-specific executable paths and Windows-safe service activation. Support x86-64; arm64 is a later capability unless a release is shipped and tested.
 - **Snippet-only:** generate files and instructions, no service or user Caddy changes unless explicitly requested and safe.
 
 ### 12.3 Release artifacts

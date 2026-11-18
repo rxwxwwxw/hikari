@@ -29,7 +29,6 @@ try {
     $CfgPath = Join-Path $TmpRoot "ProgramData\hikari\config\config.json"
     if (-not (Test-Path $CfgPath)) { throw "Missing config.json" }
     if (-not (Test-Path (Join-Path $TmpRoot "ProgramData\hikari\config\Caddyfile"))) { throw "Missing Caddyfile" }
-    if (-not (Test-Path (Join-Path $TmpRoot "ProgramData\hikari\config\hikari-service.xml"))) { throw "Missing WinSW XML" }
 
     $Ver = (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim()
     $Versions = Join-Path $TmpRoot "ProgramData\hikari\versions"
