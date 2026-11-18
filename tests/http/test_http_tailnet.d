@@ -154,6 +154,9 @@ unittest {
     auto coord = new RefreshCoordinator(fake, store);
     auto reg = new NodeRegistry(stateDir);
     auto disc = new TailnetDiscoveryService(cfg, reg);
+    // Establish the known tailnet before testing CORS. Request handling refreshes
+    // discovery asynchronously, so a preceding request is not a readiness gate.
+    assert(disc.getLocalTailscaleSnapshot().available);
     auto router = new HikariRouter(cfg, coord, disc, reg, "web/index.html");
     auto srv = new LoopbackHttpServer("127.0.0.1", 0, router);
     srv.startBackground();
