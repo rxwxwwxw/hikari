@@ -7,6 +7,7 @@ targetPath "bin"
 lflags "-framework" "IOKit" "-framework" "CoreFoundation" "-framework" "SystemConfiguration" platform="osx"
 // Deployment targets need the OS C library, but not the builder's D toolchain.
 dflags "-link-defaultlib-shared=false" platform="linux-ldc"
+libs "z" platform="linux"
 
 buildType "debug" {
     buildOptions "debugMode" "debugInfo"
