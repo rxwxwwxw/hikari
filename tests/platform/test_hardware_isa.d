@@ -27,7 +27,8 @@ unittest {
     }
 }
 
-unittest {
+// Linux sysfs fixture: PCI paths contain ":" which is not a valid Windows path character.
+version (Posix) unittest {
     // Hardware inventory fixture test: placeholder scrubbing, ARM64 device-tree, and ZERO serial/MAC leakage
     auto root = tempDir() ~ "/hikari-test-hw-arm64";
     if (exists(root)) rmdirRecurse(root);

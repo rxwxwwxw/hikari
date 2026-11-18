@@ -224,6 +224,20 @@ class TailnetDiscoveryService {
         }
     }
 
+    /// Service accounts may not inherit an interactive PATH; on Windows prefer the
+    /// standard Tailscale install location before falling back to PATH lookup.
+    static string tailscaleCliPath() {
+        version (Windows) {
+            import std.process : environment;
+            foreach (base; [environment.get("ProgramFiles", `C:\Program Files`), environment.get("ProgramW6432", "")]) {
+                if (base.length == 0) continue;
+                auto cand = base ~ `\Tailscale\tailscale.exe`;
+                if (exists(cand)) return cand;
+            }
+        }
+        return tailscaleExecutable();
+    }
+
     private string defaultTailscaleProvider() {
         import std.process : environment;
         auto fixture = config.tailscale_fixture.length > 0
@@ -233,7 +247,7 @@ class TailnetDiscoveryService {
             return readText(fixture);
         }
         try {
-            auto res = runLocalCommand([tailscaleExecutable(), "status", "--json"], 5000, 1024 * 1024 * 4);
+            auto res = runLocalCommand([tailscaleCliPath(), "status", "--json"], 5000, 1024 * 1024 * 4);
             if (res.status == 0 && !res.outputTruncated) return res.output;
         } catch (Exception) {}
         return "";

@@ -14,6 +14,21 @@ import std.algorithm : sort;
 import std.datetime.systime : Clock;
 import std.typecons : Nullable;
 
+private shared bool gSystemResumed = false;
+
+/// Records an OS resume from sleep (from the Windows SCM power event, or any platform
+/// hook). The next rate computation drops all baselines so the first post-resume rate
+/// is reported as unknown (null) instead of a bogus spike or dip.
+void noteSystemResume() nothrow @nogc {
+    import core.atomic : atomicStore;
+    atomicStore(gSystemResumed, true);
+}
+
+private bool consumeSystemResume() nothrow @nogc {
+    import core.atomic : cas;
+    return cas(&gSystemResumed, true, false);
+}
+
 struct ClockSource {
     long delegate() monoNs;
     long delegate() wallTs;
@@ -355,6 +370,7 @@ class RefreshCoordinator {
         synchronized (mtx) {
             auto e = store.groups[ProbeGroup.fast];
             if (e.generation != expectedGen) return; // timed out / superseded
+            if (consumeSystemResume()) store.rateState.resetAll();
 
             store.cachedIdentity = id;
             store.cachedCpu.pct = store.rateState.computeAggregateCpuPct(id.boot_id, cpu.total_ticks, cpu.idle_ticks, doneMono, doneBoot);
@@ -422,6 +438,7 @@ class RefreshCoordinator {
         synchronized (mtx) {
             auto e = store.groups[ProbeGroup.processes];
             if (e.generation != expectedGen) return;
+            if (consumeSystemResume()) store.rateState.resetAll();
 
             auto rates = store.rateState.computeProcessRates(id.boot_id, pr, doneMono, doneBoot);
 
