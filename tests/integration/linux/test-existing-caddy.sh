@@ -33,7 +33,7 @@ mkdir -p "$USER_DIR"
 fail() { echo "FAILED: $*" >&2; exit 1; }
 sha() { sha256sum "$1" | awk '{print $1}'; }
 run_install() {
-  bash "$REPO_ROOT/install/install.sh" --root "$ROOT" --binary-source "$HIKARI_BIN" \
+  bash "$REPO_ROOT/install/install.sh" --target-os=linux --root "$ROOT" --binary-source "$HIKARI_BIN" \
     --tailscale-fixture "$TS_FIXTURE" --systemd-mode=skip --caddy-bin "$CADDY" \
     --existing-caddyfile "$USER_CF" --existing-caddy-bin "$CADDY" "$@"
 }
@@ -72,10 +72,10 @@ echo "--- back to auto removes the isolated unit; uninstall restores the user Ca
 run_install --repair --caddy-mode=auto >/dev/null
 [ "$(sha "$USER_CF")" != "$ORIG_SHA" ] || fail "auto did not join again"
 [ ! -e "$ROOT/etc/systemd/system/hikari-caddy.service" ] || fail "isolated unit not removed after switching to the existing Caddy"
-bash "$REPO_ROOT/install/uninstall.sh" --root "$ROOT" --systemd-mode=skip >/dev/null
+bash "$REPO_ROOT/install/uninstall.sh" --target-os=linux --root "$ROOT" --systemd-mode=skip >/dev/null
 [ "$(sha "$USER_CF")" = "$ORIG_SHA" ] || fail "uninstall did not restore the original bytes"
 [ ! -e "$USER_DIR/hikari.caddy" ] || fail "uninstall left hikari.caddy behind"
-bash "$REPO_ROOT/install/uninstall.sh" --root "$ROOT" --systemd-mode=skip --purge >/dev/null
+bash "$REPO_ROOT/install/uninstall.sh" --target-os=linux --root "$ROOT" --systemd-mode=skip --purge >/dev/null
 
 echo "--- a conflicting Caddyfile: auto falls back to isolated and is left untouched"
 printf ':9100 {\n\trespond "someone else"\n}\n' > "$USER_CF"
@@ -83,11 +83,31 @@ CONFLICT_SHA=$(sha "$USER_CF")
 run_install >/dev/null
 [ "$(sha "$USER_CF")" = "$CONFLICT_SHA" ] || fail "conflicting user Caddyfile was modified"
 [ ! -e "$RECORD" ] || fail "no record expected on fallback"
-bash "$REPO_ROOT/install/uninstall.sh" --root "$ROOT" --systemd-mode=skip --purge >/dev/null
+bash "$REPO_ROOT/install/uninstall.sh" --target-os=linux --root "$ROOT" --systemd-mode=skip --purge >/dev/null
 
 echo "--- --caddy-mode=integrate on a conflict fails before writing anything"
 if run_install --caddy-mode=integrate >/dev/null 2>&1; then fail "--caddy-mode=integrate should fail on a conflict"; fi
 [ ! -e "$ROOT/opt/hikari" ] && [ ! -e "$ROOT/etc/hikari" ] || fail "a failed --caddy-mode=integrate must not write anything"
 [ "$(sha "$USER_CF")" = "$CONFLICT_SHA" ] || fail "conflicting user Caddyfile was modified"
+
+echo "--- failed reload restores the original configuration"
+printf 'example.com {\n respond "keep"\n}\n' > "$USER_CF"
+RELOAD_ORIGINAL=$(sha "$USER_CF")
+export HIKARI_REAL_CADDY="$CADDY"
+export HIKARI_RELOAD_MARKER="$TMP/reload-attempted"
+cat > "$TMP/failing-caddy" <<'WRAPPER'
+#!/usr/bin/env bash
+if [ "$1" = reload ]; then touch "$HIKARI_RELOAD_MARKER"; echo "simulated reload failure" >&2; exit 1; fi
+exec "$HIKARI_REAL_CADDY" "$@"
+WRAPPER
+chmod +x "$TMP/failing-caddy"
+if "$HIKARI_BIN" caddy integrate --caddyfile "$USER_CF" --caddy "$TMP/failing-caddy" \
+  --state-dir "$TMP/reload-state" --fqdn fixture.tail.ts.net --tailscale-ip 100.64.0.10 \
+  --web-dir "$TMP/web" --reload >/dev/null 2>&1; then
+  fail "failed reload should fail integration"
+fi
+[ -f "$HIKARI_RELOAD_MARKER" ] || fail "fixture did not exercise reload"
+[ "$(sha "$USER_CF")" = "$RELOAD_ORIGINAL" ] || fail "failed reload did not restore original bytes"
+[ ! -e "$USER_DIR/hikari.caddy" ] || fail "failed reload left the hikari site file"
 
 echo "Existing-Caddy installer test PASSED."

@@ -41,3 +41,5 @@ assert "/hikari/api/v1/*" in serialized
 assert str(root/"Web Assets") in serialized
 PY
 echo 'Pinned Caddy validated macOS spaced paths, prefixed routes and tailnet-only listener.'
+
+python3 "$REPO_ROOT/tests/install/test_signed_install.py" --caddy "$CADDY_BIN"

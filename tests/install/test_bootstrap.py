@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+import hashlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[2]
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / f'install/{name}.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+bootstrap = load('bootstrap')
+readiness = load('readiness')
+
+
+class BootstrapTests(unittest.TestCase):
+    def test_signed_install_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / 'private.pem'
+            public = root / 'public.pem'
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-out', str(private)], check=True, capture_output=True)
+            subprocess.run(['openssl', 'pkey', '-in', str(private), '-pubout', '-out', str(public)], check=True, capture_output=True)
+            (root / 'trust.json').write_text(json.dumps({'repo': 'example/hikari', 'public_key': public.read_text()}))
+            for system, arch in [('linux', 'x86_64'), ('darwin', 'arm64'), ('windows', 'x86_64')]:
+                filename = f'hikari-{system}-{arch}' + ('.zip' if system == 'windows' else '.tar.gz')
+                files = {'VERSION': b'0.2.0\n', 'web/index.html': b'dashboard',
+                         'hikari.exe' if system == 'windows' else 'hikari': b'binary',
+                         'install/install.ps1' if system == 'windows' else 'install/install.sh': b'installer'}
+                for name in ['install/readiness.py', 'install/verify-release.py', 'caddy/Caddyfile.tmpl', 'caddy/snippet.caddy.tmpl']:
+                    files[name] = b'fixture'
+                if system == 'windows':
+                    with zipfile.ZipFile(root / filename, 'w') as archive:
+                        for name, data in files.items(): archive.writestr(name, data)
+                else:
+                    with tarfile.open(root / filename, 'w:gz') as archive:
+                        for name, data in files.items():
+                            entry = tarfile.TarInfo(name); entry.size = len(data)
+                            archive.addfile(entry, io.BytesIO(data))
+                data = (root / filename).read_bytes()
+                manifest = {'schema_version': 1, 'repo': 'example/hikari', 'version': '0.2.0', 'artifacts': [
+                    {'os': system, 'arch': arch, 'filename': filename, 'size_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}]}
+                (root / 'manifest.json').write_text(json.dumps(manifest))
+                subprocess.run(['openssl', 'pkeyutl', '-sign', '-inkey', str(private), '-rawin', '-in', str(root / 'manifest.json'), '-out', str(root / 'manifest.sig')], check=True, capture_output=True)
+                launched = []
+                run = subprocess.run
+                def launch(command, **kwargs):
+                    if command[0] in ('bash', 'powershell.exe'):
+                        launched.append(command)
+                        return subprocess.CompletedProcess(command, 0)
+                    return run(command, **kwargs)
+                def download(url, destination, limit):
+                    content = (root / url.rsplit('/', 1)[1]).read_bytes()
+                    self.assertLessEqual(len(content), limit)
+                    destination.write_bytes(content)
+                with patch.object(bootstrap, 'HERE', root), patch.object(bootstrap, 'target', return_value=(system, arch)), patch.object(bootstrap, 'download', side_effect=download), patch.object(bootstrap.subprocess, 'run', side_effect=launch):
+                    self.assertEqual(bootstrap.main(['--version', '0.2.0', '--dry-run', '--reload']), 0)
+                    self.assertEqual(len(launched), 1)
+                    self.assertIn('-Reload' if system == 'windows' else '--reload', launched[0])
+                    launched.clear()
+                    with self.assertRaises(ValueError): bootstrap.main(['--version', '0.3.0'])
+                    self.assertFalse(launched)
+                    (root / filename).write_bytes(b'partial download')
+                    with self.assertRaises(ValueError): bootstrap.main([])
+                    self.assertFalse(launched)
+                    (root / filename).write_bytes(data)
+                    (root / 'manifest.sig').write_bytes(b'bad signature')
+                    with self.assertRaises(subprocess.CalledProcessError): bootstrap.main([])
+                    self.assertFalse(launched)
+
+    def test_download_retries_discard_partial_data(self):
+        class Response:
+            def __init__(self, fail): self.fail, self.reads = fail, 0
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size):
+                self.reads += 1
+                if self.reads == 1: return b'whole'
+                if self.fail: raise OSError('interrupted')
+                return b''
+        from unittest.mock import Mock
+        opener = Mock(); opener.open.side_effect = [Response(True), Response(False)]
+        with tempfile.TemporaryDirectory() as directory, patch.object(bootstrap.urllib.request, 'build_opener', return_value=opener):
+            dest = Path(directory) / 'archive'
+            bootstrap.download('https://example.com/archive', dest, 100)
+            self.assertEqual(dest.read_bytes(), b'whole')
+        with self.assertRaises(ValueError): bootstrap.download('http://example.com/archive', Path('/unused'), 100)
+
+
+class ReadinessTests(unittest.TestCase):
+    def test_ready_pending_wrong_routes_and_unavailable_tls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'index.html').write_bytes(b'dashboard')
+            config = {'listen': {'base_path': '/hikari'}, 'paths': {'web_dir': directory}}
+            info = {'status': 'ok', 'app': 'hikari', 'schema_version': 1, 'agent_version': '0.2.0', 'node_id': 'hikari:test', 'fqdn': 'host.tail.ts.net'}
+            calls = []
+            def fetch(url):
+                calls.append(url)
+                return b'dashboard' if url.endswith('/hikari/') else json.dumps(info).encode()
+            results, url = readiness.check(config, '0.2.0', info['fqdn'], get=fetch)
+            self.assertTrue(all(ok for _, ok, _ in results))
+            self.assertEqual(url, 'https://host.tail.ts.net:9100/hikari/')
+            self.assertTrue(all('/status' not in u and '/hardware' not in u for u in calls))
+            calls.clear()
+            results, _ = readiness.check(config, '0.2.0', info['fqdn'], True, fetch)
+            self.assertFalse(all(ok for _, ok, _ in results))
+            self.assertFalse(any(u.startswith('https') for u in calls))
+            def unavailable(url):
+                if url.startswith('https'): raise OSError('TLS failed')
+                return fetch(url)
+            results, _ = readiness.check(config, '0.2.0', info['fqdn'], get=unavailable)
+            self.assertTrue(results[0][1])
+            self.assertFalse(results[-1][1])
+            Path(directory, 'index.html').write_bytes(b'wrong route')
+            results, _ = readiness.check(config, '0.2.0', info['fqdn'], get=fetch)
+            self.assertFalse(results[-1][1])
+            results, _ = readiness.check(config, '0.3.0', info['fqdn'], get=fetch)
+            self.assertFalse(results[0][1])
+            results, _ = readiness.check(config, '0.2.0', info['fqdn'], get=lambda url: b'[]')
+            self.assertFalse(results[0][1])
+
+
+if __name__ == '__main__': unittest.main()

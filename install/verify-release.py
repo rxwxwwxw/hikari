@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import zipfile
+import stat
 
 MAX_BYTES = 512 * 1024 * 1024
 
@@ -63,6 +65,9 @@ def verify_snapshot(args):
             digest.update(chunk)
     if digest.hexdigest() != artifact.get("sha256"):
         raise ValueError("Archive digest mismatch")
+    if args.os == "windows":
+        extract_zip(archive, args.extract_dir)
+        return version
     with tarfile.open(archive, "r:gz") as tar:
         members = []
         total = 0
@@ -98,6 +103,49 @@ def verify_snapshot(args):
     return version
 
 
+def extract_zip(archive, extract_dir):
+    """Validate every entry before writing; reject Windows path aliases and links."""
+    import re
+    with zipfile.ZipFile(archive) as bundle:
+        seen = set()
+        total = 0
+        entries = []
+        for entry in bundle.infolist():
+            name = entry.filename
+            path = PurePosixPath(name)
+            parts = path.parts
+            mode = entry.external_attr >> 16
+            if (not parts or path.is_absolute() or "\\" in name
+                    or any(p in (".", "..") or p.endswith((".", " "))
+                           or re.search(r'[<>:"|?*\x00-\x1f]', p)
+                           or re.fullmatch(r"(?i:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?", p)
+                           for p in parts)):
+                raise ValueError("Unsafe Windows archive path")
+            if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise ValueError("Archive contains a link or special file")
+            key = str(path).casefold()
+            if key in seen:
+                raise ValueError("Duplicate archive path")
+            seen.add(key)
+            total += entry.file_size
+            entries.append((entry, parts))
+            if total > MAX_BYTES or len(entries) > 4096:
+                raise ValueError("Expanded archive exceeds limits")
+        if not {"hikari.exe", "web/index.html"}.issubset(seen):
+            raise ValueError("Release is missing required files")
+        if extract_dir:
+            destination = Path(extract_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            for entry, parts in entries:
+                target = destination.joinpath(*parts)
+                if entry.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.open(entry) as source, target.open("xb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+
+
 def main():
     parser = argparse.ArgumentParser()
     for field in ("archive", "manifest", "signature", "public-key", "repo", "os", "arch"):
@@ -106,7 +154,7 @@ def main():
     args = parser.parse_args()
     try:
         print(verify(args))
-    except (ValueError, OSError, tarfile.TarError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, tarfile.TarError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         parser.exit(1, f"Release verification failed: {error}\n")
 
 

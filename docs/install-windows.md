@@ -2,26 +2,24 @@
 
 This guide covers building, testing, and installing **hikari** on Windows 11 (`x86_64`) as boot-persistent Windows services, so telemetry and hardware cards stay available before anyone logs in, while a standard/child account is signed in, during Fast User Switching, after every user signs out, and after reboot.
 
+## Install a release
+
+Download `hikari-install.ps1` from the [release page](https://github.com/rxwxwwxw/hikari/releases). In Administrator PowerShell:
+
+```powershell
+.\hikari-install.ps1 -DryRun
+.\hikari-install.ps1 -Reload
+```
+
+Python 3.9+ and Ed25519-capable OpenSSL are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
+
 ## Prerequisites
 
 - **Tailscale for Windows**, enrolled in your tailnet, with MagicDNS and HTTPS certificates enabled. Turning on Tailscale's **Run unattended** option is recommended so `tailscaled` is not tied to one interactive user (see [Service accounts](#service-accounts-and-tailscale-access)).
-- **Caddy** is optional. If no `caddy.exe` is on `PATH`, a pinned Caddy v2.9.1 is downloaded into `C:\ProgramData\hikari\bin\` and checked against its SHA-512. An existing Caddy is used read-only, and its service is never touched.
+- **Caddy** is optional. If no `caddy.exe` is on `PATH`, a pinned Caddy v2.9.1 is downloaded into `C:\ProgramData\hikari\bin\` and checked against its SHA-512. A compatible existing Caddy service is reused through the verified integration; it is never restarted and reload requires explicit authorization.
 - To build from source: **LDC2 (`ldc2`) and DUB (`dub`)** with the Microsoft Visual C++ Build Tools.
 
-## Building & testing locally
-
-```powershell
-dub build --compiler=ldc2 --build=release
-dub test --compiler=ldc2
-.\bin\hikari.exe version
-.\bin\hikari.exe snapshot --sample-twice
-.\bin\hikari.exe hardware
-.\tests\integration\windows\test-installer.ps1   # isolated -Root install/repair/uninstall smoke test
-# Elevated only: registers throwaway services and exercises the real SCM
-.\tests\integration\windows\test-service.ps1 -CaddyExe C:\path\to\caddy.exe
-```
-
-Apart from `test-service.ps1`, none of these commands need administrator rights. SMBIOS, CPU topology, SetupAPI device descriptions and physical-disk attribute queries all work for a standard user.
+For developer builds, see [building from source](building.md).
 
 ## Installing as machine-wide services
 

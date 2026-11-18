@@ -449,7 +449,16 @@ if [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrat
     PROBE_DIR=""
     if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
       PROBE_DIR=$(mktemp -d)
-      tar -xzf "$BINARY_SOURCE" -C "$PROBE_DIR" hikari
+      # Re-verify a private snapshot before executing the inspection binary.
+      # Release archives may store ./hikari rather than a literal hikari entry.
+      PROBE_VERSION=$(python3 "$REPO_ROOT/install/verify-release.py" --archive "$BINARY_SOURCE" \
+        --manifest "$MANIFEST" --signature "$SIGNATURE" --repo "$TRUST_REPO" \
+        --public-key "$TRUST_PUBKEY" --os "$RELEASE_OS" --arch "$ARCH" --extract-dir "$PROBE_DIR")
+      if [ "$PROBE_VERSION" != "$APP_VERSION" ]; then
+        rm -rf "$PROBE_DIR"
+        echo "Release changed before inspection; refusing installation." >&2
+        exit 1
+      fi
       PROBE_BIN="$PROBE_DIR/hikari"
     fi
     INSPECT_ARGS=(caddy inspect --verdict --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI" --port "$TAILNET_PORT")
@@ -1160,36 +1169,22 @@ if [ "$INTEGRATED" -eq 1 ]; then
   fi
 fi
 
-# 12. Final operator report
+# 12. Report installation separately from verified end-to-end readiness.
 echo ""
-echo "=== hikari installation complete ($TARGET_OS) ==="
+echo "=== hikari files and services installed ($TARGET_OS) ==="
 echo "  Version:          $APP_VERSION"
-echo "  Loopback API:     http://127.0.0.1:${LOOPBACK_PORT}/healthz"
-if [ "$SNIPPET_ONLY" -eq 1 ]; then
-  echo "  Caddy snippet:    $ETC_HIKARI/hikari-snippet.caddy"
-  echo "  Action needed:    Add 'import ${REAL_ETC_HIKARI}/hikari-snippet.caddy' inside your existing Caddy site block."
-elif [ "$INTEGRATED" -eq 1 ]; then
-  echo "  Caddy:            joined existing Caddy ($INTEGRATE_CADDYFILE); undo with uninstall.sh or 'hikari caddy unintegrate'"
-  if [ -n "$TS_FQDN" ]; then
-    echo "  Dashboard URL:    https://${TS_FQDN}:${TAILNET_PORT}${BASE_PATH%/}/"
-  fi
+if [ "$INTEGRATED" -eq 1 ]; then
+  echo "  Caddy:            reused existing service ($INTEGRATE_CADDYFILE)"
 else
-  echo "  Caddy executable: $RESOLVED_CADDY_BIN ($CADDY_ORIGIN)"
-  echo "  Caddy config:     $ETC_HIKARI/Caddyfile"
-  if [ -n "$TS_FQDN" ]; then
-    BP_CLEAN="${BASE_PATH%/}"
-    echo "  Dashboard URL:    https://${TS_FQDN}:${TAILNET_PORT}${BP_CLEAN}/"
-  else
-    echo "  Dashboard URL:    Run 'hikari doctor' once Tailscale is logged in to render Caddyfile with your .ts.net FQDN."
-  fi
+  echo "  Caddy:            isolated hikari-caddy ($RESOLVED_CADDY_BIN)"
 fi
 echo "  Install log:      $LOG_FILE"
 echo "  Recovery/status:  /opt/hikari/versions/current/hikari doctor"
-
-if [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ] && [ "$SYSTEMD_MODE" = "auto" ]; then
-  echo "Readiness report (service context and TLS are checked independently):"
-  "$REL_DIR/hikari" doctor --config "$CONFIG_PATH" --caddy-bin "$RESOLVED_CADDY_BIN" || {
-    echo "Installation files are in place; readiness checks need attention. See the report and $LOG_DIR." >&2
-    exit 1
-  }
+READINESS_ARGS=(--config "$CONFIG_PATH" --version "$APP_VERSION" --fqdn "$TS_FQDN")
+if [ "$INTEGRATED" -eq 1 ] && [ "$RELOAD_CADDY" -ne 1 ]; then
+  READINESS_ARGS+=(--pending-reload)
 fi
+if [ -n "$ROOT_PREFIX" ] || [ "$SYSTEMD_MODE" != "auto" ]; then
+  READINESS_ARGS+=(--skip)
+fi
+python3 "$REPO_ROOT/install/readiness.py" "${READINESS_ARGS[@]}"

@@ -54,10 +54,17 @@ param(
     [ValidateSet("Virtual", "LocalSystem")]
     [string]$AgentAccount = "Virtual",
     [string]$Repo = "OWNER/REPO",
-    [string]$PubKey = ""
+    [string]$PubKey = "",
+    [string]$Manifest = "",
+    [string]$Signature = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    throw "Python 3.9+ is required for release verification and readiness checks; install it and rerun."
+}
+& python -c "import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)"
+if ($LASTEXITCODE -ne 0) { throw "Python 3.9+ is required; install it and rerun." }
 
 $CaddyPinnedVersion = "2.9.1"
 # Official Caddy v2.9.1 windows_amd64.zip SHA-512 from caddy_2.9.1_checksums.txt
@@ -213,11 +220,25 @@ function Invoke-Native([string]$Exe, [string[]]$NArgs) {
     $o = (& $Exe @NArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
     return @{ Code = $LASTEXITCODE; Out = $o }
 }
+# Verify archives before executing even the read-only probe binary.
+function Get-VerifiedRelease([string]$Destination = "") {
+    if (-not $Manifest -or -not $Signature -or -not $PubKey -or $Repo -eq "OWNER/REPO") {
+        throw "ZIP installation requires -Manifest, -Signature, -Repo and a trusted -PubKey."
+    }
+    $verifyArgs = @((Join-Path $ScriptDir "verify-release.py"), "--archive", $BinarySource,
+        "--manifest", $Manifest, "--signature", $Signature, "--public-key", $PubKey,
+        "--repo", $Repo, "--os", "windows", "--arch", "x86_64")
+    if ($Destination) { $verifyArgs += @("--extract-dir", $Destination) }
+    $version = & python @verifyArgs
+    if ($LASTEXITCODE -ne 0) { throw "Release verification failed; nothing from this archive will be executed." }
+    return "$version".Trim()
+}
+$VerifiedVersion = ""
 $ProbeExe = $BinarySource
 $ProbeDir = ""
 if ($BinarySource -like "*.zip") {
     $ProbeDir = Join-Path $env:TEMP ("hikari-probe-" + [guid]::NewGuid().ToString("N"))
-    Expand-Archive -Path $BinarySource -DestinationPath $ProbeDir -Force
+    $VerifiedVersion = Get-VerifiedRelease $ProbeDir
     $ProbeExe = Join-Path $ProbeDir "hikari.exe"
 }
 $CaddyDecision = "isolated"
@@ -280,7 +301,7 @@ function Resolve-IsolatedCaddy {
 }
 if (-not $SnippetOnly -and $CaddyDecision -eq "isolated") { Resolve-IsolatedCaddy }
 
-$AppVersion = if (Test-Path (Join-Path $RepoRoot "VERSION")) { (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim() } else { "0.1.0" }
+$AppVersion = if ($VerifiedVersion) { $VerifiedVersion } elseif (Test-Path (Join-Path $RepoRoot "VERSION")) { (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim() } else { "0.1.0" }
 
 # Fail before writes when the maintenance task name belongs to someone else.
 if ($ManageServices) {
@@ -408,7 +429,8 @@ if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "web"), (Join-Path $StageDir "caddy") | Out-Null
 
 if ($BinarySource -like "*.zip") {
-    Expand-Archive -Path $BinarySource -DestinationPath $StageDir -Force
+    $stagedVersion = Get-VerifiedRelease $StageDir
+    if ($stagedVersion -ne $AppVersion) { throw "Release changed during installation; refusing activation." }
 } else {
     Copy-Item -Path $BinarySource -Destination (Join-Path $StageDir "hikari.exe") -Force
     Copy-Item -Path (Join-Path $RepoRoot "web\index.html") -Destination (Join-Path $StageDir "web\index.html") -Force
@@ -467,6 +489,10 @@ if ($oldVer -ne $AppVersion -or -not (Test-Path $CurrentJunction)) {
 # 6. Configuration (created once, never overwritten)
 # ---------------------------------------------------------------------------
 if (-not (Test-Path $ConfigPath)) {
+    if ($PubKey) {
+        # Persist the key bytes, not a bootstrap temporary path that will disappear.
+        $PubKey = Get-Content -Raw -LiteralPath $PubKey
+    }
     $cfgObj = @{
         schema_version = 1
         listen = @{
@@ -674,42 +700,21 @@ if ($ManageServices) {
     }
 }
 
-# 10. Post-install verification from the real service identity
-# ---------------------------------------------------------------------------
-$ServiceTailscaleOk = $null
-if ($ManageServices) {
-    $healthy = $false
-    foreach ($i in 1..30) {
-        try {
-            $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri "http://127.0.0.1:$LoopbackPort/healthz"
-            $healthy = $true; break
-        } catch { Start-Sleep -Milliseconds 500 }
-    }
-    if (-not $healthy) {
-        Write-Log "WARNING: hikari service did not answer /healthz on 127.0.0.1:$LoopbackPort; see $LogsDir\hikari.log"
-    } else {
-        try {
-            $info = Invoke-RestMethod -TimeoutSec 5 -Uri "http://127.0.0.1:$LoopbackPort/api/v1/info"
-            $ServiceTailscaleOk = [bool]$info.fqdn
-        } catch { $ServiceTailscaleOk = $false }
-        if ($ServiceTailscaleOk) {
-            Write-Log "Verified: the hikari service account can read local Tailscale status ($($info.fqdn))"
-        } else {
-            Write-Log "WARNING: the hikari service ($AgentAccount) cannot read Tailscale status. Peer discovery and Host validation need it."
-            Write-Log "         Enable Tailscale's 'Run unattended' option (so tailscaled is not tied to an interactive user),"
-            Write-Log "         or re-run with -AgentAccount LocalSystem -Repair. hikari never changes Tailscale settings itself."
-        }
-    }
-}
-
-Write-Host "`n=== hikari Windows installation complete ==="
+# 10. Separate installed files from end-to-end readiness.
+Write-Host "`n=== hikari files and services installed ==="
 Write-Host "  Version:       $AppVersion"
 Write-Host "  Config:        $ConfigPath"
 Write-Host "  Logs:          $LogsDir (hikari.log, caddy.log, install.log)"
-if ($Integrated) {
-    Write-Host "  Caddy:         joined existing Caddy ($IntegrateCaddyfile); undo with uninstall.ps1 or 'hikari caddy unintegrate'"
+if ($SnippetOnly) {
+    Write-Host "  Caddy:         snippet generated; import and reload remain operator actions"
+} elseif ($Integrated) {
+    Write-Host "  Caddy:         reused existing service ($IntegrateCaddyfile)"
+} else {
+    Write-Host "  Caddy:         isolated hikari-caddy"
 }
-if ($TsFqdn -and -not $SnippetOnly -and ($Integrated -or (Test-Path $CaddyfilePath))) {
-    Write-Host "  Dashboard URL: https://${TsFqdn}:${TailnetPort}$($BasePath.TrimEnd('/'))/"
-    Write-Host "  Note: restrict TCP $TailnetPort in your Tailscale ACLs; hikari does not change Windows Firewall or Tailscale policy."
-}
+$readinessArgs = @((Join-Path $ScriptDir "readiness.py"), "--config", $ConfigPath,
+    "--version", $AppVersion, "--fqdn", "$TsFqdn")
+if ($Integrated -and -not $EffectiveReload) { $readinessArgs += "--pending-reload" }
+if (-not $ManageServices -or $SnippetOnly) { $readinessArgs += "--skip" }
+& python @readinessArgs
+exit $LASTEXITCODE

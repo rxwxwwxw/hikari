@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import io
+import os
 import json
 from pathlib import Path
 import subprocess
@@ -10,6 +11,7 @@ import tarfile
 import tempfile
 import types
 import unittest
+import zipfile
 
 REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location("verifier", REPO / "install/verify-release.py")
@@ -18,6 +20,32 @@ spec.loader.exec_module(verifier)
 
 
 class ReleaseVerification(unittest.TestCase):
+    def test_windows_paths_and_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "release.zip"
+            def package(name=None, link=False):
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    bundle.writestr("hikari.exe", b"binary")
+                    bundle.writestr("web/index.html", b"dashboard")
+                    if name:
+                        entry = zipfile.ZipInfo(name)
+                        if link:
+                            entry.create_system = 3
+                            entry.external_attr = 0o120777 << 16
+                        bundle.writestr(entry, b"target")
+            package()
+            verifier.extract_zip(archive, root / "stage")
+            self.assertEqual((root / "stage/hikari.exe").read_bytes(), b"binary")
+            for name in ("../outside", "/absolute", "C:/outside", "web\\evil", "file:stream",
+                         "NUL.txt", "COM1", "trailing.", "trailing ", "HIKARI.EXE"):
+                package(name)
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    verifier.extract_zip(archive, None)
+            package("link", True)
+            with self.assertRaises(ValueError):
+                verifier.extract_zip(archive, None)
+
     def test_signed_archive_and_failures(self):
         with tempfile.TemporaryDirectory(prefix="hikari-trust-") as directory:
             root = Path(directory)
@@ -49,7 +77,8 @@ class ReleaseVerification(unittest.TestCase):
             self.assertEqual(verifier.verify(args), "0.2.0")
             args.extract_dir = str(root / "stage")
             verifier.verify(args)
-            self.assertEqual((root / "stage/hikari").stat().st_mode & 0o777, 0o755)
+            if os.name != "nt":
+                self.assertEqual((root / "stage/hikari").stat().st_mode & 0o777, 0o755)
             args.extract_dir = None
             Path(args.archive).write_bytes(b"tampered")
             with self.assertRaises(ValueError): verifier.verify(args)

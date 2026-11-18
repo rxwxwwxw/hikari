@@ -95,6 +95,8 @@ jobs:
           Copy-Item caddy\snippet.caddy.tmpl "$stage\caddy\snippet.caddy.tmpl"
           Copy-Item install\install.ps1 "$stage\install\install.ps1"
           Copy-Item install\uninstall.ps1 "$stage\install\uninstall.ps1"
+          Copy-Item install\verify-release.py "$stage\install\verify-release.py"
+          Copy-Item install\readiness.py "$stage\install\readiness.py"
           Compress-Archive -Path "$stage\*" -DestinationPath "dist\hikari-windows-x86_64.zip" -Force
 
       - uses: actions/upload-artifact@v4
@@ -117,11 +119,12 @@ jobs:
         run: |
           mkdir -p release-files
           find artifacts -type f \( -name 'hikari-*.tar.gz' -o -name 'hikari-*.zip' \) -exec cp {} release-files/ \;
+          python3 tools/package-bootstrap.py release-files
           VER="$(cat VERSION | tr -d '[:space:]')"
           python3 - <<PY
           import hashlib, json, os, glob
           arts = []
-          for p in sorted(glob.glob("release-files/hikari-*")):
+          for p in sorted(glob.glob("release-files/hikari-*.tar.gz") + glob.glob("release-files/hikari-*.zip")):
               fn = os.path.basename(p)
               stem = fn.replace(".tar.gz", "").replace(".zip", "")
               parts = stem.split("-")
@@ -148,10 +151,40 @@ jobs:
             exit 1
           fi
           if [ -n "$SIGNING_KEY" ]; then
+            umask 077
+            trap 'rm -f /tmp/rel.pem /tmp/rel-public.pem' EXIT
             printf '%s\n' "$SIGNING_KEY" > /tmp/rel.pem
+            openssl pkey -in /tmp/rel.pem -pubout -out /tmp/rel-public.pem
+            python3 - <<'PY'
+          import json, pathlib
+          expected = json.loads(pathlib.Path("install/trust.json").read_text())["public_key"].strip()
+          actual = pathlib.Path("/tmp/rel-public.pem").read_text().strip()
+          if actual != expected:
+              raise SystemExit("Release signing key does not match the pinned bootstrap public key")
+          PY
             openssl pkeyutl -sign -inkey /tmp/rel.pem -rawin -in release-files/manifest.json -out release-files/manifest.sig
             rm -f /tmp/rel.pem
           fi
+
+      - name: Verify every signed archive before publishing
+        run: |
+          python3 - <<'PY'
+          import argparse, importlib.util, json, pathlib, tempfile
+          spec = importlib.util.spec_from_file_location("verifier", "install/verify-release.py")
+          verifier = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(verifier)
+          manifest = json.loads(pathlib.Path("release-files/manifest.json").read_text())
+          trust = json.loads(pathlib.Path("install/trust.json").read_text())
+          with tempfile.TemporaryDirectory() as directory:
+              key = pathlib.Path(directory) / "public.pem"
+              key.write_text(trust["public_key"])
+              for artifact in manifest["artifacts"]:
+                  verifier.verify(argparse.Namespace(
+                      archive="release-files/" + artifact["filename"],
+                      manifest="release-files/manifest.json", signature="release-files/manifest.sig",
+                      public_key=str(key), repo=trust["repo"], os=artifact["os"], arch=artifact["arch"],
+                      extract_dir=None))
+          PY
 
       - uses: softprops/action-gh-release@v2
         with:

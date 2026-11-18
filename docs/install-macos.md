@@ -2,23 +2,24 @@
 
 This guide covers building, testing, and installing **hikari** on **Apple Silicon (`arm64`)** Macs using system-domain **launchd LaunchDaemons** (`/Library/LaunchDaemons/`) so monitoring remains active at the login window and after users log out. Intel macOS support is deferred for this release; Intel Macs running Linux use the Linux targets.
 
+## Install a release
+
+Download `hikari-install.sh` from the [release page](https://github.com/rxwxwwxw/hikari/releases), then:
+
+```sh
+bash hikari-install.sh --dry-run
+sudo bash hikari-install.sh --reload
+```
+
+Python 3.9+ and Ed25519-capable OpenSSL are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
+
 ## Prerequisites
 
 - macOS with **Tailscale** installed and enrolled (MagicDNS and HTTPS certificates enabled).
-- **Homebrew** installed (normally `/opt/homebrew` on Apple Silicon).
+- **Homebrew** is only needed if you choose it to obtain development tools, Python/OpenSSL, or Caddy; hikari never installs Homebrew.
 - **LDC2 (`ldc2`) and DUB (`dub`)** (`brew install ldc dub`) to build from source.
 
-## Building & Testing Locally
-
-```bash
-dub build --compiler=ldc2 --build=release
-dub test --compiler=ldc2
-./bin/hikari version
-MACOS_SMOKE_STATE=$(mktemp -d /tmp/hikari-smoke-XXXXXX)
-./bin/hikari snapshot --state-dir "$MACOS_SMOKE_STATE" --sample-twice
-./bin/hikari hardware --state-dir "$MACOS_SMOKE_STATE"
-rm -rf "$MACOS_SMOKE_STATE"
-```
+For developer builds, see [building from source](building.md).
 
 ## Installing System-Domain LaunchDaemons
 

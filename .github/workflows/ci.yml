@@ -50,6 +50,7 @@ jobs:
           bash tests/integration/macos/test-reconciler.sh
           python3 tests/integration/macos/test-reconcile-lifecycle.py
           python3 tests/integration/macos/test-release-verification.py
+          python3 tests/install/test_bootstrap.py
           python3 tests/integration/macos/test-activation.py
           python3 tests/integration/macos/test-startup.py
           python3 tests/integration/test-graceful-shutdown.py
@@ -73,7 +74,9 @@ jobs:
           pwsh -NoProfile -File tests/integration/caddy/differential.ps1 -Caddy "$dl/caddy"
 
       - name: Installer test with an existing Caddy (join, repair, mode switch, uninstall)
-        run: bash tests/integration/linux/test-existing-caddy.sh "$RUNNER_TEMP/caddy-dl/caddy"
+        run: |
+          bash tests/integration/linux/test-existing-caddy.sh "$RUNNER_TEMP/caddy-dl/caddy"
+          python3 tests/install/test_signed_install.py --caddy "$RUNNER_TEMP/caddy-dl/caddy"
 
       - name: Run Linux installer, service, and container suite
         run: bash tests/integration/linux/run.sh --distro "${{ matrix.docker_distro }}"
@@ -96,6 +99,19 @@ jobs:
 
       - name: Run D unit tests
         run: dub test --compiler=ldc2
+
+      - name: Verify release bootstrap and readiness
+        shell: pwsh
+        run: |
+          python tests/install/test_bootstrap.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/integration/macos/test-release-verification.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/package-bootstrap.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd "dist/bootstrap/hikari-install.ps1"), [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { throw ($errs | Out-String) }
 
       - name: PowerShell static checks
         shell: pwsh
@@ -178,6 +194,7 @@ jobs:
           bash tests/integration/macos/test-reconciler.sh
           python3 tests/integration/macos/test-reconcile-lifecycle.py
           python3 tests/integration/macos/test-release-verification.py
+          python3 tests/install/test_bootstrap.py
           python3 tests/integration/macos/test-activation.py
           python3 tests/integration/macos/test-startup.py
           python3 tests/integration/test-graceful-shutdown.py
