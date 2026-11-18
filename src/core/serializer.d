@@ -592,6 +592,15 @@ JSONValue serializeNodesResponse(const ref NodesResponse nr) pure @safe {
         arr ~= nj;
     }
     j["nodes"] = JSONValue(arr);
+    if (!nr.discovery.isNull) {
+        auto d = nr.discovery.get;
+        JSONValue dj = JSONValue.emptyObject;
+        dj["running"] = d.running;
+        dj["last_started_at"] = jsonNullableLong(d.last_started_at);
+        dj["last_finished_at"] = jsonNullableLong(d.last_finished_at);
+        dj["tailscale_available"] = d.tailscale_available;
+        j["discovery"] = dj;
+    }
     return j;
 }
 

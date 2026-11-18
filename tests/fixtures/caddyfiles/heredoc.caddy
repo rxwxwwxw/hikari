@@ -1,0 +1,7 @@
+example.com {
+	respond <<HTML
+		<html>
+		  { this is not a block }
+		</html>
+		HTML 200
+}

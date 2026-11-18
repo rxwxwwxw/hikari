@@ -76,6 +76,19 @@ sc.exe qprivs hikari      # SeChangeNotifyPrivilege only
 & 'C:\ProgramData\hikari\versions\current\hikari.exe' service status --name hikari
 ```
 
+### An existing Caddy on Windows
+
+If a Windows service already runs `caddy.exe run --config <Caddyfile>`, the default `-CaddyMode auto` joins it instead of creating `hikari-caddy`, when every safety check passes:
+- one marked `import hikari.caddy` block is appended to that Caddyfile, and `hikari.caddy` is written next to it;
+- the change is verified with `caddy adapt`, a backup is kept, and the file's ACL is preserved.
+
+Other modes:
+- `-CaddyMode integrate` joins or stops before writing anything.
+- `-CaddyMode isolated` never touches the existing Caddy.
+- `-Reload` reloads it afterwards (`caddy reload` through its admin endpoint); otherwise the command is printed.
+
+Switching modes with `-Repair` reverses the previous choice first, and `uninstall.ps1` restores the Caddyfile byte for byte. Details are in [caddy-integration.md](caddy-integration.md).
+
 ### Service accounts and Tailscale access
 
 The agent runs as its own **virtual account**, `NT SERVICE\hikari`. Windows manages it automatically: there is no password and no user profile, and it has no group memberships beyond a normal service. Files are granted to this one service, not to every service that shares `LocalService`.

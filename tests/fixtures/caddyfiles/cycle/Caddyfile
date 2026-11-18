@@ -1,0 +1,5 @@
+import other.caddy
+
+main.example.com {
+	respond main
+}

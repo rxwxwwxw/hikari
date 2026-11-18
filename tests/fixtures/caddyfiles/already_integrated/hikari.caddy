@@ -1,0 +1,16 @@
+# Managed by hikari: regenerated on install/repair. Do not edit; remove with `hikari caddy unintegrate`.
+https://box.tail1234.ts.net:9100 {
+	bind 100.64.0.10
+	tls {
+		get_certificate tailscale
+	}
+
+	handle /api/v1/* {
+		reverse_proxy 127.0.0.1:19100
+	}
+
+	handle {
+		root * "/opt/hikari/versions/current/web"
+		file_server
+	}
+}

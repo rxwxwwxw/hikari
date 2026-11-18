@@ -342,9 +342,246 @@ private int cmdNodes(string[] args) {
     return 0;
 }
 
+/// `hikari caddy inspect|integrate|unintegrate`: read-only analysis of an existing Caddy,
+/// and the verified, reversible integration of hikari's site into it.
+private int cmdCaddyIntegration(string sub, string[] args, ref HikariConfig cfg) {
+    import caddyfile.analyze;
+    import caddyfile.caddybin;
+    import caddyfile.detect;
+    import caddyfile.edit : resolveRealPath;
+    import caddyfile.integrate;
+    import std.array : join;
+    import std.json : JSONValue;
+
+    bool asJson = hasFlag(args, "--json");
+    auto stateDir = getFlagValue(args, "--state-dir", cfg.paths.state_dir);
+    IntegrationRecord record;
+    bool hasRecord = loadIntegrationRecord(stateDir, record);
+
+    if (sub == "status") {
+        JSONValue st = JSONValue(string[string].init);
+        st["mode"] = hasRecord ? "integrated" : "not_integrated";
+        st["preference"] = cfg.caddy.mode;
+        if (hasRecord) {
+            st["integration"] = record.mode;
+            st["caddyfile"] = record.caddyfile;
+            st["site_file"] = record.siteFile;
+            st["service"] = record.service;
+            st["manager"] = record.manager;
+            st["caddy_bin"] = record.caddyBin;
+            st["integrated_at"] = record.integratedAt;
+        }
+        if (asJson) writeln(st.toPrettyString());
+        else if (hasRecord) writefln("integrated into %s (%s; site file %s)", record.caddyfile, record.mode, record.siteFile);
+        else writefln("not integrated into an existing Caddy (preference: caddy.mode=%s)", cfg.caddy.mode);
+        return 0;
+    }
+
+    if (sub == "reload") {
+        // Reload the existing Caddy hikari integrated into (never restarts it).
+        if (!hasRecord) {
+            stderr.writeln("hikari caddy reload: hikari is not integrated into an existing Caddy");
+            return 2;
+        }
+        IntegrateOptions ro;
+        ro.caddyfile = record.caddyfile;
+        ro.caddyBin = record.caddyBin;
+        ro.service = record.service;
+        ro.manager = record.manager;
+        bool ok, attempted;
+        auto note = reloadExistingCaddy(ro, analyzeCaddyfile(record.caddyfile), ok, attempted);
+        writeln(note);
+        if (!attempted) writeln("run: ", manualReloadHint(ro));
+        return ok ? 0 : (attempted ? 1 : 3);
+    }
+
+    auto detected = detectExistingCaddy(cfg.paths.config_dir);
+    // unintegrate (and repair) act on what was recorded, even if the service changed since.
+    string defaultCaddyfile = (sub == "unintegrate" && hasRecord) ? record.caddyfile : detected.caddyfile;
+    string defaultBin = (sub == "unintegrate" && hasRecord && record.caddyBin.length > 0) ? record.caddyBin : detected.binary;
+    string cfPath = getFlagValue(args, "--caddyfile", defaultCaddyfile);
+    string caddyBin = getFlagValue(args, "--caddy", defaultBin);
+    // Values often come from shell pipelines; never let stray whitespace/CR into an address.
+    string fqdn = getFlagValue(args, "--fqdn", "").strip();
+    string tsIp = getFlagValue(args, "--tailscale-ip", "").strip();
+    auto portStr = getFlagValue(args, "--port", "").strip();
+    ushort port = portStr.length > 0 ? to!ushort(portStr) : cfg.listen.tailnet_port;
+    if (fqdn.length == 0 || tsIp.length == 0) {
+        try {
+            auto disc = new TailnetDiscoveryService(cfg, new NodeRegistry(cfg.paths.state_dir));
+            auto snap = disc.getLocalTailscaleSnapshot(true);
+            if (snap.available) {
+                if (fqdn.length == 0) fqdn = snap.selfNode.fqdn;
+                if (tsIp.length == 0 && snap.selfNode.tailscale_ips.length > 0) tsIp = snap.selfNode.tailscale_ips[0];
+            }
+        } catch (Exception) {}
+    }
+
+    if (sub == "inspect") {
+        JSONValue j = JSONValue(string[string].init);
+        j["detected_service"] = detected.found ? JSONValue(detected.service ~ " (" ~ detected.manager ~ ")") : JSONValue(null);
+        j["detection_note"] = detected.note;
+        j["caddyfile"] = cfPath;
+        j["caddy_binary"] = caddyBin;
+        j["fqdn"] = fqdn;
+        j["tailscale_ip"] = tsIp;
+        j["port"] = port;
+        if (cfPath.length == 0) {
+            j["verdict"] = "isolated";
+            j["reason"] = detected.found ? detected.note : "no existing Caddy service found";
+            if (hasFlag(args, "--verdict")) writeln("isolated: ", j["reason"].str);
+            else if (asJson) writeln(j.toPrettyString());
+            else writefln("No Caddyfile to inspect: %s.\nhikari would use its own isolated hikari-caddy instance.", j["reason"].str);
+            return 0;
+        }
+        auto r = analyzeCaddyfile(cfPath);
+        auto v = integrationVerdict(r, fqdn, tsIp, port);
+        string reason = v.reason;
+        bool integrable = v.integrable;
+        if (integrable && detected.found && detected.note.length > 0 && cfPath == detected.caddyfile) {
+            integrable = false;
+            reason = detected.note;
+        }
+        j["parsed"] = r.parsed;
+        if (!r.parsed) j["parse_error"] = r.parseError;
+        j["files_read"] = r.filesRead;
+        j["line_endings"] = r.crlf ? "crlf" : "lf";
+        j["bom"] = r.hasBom;
+        JSONValue g = JSONValue(string[string].init);
+        g["present"] = r.globals.present;
+        g["admin"] = r.globals.admin;
+        g["auto_https"] = r.globals.autoHttps;
+        g["http_port"] = r.globals.httpPort;
+        g["https_port"] = r.globals.httpsPort;
+        g["default_bind"] = r.globals.defaultBind;
+        g["servers"] = r.globals.serversListeners;
+        j["globals"] = g;
+        JSONValue[] sites;
+        foreach (sa; r.sites) {
+            JSONValue sj = JSONValue(string[string].init);
+            sj["address"] = sa.raw;
+            sj["scheme"] = sa.scheme;
+            sj["host"] = sa.host;
+            sj["port"] = sa.port;
+            sj["binds"] = sa.binds;
+            sj["placeholder"] = sa.placeholder;
+            sj["file"] = sa.file;
+            sj["line"] = sa.line;
+            sites ~= sj;
+        }
+        j["sites"] = JSONValue(sites);
+        j["parser_listeners"] = parserListeners(r);
+        string[] imps;
+        foreach (im; r.imports) imps ~= format!"%s:%u import %s%s"(im.file, im.line, im.pattern, im.isSnippet ? " (snippet)" : im.isGlob ? " (glob)" : "");
+        j["imports"] = imps;
+        j["config_management"] = r.configManagement;
+        j["hikari_markers"] = r.hikariMarkers;
+        string[] cs;
+        foreach (c; v.conflicts) cs ~= c.kind ~ ": " ~ c.detail;
+        j["conflicts"] = cs;
+        if (caddyBin.length > 0) {
+            auto ver = caddyVersion(caddyBin);
+            j["caddy_version"] = ver.length > 0 ? to!string(ver) : "unknown";
+            auto ad = caddyAdapt(caddyBin, cfPath);
+            j["caddy_adapt_ok"] = ad.ok;
+            if (!ad.ok) j["caddy_adapt_error"] = ad.error;
+            else j["caddy_listeners"] = adaptedListeners(ad.json);
+            if (!ad.ok && integrable) {
+                integrable = false;
+                reason = "existing Caddyfile does not adapt cleanly";
+            }
+        }
+        j["verdict"] = integrable ? "integrate" : "isolated";
+        j["reason"] = reason;
+        if (hasFlag(args, "--verdict")) {
+            // Single line for installer scripts: "integrate <caddyfile>" or "isolated: <reason>".
+            writeln(integrable ? "integrate " ~ cfPath : "isolated: " ~ reason);
+            return 0;
+        }
+        if (asJson) {
+            writeln(j.toPrettyString());
+        } else {
+            writefln("Caddyfile:   %s%s", cfPath, detected.found ? " (service " ~ detected.service ~ ")" : "");
+            writefln("Parsed:      %s%s", r.parsed ? "yes" : "NO", r.parsed ? format!" (%u file(s), %s)"(r.filesRead, r.crlf ? "CRLF" : "LF") : " - " ~ r.parseError);
+            foreach (sa; r.sites) writefln("  site %-40s port %-5s bind %s", sa.raw, sa.port == 0 ? "?" : to!string(sa.port), sa.binds.length ? sa.binds.join(",") : "(all)");
+            foreach (c; cs) writefln("  conflict: %s", c);
+            writefln("Verdict:     %s (%s)", integrable ? "integrate into this Caddy" : "use isolated hikari-caddy", reason);
+        }
+        return 0;
+    }
+
+    if (cfPath.length == 0) {
+        stderr.writeln("hikari caddy ", sub, ": no existing Caddy service detected; pass --caddyfile <path>");
+        return 2;
+    }
+    IntegrateOptions o;
+    o.caddyfile = cfPath;
+    o.caddyBin = caddyBin;
+    o.fqdn = fqdn;
+    o.ip = tsIp;
+    o.port = port;
+    o.loopbackPort = cfg.listen.loopback_port;
+    o.basePath = cfg.listen.base_path;
+    o.webDir = getFlagValue(args, "--web-dir", cfg.paths.web_dir);
+    o.dryRun = hasFlag(args, "--dry-run");
+    o.reload = hasFlag(args, "--reload") || cfg.caddy.reload;
+    if (sub == "unintegrate" && hasRecord && record.caddyfile == cfPath) {
+        o.service = record.service;
+        o.manager = record.manager;
+    }
+    if (detected.found && detected.caddyfile == cfPath) {
+        o.service = detected.service;
+        o.manager = detected.manager;
+        if (sub == "integrate" && detected.note.length > 0) {
+            stderr.writeln("hikari caddy integrate: not integrating: ", detected.note);
+            return 1;
+        }
+    }
+    auto res = sub == "integrate" ? integrate(o) : unintegrate(o);
+    if (res.ok && !o.dryRun) {
+        try {
+            if (sub == "integrate") {
+                import std.datetime.systime : Clock;
+                IntegrationRecord rec;
+                rec.mode = res.mode;
+                rec.caddyfile = resolveRealPath(cfPath);
+                rec.siteFile = res.siteFile;
+                rec.service = o.service;
+                rec.manager = o.manager;
+                rec.caddyBin = caddyBin;
+                rec.integratedAt = Clock.currTime().toUnixTime();
+                saveIntegrationRecord(stateDir, rec);
+            } else {
+                removeIntegrationRecord(stateDir);
+            }
+        } catch (Exception e) {
+            stderr.writeln("warning: could not update ", integrationRecordPath(stateDir), ": ", e.msg);
+        }
+    }
+    if (asJson) {
+        JSONValue j = JSONValue(string[string].init);
+        j["ok"] = res.ok;
+        j["changed"] = res.changed;
+        j["mode"] = res.mode;
+        j["message"] = res.message;
+        j["verified"] = res.verified;
+        j["site_file"] = res.siteFile;
+        j["backup"] = res.backup;
+        j["problems"] = res.problems;
+        j["reload"] = res.reloadNote;
+        writeln(j.toPrettyString());
+    } else {
+        if (res.diff.length > 0 && (o.dryRun || res.changed)) stdout.write(res.diff);
+        writeln(res.message);
+        if (res.reloadNote.length > 0) writeln(res.reloadNote);
+        foreach (pr; res.problems) writeln("  - ", pr);
+    }
+    return res.ok ? 0 : 1;
+}
+
 private int cmdCaddy(string[] args) {
     if (args.length == 0) {
-        stderr.writeln("Usage: hikari caddy <render|snippet> [options]");
+        stderr.writeln("Usage: hikari caddy <render|snippet|inspect|integrate|unintegrate|status|reload> [options]");
         return 2;
     }
     string sub = args[0];
@@ -364,6 +601,10 @@ private int cmdCaddy(string[] args) {
             return 1;
         }
         return 0;
+    }
+
+    if (sub == "inspect" || sub == "integrate" || sub == "unintegrate" || sub == "status" || sub == "reload") {
+        return cmdCaddyIntegration(sub, args, cfg);
     }
 
     if (sub == "snippet") {

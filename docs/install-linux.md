@@ -11,7 +11,16 @@ This guide covers installing, repairing, updating, and uninstalling **hikari** o
 
 ## Caddy Resolution Policy
 
-hikari **never** modifies, restarts, or deletes an existing system Caddy configuration or `caddy.service`:
+`--caddy-mode` decides how hikari is served. It defaults to `caddy.mode` in `config.json`, else `auto`:
+
+- **`auto` (default):** if a `caddy.service` runs a Caddyfile and every safety check passes, hikari **joins it**. It appends one marked `import hikari.caddy` block and writes `hikari.caddy` next to that Caddyfile. The change is verified with `caddy adapt`, a backup is kept, and removal restores the file byte for byte. If anything is uncertain, hikari falls back to the isolated `hikari-caddy` below; the installer's plan shows which, and why. See [caddy-integration.md](caddy-integration.md).
+- **`integrate`:** join the existing Caddy or stop before changing anything.
+- **`isolated`:** never touch an existing Caddy; always run `hikari-caddy`.
+- **`snippet`** (same as `--snippet-only`): only write a snippet for manual import.
+
+hikari never restarts, stops or deletes an existing `caddy.service`. When it joins one, that Caddy is reloaded only with `--reload` (`systemctl reload caddy`); otherwise the installer prints the command. Switching modes on a later `--repair` reverses the previous choice first: from joined to isolated restores the user's Caddyfile; from isolated to joined removes `hikari-caddy.service` before the reload.
+
+For the isolated instance, the binary is chosen as follows:
 
 - **`--caddy-source=auto` (default):** If a compatible `caddy` binary is already on `PATH`, `hikari-caddy.service` invokes that binary with its own isolated `/etc/hikari/Caddyfile` (`admin off`, `auto_https disable_redirects`, storage in `/var/lib/hikari/caddy`, bound exclusively to the Tailscale IP). If Caddy is absent, hikari downloads a verified, SHA-256-pinned Caddy binary to `/opt/hikari/bin/caddy`.
 - **`--caddy-source=private`:** Always installs/uses the private pinned binary in `/opt/hikari/bin/caddy`.

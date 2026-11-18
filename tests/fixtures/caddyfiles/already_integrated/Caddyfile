@@ -1,0 +1,7 @@
+example.com {
+	respond ok
+}
+
+# BEGIN hikari (managed; remove with `hikari caddy unintegrate`)
+import hikari.caddy
+# END hikari

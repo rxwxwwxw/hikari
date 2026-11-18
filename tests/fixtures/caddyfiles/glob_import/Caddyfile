@@ -1,0 +1,5 @@
+{
+	email ops@example.com
+}
+
+import sites/*.caddy

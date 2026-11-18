@@ -158,7 +158,7 @@ class RefreshCoordinator {
                     }
                 }
 
-                if (!e.inFlight && (forceRefresh || nowMono >= e.backoffUntilMonoNs)) {
+                if (canStartLocked(e, nowMono, forceRefresh)) {
                     startGroupRefreshLocked(g, nowMono);
                 }
             }
@@ -236,7 +236,7 @@ class RefreshCoordinator {
             bool usable = !forceRefresh && store.isUsableStale(ProbeGroup.hardware, nowMono, nowWall);
             auto e = store.groups[ProbeGroup.hardware];
 
-            if (!fresh && !e.inFlight && (forceRefresh || nowMono >= e.backoffUntilMonoNs)) {
+            if (!fresh && canStartLocked(e, nowMono, forceRefresh)) {
                 startGroupRefreshLocked(ProbeGroup.hardware, nowMono);
             }
 
@@ -283,6 +283,16 @@ class RefreshCoordinator {
         }
     }
 
+    /// A new worker may start only when no earlier worker for the group is still
+    /// running (even one already reaped as timed out) and backoff has elapsed.
+    /// This bounds collector threads to one per probe group: a probe stuck in the
+    /// kernel (NFS statvfs, WMI, a GPU driver) cannot accumulate threads, and the
+    /// backend never runs two collectors of the same group concurrently.
+    private static bool canStartLocked(const ref GroupCacheEntry e, long nowMono, bool forceRefresh) pure nothrow @safe {
+        if (e.inFlight || e.workerAlive) return false;
+        return forceRefresh || nowMono >= e.backoffUntilMonoNs;
+    }
+
     private void reapTimedOutLocked(ProbeGroup g, long nowMono) {
         auto e = store.groups[g];
         if (!e.inFlight) return;
@@ -308,6 +318,7 @@ class RefreshCoordinator {
     private void startGroupRefreshLocked(ProbeGroup g, long nowMono) {
         auto e = store.groups[g];
         e.inFlight = true;
+        e.workerAlive = true;
         e.lastAttemptMonoNs = nowMono;
         e.inFlightStartedMonoNs = nowMono;
         ulong launchGen = e.generation;
@@ -320,7 +331,19 @@ class RefreshCoordinator {
         worker.start();
     }
 
+    private void clearWorkerAlive(ProbeGroup g) {
+        synchronized (mtx) {
+            auto e = store.groups[g];
+            e.workerAlive = false;
+            store.groups[g] = e;
+            cond.notifyAll();
+        }
+    }
+
     private void runProbe(ProbeGroup g, ulong expectedGen) {
+        // (A helper call rather than `synchronized` inside scope(exit): LDC's
+        // Windows funclet EH miscompiles nested synchronized in cleanup blocks.)
+        scope (exit) clearWorkerAlive(g);
         try {
             final switch (g) {
                 case ProbeGroup.fast:

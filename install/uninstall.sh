@@ -4,9 +4,12 @@ set -euo pipefail
 # hikari Unix uninstaller (Linux systemd & macOS LaunchDaemons)
 # Removes only hikari-owned binaries and system units/plists.
 # Preserves Tailscale, existing system/Homebrew Caddy, and user config/state unless --purge is passed.
+# If hikari was joined into an existing Caddy, its marked block and site file are removed first
+# (the Caddyfile is restored byte for byte); that Caddy is reloaded only with --reload.
 
 DRY_RUN=0
 PURGE=0
+RELOAD_CADDY=0
 ROOT_PREFIX=""
 SYSTEMD_MODE="auto"
 TARGET_OS="auto"
@@ -18,6 +21,7 @@ Usage: install/uninstall.sh [options]
 Options:
   --dry-run                        Print planned removals without changing files
   --purge                          Also delete config, nodes.json, and Caddy cert store
+  --reload                         Reload the existing Caddy hikari was joined into after removing it
   --root <dir>                     Operate under target root directory (for staging tests)
   --target-os=<auto|linux|macos>   Target OS layout (default: auto via uname -s)
   --systemd-mode=<auto|skip>       Manage systemd/launchd or skip activation calls (default: auto)
@@ -30,6 +34,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --purge) PURGE=1; shift ;;
+    --reload) RELOAD_CADDY=1; shift ;;
     --root=*) ROOT_PREFIX="${1#*=}"; shift ;;
     --root) ROOT_PREFIX="${2:?}"; shift 2 ;;
     --target-os=*) TARGET_OS="${1#*=}"; shift ;;
@@ -65,6 +70,30 @@ remove_path() {
     fi
   fi
 }
+
+# Undo an integration into an existing Caddy before hikari's binary is removed.
+if [ "$TARGET_OS" = "macos" ]; then
+  U_ETC="${ROOT_PREFIX}/Library/Application Support/hikari"
+  U_VAR="${ROOT_PREFIX}/Library/Application Support/hikari/state"
+else
+  U_ETC="${ROOT_PREFIX}/etc/hikari"
+  U_VAR="${ROOT_PREFIX}/var/lib/hikari"
+fi
+if [ -f "$U_VAR/caddy-integration.json" ]; then
+  HIKARI_BIN="$OPT_HIKARI/versions/current/hikari"
+  if [ ! -x "$HIKARI_BIN" ]; then
+    echo "hikari is joined into an existing Caddy but $HIKARI_BIN is missing; reinstall, or remove the '# BEGIN hikari' block by hand, then re-run." >&2
+    exit 1
+  fi
+  UN_ARGS=(caddy unintegrate --config "$U_ETC/config.json" --state-dir "$U_VAR")
+  [ "$DRY_RUN" -eq 1 ] && UN_ARGS+=(--dry-run)
+  [ "$RELOAD_CADDY" -eq 1 ] && UN_ARGS+=(--reload)
+  if ! UN_OUT=$("$HIKARI_BIN" "${UN_ARGS[@]}" 2>&1); then
+    echo "Could not remove hikari from the existing Caddy; nothing was uninstalled. $UN_OUT" >&2
+    exit 1
+  fi
+  echo "$UN_OUT"
+fi
 
 if [ "$TARGET_OS" = "macos" ]; then
   ETC_HIKARI="${ROOT_PREFIX}/Library/Application Support/hikari"

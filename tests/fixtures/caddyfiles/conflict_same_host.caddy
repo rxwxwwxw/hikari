@@ -1,0 +1,3 @@
+box.tail1234.ts.net:9100 {
+	respond "already here"
+}

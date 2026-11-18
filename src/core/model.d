@@ -303,10 +303,21 @@ struct NodeRecord {
     bool hidden = false;
 }
 
+/// Background peer-validation state reported by GET /api/v1/nodes.
+struct DiscoveryMeta {
+    bool running = false;
+    Nullable!long last_started_at;
+    Nullable!long last_finished_at;
+    /// Tailscale status read failed (stale or unavailable view of peers).
+    bool tailscale_available = true;
+}
+
 struct NodesResponse {
     int schema_version = SCHEMA_VERSION;
     long generated_at;
     NodeRecord[] nodes;
+    /// Set only on API responses; never persisted to nodes.json.
+    Nullable!DiscoveryMeta discovery;
 }
 
 struct InfoResponse {

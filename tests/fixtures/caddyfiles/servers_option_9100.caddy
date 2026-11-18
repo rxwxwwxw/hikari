@@ -1,0 +1,9 @@
+{
+	servers :9100 {
+		protocols h1 h2
+	}
+}
+
+example.com {
+	respond ok
+}

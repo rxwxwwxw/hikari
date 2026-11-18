@@ -94,6 +94,27 @@ string renderCaddyfile(
     return rendered;
 }
 
+/// The site block hikari adds to an *existing* Caddy (written to its own file, imported
+/// by the operator's Caddyfile). It relies on none of the operator's global options:
+/// explicit bind and Tailscale certificates work even with `auto_https off`.
+string renderIntegratedSite(string fqdn, ushort tailnetPort, string tailscaleIp, ushort loopbackPort, string basePath, string webDir) @trusted {
+    import caddyfile.edit : SITE_FILE_HEADER;
+    if (tailscaleIp.length == 0) throw new Exception("Refusing to render a site without a Tailscale IP (never bind all interfaces)");
+    if (fqdn.length == 0) throw new Exception("Refusing to render a site without a MagicDNS FQDN");
+    auto bp = normalizeBasePath(basePath);
+    string apiPattern = (bp == "/") ? "/api/v1/*" : (bp ~ "/api/v1/*");
+    string web = webDir.replace("\\", "/");
+    string s = SITE_FILE_HEADER ~ "\n";
+    s ~= "https://" ~ fqdn ~ ":" ~ to!string(tailnetPort) ~ " {\n";
+    s ~= "\tbind " ~ tailscaleIp ~ "\n";
+    s ~= "\ttls {\n\t\tget_certificate tailscale\n\t}\n\n";
+    s ~= "\thandle " ~ apiPattern ~ " {\n\t\treverse_proxy 127.0.0.1:" ~ to!string(loopbackPort) ~ "\n\t}\n\n";
+    if (bp == "/") s ~= "\thandle {\n";
+    else s ~= "\thandle_path " ~ bp ~ "/* {\n";
+    s ~= "\t\troot * \"" ~ web ~ "\"\n\t\tfile_server\n\t}\n}\n";
+    return s;
+}
+
 /// Windows services have no console or journal, so the isolated Caddy writes its own
 /// size-rotated log next to hikari's (<ProgramData>/hikari/logs/caddy.log). On Linux and
 /// macOS this renders empty and logs keep going to journald/launchd.

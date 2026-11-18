@@ -5,7 +5,14 @@ INSTALL_ARGS=("$@")
 # hikari Unix system installer (Linux systemd & macOS LaunchDaemons)
 # Linux: Fedora/dnf, Arch/CachyOS/pacman, Ubuntu/Mint/Armbian/Debian/apt
 # macOS: Intel x86_64 & Apple Silicon arm64 system-domain LaunchDaemons
-# Guarantees: non-destructive, idempotent, isolated hikari-caddy, preserves existing Caddy & Tailscale.
+# Guarantees: non-destructive, idempotent, preserves Tailscale and every other service.
+# Caddy modes (--caddy-mode, default from config.json caddy.mode, else auto):
+#   auto       join an existing Caddy service when every safety check passes (one marked import
+#              line + a hikari-owned site file, verified with `caddy adapt`), else isolated
+#   integrate  join an existing Caddy or fail before changing anything
+#   isolated   run hikari's own isolated hikari-caddy; never touch an existing Caddy
+#   snippet    only write an importable snippet (same as --snippet-only)
+# An existing Caddy is reloaded only with --reload; otherwise the reload command is printed.
 
 CADDY_PINNED_VERSION="2.9.1"
 CADDY_SHA512_LINUX_AMD64="0412057ba591c33bdb66034d7f32209619ce635147dac3084c79abcbc118a761145e695199f57c6798d88fab077f2b0d9cb999f52ded904c6d464a4eba202932"
@@ -16,6 +23,10 @@ CADDY_SHA512_MAC_ARM64="246b4ab9755b584f81db37b640af806161da9e292277b17f4fa4f3da
 DRY_RUN=0
 REPAIR=0
 SNIPPET_ONLY=0
+CADDY_MODE=""          # auto | integrate | isolated | snippet (empty: config.json, else auto)
+RELOAD_CADDY=0
+EXISTING_CADDYFILE=""  # test/override: use this Caddyfile instead of detecting the Caddy service
+EXISTING_CADDY_BIN=""
 CADDY_SOURCE="auto" # auto | private | system-package | existing
 TAILNET_PORT="9100"
 LOOPBACK_PORT="19100"
@@ -41,7 +52,11 @@ Usage: install/install.sh [options]
 Options:
   --dry-run                         Show planned changes without modifying files or services
   --repair                          Reconcile generated units and Caddyfile; preserve user config/state
-  --snippet-only                    Write hikari-snippet.caddy only (no hikari-caddy service)
+  --snippet-only                    Write hikari-snippet.caddy only (same as --caddy-mode=snippet)
+  --caddy-mode=<mode>               auto (default) | integrate | isolated | snippet
+  --reload                          Reload an existing Caddy after joining it (else print the command)
+  --existing-caddyfile <path>       Use this existing Caddyfile instead of detecting the Caddy service
+  --existing-caddy-bin <path>       caddy binary used to verify changes to the existing Caddyfile
   --caddy-source=<mode>             auto (default) | private | system-package | existing
   --target-os=<auto|linux|macos>    Target OS layout (default: auto via uname -s)
   --tailnet-port <port>             Tailnet HTTPS port (default: 9100)
@@ -67,6 +82,13 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1; shift ;;
     --repair) REPAIR=1; shift ;;
     --snippet-only) SNIPPET_ONLY=1; shift ;;
+    --caddy-mode=*) CADDY_MODE="${1#*=}"; shift ;;
+    --caddy-mode) CADDY_MODE="${2:?}"; shift 2 ;;
+    --reload) RELOAD_CADDY=1; shift ;;
+    --existing-caddyfile=*) EXISTING_CADDYFILE="${1#*=}"; shift ;;
+    --existing-caddyfile) EXISTING_CADDYFILE="${2:?}"; shift 2 ;;
+    --existing-caddy-bin=*) EXISTING_CADDY_BIN="${1#*=}"; shift ;;
+    --existing-caddy-bin) EXISTING_CADDY_BIN="${2:?}"; shift 2 ;;
     --caddy-source=*) CADDY_SOURCE="${1#*=}"; shift ;;
     --caddy-source) CADDY_SOURCE="${2:?}"; shift 2 ;;
     --target-os=*) TARGET_OS="${1#*=}"; shift ;;
@@ -110,6 +132,11 @@ fi
 case "$TARGET_OS" in
   linux|macos) ;;
   *) echo "Invalid --target-os: $TARGET_OS" >&2; exit 2 ;;
+esac
+
+case "$CADDY_MODE" in
+  ""|auto|integrate|isolated|snippet) ;;
+  *) echo "Invalid --caddy-mode: $CADDY_MODE" >&2; exit 2 ;;
 esac
 
 case "$CADDY_SOURCE" in
@@ -384,6 +411,8 @@ try:
 except Exception:
     print("", "")
 ' <<< "$TS_JSON") || true
+  TS_FQDN="${TS_FQDN//$'\r'/}"
+  TS_IP="${TS_IP//$'\r'/}"
 fi
 
 # Serialize activation, dependency provisioning and account creation with updates.
@@ -392,7 +421,66 @@ if [ "$DRY_RUN" -eq 0 ] && [ "${HIKARI_INSTALL_LOCKED:-0}" != 1 ]; then
     bash "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
 fi
 
-# 5. Caddy binary resolution (never modify pre-existing Caddy service/config or brew services!)
+# 4b. Caddy mode: explicit flag > operator config > auto. Then hikari's own read-only analysis
+#     of any existing Caddy (nothing is changed here).
+CONFIG_PATH="$ETC_HIKARI/config.json"
+INTEGRATION_RECORD="$VAR_HIKARI/caddy-integration.json"
+WAS_INTEGRATED=0
+[ -f "$INTEGRATION_RECORD" ] && WAS_INTEGRATED=1
+EFFECTIVE_CADDY_MODE="auto"
+if [ -f "$CONFIG_PATH" ] && command -v python3 >/dev/null 2>&1; then
+  read -r CFG_CADDY_MODE CFG_CADDY_RELOAD < <(python3 -c '
+import json, sys
+try:
+    c = json.load(open(sys.argv[1])).get("caddy") or {}
+    print(c.get("mode") or "auto", 1 if c.get("reload") else 0)
+except Exception:
+    print("auto", 0)
+' "$CONFIG_PATH") || true
+  EFFECTIVE_CADDY_MODE="${CFG_CADDY_MODE:-auto}"
+  [ "${CFG_CADDY_RELOAD:-0}" = "1" ] && RELOAD_CADDY=1
+fi
+[ -n "$CADDY_MODE" ] && EFFECTIVE_CADDY_MODE="$CADDY_MODE"
+[ "$SNIPPET_ONLY" -eq 1 ] && EFFECTIVE_CADDY_MODE="snippet"
+[ "$EFFECTIVE_CADDY_MODE" = "snippet" ] && SNIPPET_ONLY=1
+
+CADDY_DECISION="isolated"
+CADDY_DECISION_REASON=""
+INTEGRATE_CADDYFILE=""
+if [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrate" ]; then
+  if [ -n "$ROOT_PREFIX" ] && [ -z "$EXISTING_CADDYFILE" ]; then
+    CADDY_DECISION_REASON="existing-Caddy detection is disabled under --root (pass --existing-caddyfile to test integration)"
+  else
+    PROBE_BIN="$BINARY_SOURCE"
+    PROBE_DIR=""
+    if [[ "$BINARY_SOURCE" == *.tar.gz ]] || [[ "$BINARY_SOURCE" == *.tgz ]]; then
+      PROBE_DIR=$(mktemp -d)
+      tar -xzf "$BINARY_SOURCE" -C "$PROBE_DIR" hikari
+      PROBE_BIN="$PROBE_DIR/hikari"
+    fi
+    INSPECT_ARGS=(caddy inspect --verdict --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI" --port "$TAILNET_PORT")
+    [ -n "$TS_FQDN" ] && INSPECT_ARGS+=(--fqdn "$TS_FQDN")
+    [ -n "$TS_IP" ] && INSPECT_ARGS+=(--tailscale-ip "$TS_IP")
+    [ -n "$EXISTING_CADDYFILE" ] && INSPECT_ARGS+=(--caddyfile "$EXISTING_CADDYFILE")
+    [ -n "$EXISTING_CADDY_BIN" ] && INSPECT_ARGS+=(--caddy "$EXISTING_CADDY_BIN")
+    VERDICT=$("$PROBE_BIN" "${INSPECT_ARGS[@]}" 2>&1 | grep -E '^(integrate |isolated:)' | head -n 1 || true)
+    [ -n "$PROBE_DIR" ] && rm -rf "$PROBE_DIR"
+    case "$VERDICT" in
+      "integrate "*) CADDY_DECISION="integrate"; INTEGRATE_CADDYFILE="${VERDICT#integrate }" ;;
+      "isolated:"*) CADDY_DECISION_REASON="${VERDICT#isolated: }" ;;
+      *) CADDY_DECISION_REASON="inspection failed" ;;
+    esac
+  fi
+  if [ "$EFFECTIVE_CADDY_MODE" = "integrate" ] && [ "$CADDY_DECISION" != "integrate" ]; then
+    echo "--caddy-mode=integrate: cannot join the existing Caddy ($CADDY_DECISION_REASON). Nothing was changed." >&2
+    exit 1
+  fi
+elif [ "$EFFECTIVE_CADDY_MODE" = "isolated" ]; then
+  CADDY_DECISION_REASON="caddy mode is 'isolated'"
+fi
+
+# 5. Caddy binary for the isolated instance (an existing Caddy binary is used read-only; its
+#    service and config are never touched in isolated mode).
 RESOLVED_CADDY_BIN=""
 CADDY_ORIGIN="none"
 
@@ -478,7 +566,7 @@ install_private_caddy() {
   CADDY_ORIGIN="private"
 }
 
-if [ "$SNIPPET_ONLY" -eq 0 ]; then
+resolve_isolated_caddy() {
   case "$CADDY_SOURCE" in
     auto)
       if ! detect_existing_caddy; then
@@ -529,6 +617,10 @@ if [ "$SNIPPET_ONLY" -eq 0 ]; then
       fi
       ;;
   esac
+}
+
+if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$CADDY_DECISION" = "isolated" ]; then
+  resolve_isolated_caddy
 fi
 
 echo "=== hikari ($TARGET_OS) Install Plan ==="
@@ -537,7 +629,18 @@ echo "  Target root:    ${ROOT_PREFIX:-/}"
 echo "  Release dir:    $VERSIONS_DIR"
 echo "  Config dir:     $ETC_HIKARI (existing user config preserved)"
 echo "  State dir:      $VAR_HIKARI (existing nodes/hardware/certs preserved)"
-echo "  Mode:           $([ "$SNIPPET_ONLY" -eq 1 ] && echo 'snippet-only' || echo 'isolated hikari + hikari-caddy')"
+if [ "$SNIPPET_ONLY" -eq 1 ]; then
+  echo "  Caddy:          snippet only (nothing imported or reloaded)"
+elif [ "$CADDY_DECISION" = "integrate" ]; then
+  echo "  Caddy:          join existing Caddy: one marked import line appended to $INTEGRATE_CADDYFILE + hikari-owned site file"
+  echo "                  (verified with caddy adapt, backup kept; reload: $([ "$RELOAD_CADDY" -eq 1 ] && echo yes || echo 'no - command printed'))"
+  if [ -f "$UNIT_DIR/hikari-caddy.service" ] || [ -f "$UNIT_DIR/io.hikari.caddy.plist" ]; then
+    echo "                  the isolated hikari-caddy service will be removed (its port moves to the existing Caddy)"
+  fi
+else
+  echo "  Caddy:          isolated hikari-caddy${CADDY_DECISION_REASON:+ ($CADDY_DECISION_REASON)}"
+  [ "$WAS_INTEGRATED" -eq 1 ] && echo "                  hikari's block is first removed from the previously joined Caddy (restored byte for byte)"
+fi
 echo "  Ports:          tailnet=$TAILNET_PORT loopback=127.0.0.1:$LOOPBACK_PORT base_path=$BASE_PATH"
 echo "  Caddy binary:   ${RESOLVED_CADDY_BIN:-none} ($CADDY_ORIGIN)"
 echo "  Tailscale FQDN: ${TS_FQDN:-<not yet detected>} (IP: ${TS_IP:-<none>})"
@@ -613,8 +716,15 @@ activate_install_release() {
   python3 "$REPO_ROOT/install/activate-release.py" begin "$VERSIONS_DIR" "$APP_VERSION"
 }
 
+# Seed the agent's last-known MagicDNS name (hikari-owned state, refreshed by the
+# agent itself); used for Host validation while `tailscale status` is unreadable.
+case "$TS_FQDN" in
+  ''|*[!A-Za-z0-9.-]*) ;;
+  *) mkdir -p "$VAR_HIKARI" && printf '%s
+' "$TS_FQDN" > "$VAR_HIKARI/local_fqdn" ;;
+esac
+
 # 8. Write default config.json ONLY if missing
-CONFIG_PATH="$ETC_HIKARI/config.json"
 if [ ! -f "$CONFIG_PATH" ]; then
   if [ -n "$TRUST_PUBKEY" ]; then
     cp "$TRUST_PUBKEY" "$ETC_HIKARI/release-public-key.pem"
@@ -669,6 +779,10 @@ if [ ! -f "$CONFIG_PATH" ]; then
     "expose_serials": false,
     "expose_mac_addresses": false
   },
+  "caddy": {
+    "mode": "${EFFECTIVE_CADDY_MODE}",
+    "reload": $([ "$RELOAD_CADDY" -eq 1 ] && echo true || echo false)
+  },
   "paths": {
     "state_dir": "${REAL_VAR_HIKARI}",
     "config_dir": "${REAL_ETC_HIKARI}",
@@ -683,7 +797,38 @@ else
   log "Preserved existing user configuration at $CONFIG_PATH"
 fi
 
-# 9. Render hikari-owned Caddy config or snippet
+# 9. Join the existing Caddy, or render hikari-owned Caddy config or snippet
+INTEGRATED=0
+if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$CADDY_DECISION" = "integrate" ]; then
+  INT_ARGS=(caddy integrate --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI" --port "$TAILNET_PORT")
+  [ -n "$TS_FQDN" ] && INT_ARGS+=(--fqdn "$TS_FQDN")
+  [ -n "$TS_IP" ] && INT_ARGS+=(--tailscale-ip "$TS_IP")
+  [ -n "$INTEGRATE_CADDYFILE" ] && INT_ARGS+=(--caddyfile "$INTEGRATE_CADDYFILE")
+  [ -n "$EXISTING_CADDY_BIN" ] && INT_ARGS+=(--caddy "$EXISTING_CADDY_BIN")
+  if INT_OUT=$("$REL_DIR/hikari" "${INT_ARGS[@]}" 2>&1); then
+    INTEGRATED=1
+    log "Joined existing Caddy: $(echo "$INT_OUT" | tr '\n' ' ')"
+  elif [ "$EFFECTIVE_CADDY_MODE" = "integrate" ]; then
+    echo "Could not join the existing Caddy: $INT_OUT" >&2
+    exit 1
+  else
+    log "Not joining the existing Caddy ($(echo "$INT_OUT" | tail -n 1)); using the isolated hikari-caddy instead"
+    CADDY_DECISION="isolated"
+    resolve_isolated_caddy
+  fi
+fi
+
+if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$CADDY_DECISION" = "isolated" ] && [ "$WAS_INTEGRATED" -eq 1 ]; then
+  # Switching back to isolated: remove hikari's block from the previously joined Caddy first.
+  UN_ARGS=(caddy unintegrate --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI")
+  [ "$RELOAD_CADDY" -eq 1 ] && UN_ARGS+=(--reload)
+  if ! UN_OUT=$("$REL_DIR/hikari" "${UN_ARGS[@]}" 2>&1); then
+    echo "Could not remove hikari from the previously joined Caddy: $UN_OUT" >&2
+    exit 1
+  fi
+  log "Removed hikari from the previously joined Caddy: $(echo "$UN_OUT" | tr '\n' ' ')"
+fi
+
 if [ "$SNIPPET_ONLY" -eq 1 ]; then
   SNIPPET_PATH="$ETC_HIKARI/hikari-snippet.caddy"
   "$REL_DIR/hikari" caddy snippet \
@@ -691,6 +836,8 @@ if [ "$SNIPPET_ONLY" -eq 1 ]; then
     --template "$REL_DIR/caddy/snippet.caddy.tmpl" \
     --out "$SNIPPET_PATH"
   log "Generated Caddy import snippet at $SNIPPET_PATH"
+elif [ "$INTEGRATED" -eq 1 ]; then
+  : # the existing Caddy serves hikari; no isolated Caddyfile needed
 else
   if [ -n "$TS_FQDN" ] && [ -n "$TS_IP" ]; then
     CADDYFILE_PATH="$ETC_HIKARI/Caddyfile"
@@ -787,7 +934,16 @@ EOF
 EOF
   chmod 0644 "$UNIT_DIR/io.hikari.agent.plist"
 
-  if [ "$SNIPPET_ONLY" -eq 0 ]; then
+  if [ "$INTEGRATED" -eq 1 ] && [ -f "$UNIT_DIR/io.hikari.caddy.plist" ]; then
+    # Switched to the existing Caddy: free the tailnet port before any reload.
+    if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
+      launchctl bootout system/io.hikari.caddy 2>/dev/null || true
+    fi
+    rm -f "$UNIT_DIR/io.hikari.caddy.plist"
+    log "Removed the isolated hikari-caddy LaunchDaemon (switched to the existing Caddy)"
+  fi
+
+  if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
     RESOLVED_CADDY_XML=$(printf '%s' "$RESOLVED_CADDY_BIN" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
     cat > "$UNIT_DIR/io.hikari.caddy.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -854,13 +1010,13 @@ EOF
     chmod 0600 "$LOG_DIR/"*.log
     /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.recover.plist"
     /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.agent.plist"
-    if [ "$SNIPPET_ONLY" -eq 0 ]; then /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.caddy.plist"; fi
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.caddy.plist"; fi
   fi
   activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system/io.hikari.agent 2>/dev/null || true
     launchctl bootstrap system "$UNIT_DIR/io.hikari.agent.plist"
-    if [ "$SNIPPET_ONLY" -eq 0 ]; then
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
       launchctl bootout system/io.hikari.caddy 2>/dev/null || true
       launchctl bootstrap system "$UNIT_DIR/io.hikari.caddy.plist"
     fi
@@ -895,7 +1051,16 @@ LimitNOFILE=4096
 WantedBy=multi-user.target
 EOF
 
-  if [ "$SNIPPET_ONLY" -eq 0 ]; then
+  if [ "$INTEGRATED" -eq 1 ] && [ -f "$UNIT_DIR/hikari-caddy.service" ]; then
+    # Switched to the existing Caddy: free the tailnet port before any reload.
+    if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now hikari-caddy.service 2>/dev/null || true
+    fi
+    rm -f "$UNIT_DIR/hikari-caddy.service"
+    log "Removed the isolated hikari-caddy unit (switched to the existing Caddy)"
+  fi
+
+  if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
     cat > "$UNIT_DIR/hikari-caddy.service" <<EOF
 [Unit]
 Description=hikari isolated Tailscale HTTPS reverse proxy (Caddy)
@@ -927,7 +1092,7 @@ EOF
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now hikari.service
-    if [ "$SNIPPET_ONLY" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
       systemctl enable --now hikari-caddy.service
     fi
     log "Enabled and started hikari systemd units"
@@ -944,6 +1109,24 @@ elif [ "$SYSTEMD_MODE" = "auto" ]; then
   python3 "$REPO_ROOT/install/activate-release.py" health-confirm "$VERSIONS_DIR" "$APP_VERSION" "$CONFIG_PATH"
 fi
 
+# 11. Reload the existing Caddy only when asked (after hikari-caddy released the port).
+if [ "$INTEGRATED" -eq 1 ]; then
+  if [ "$RELOAD_CADDY" -eq 1 ]; then
+    set +e
+    RL_OUT=$("$REL_DIR/hikari" caddy reload --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI" 2>&1)
+    RL_CODE=$?
+    set -e
+    if [ "$RL_CODE" -eq 1 ]; then
+      "$REL_DIR/hikari" caddy unintegrate --config "$CONFIG_PATH" --state-dir "$VAR_HIKARI" --reload >/dev/null 2>&1 || true
+      echo "Reloading the existing Caddy failed ($RL_OUT); hikari's change was removed again. Re-run with --caddy-mode=isolated to use hikari's own Caddy." >&2
+      exit 1
+    fi
+    log "$RL_OUT"
+  else
+    log "$(echo "$INT_OUT" | grep -E '^not reloaded' || true)"
+  fi
+fi
+
 # 12. Final operator report
 echo ""
 echo "=== hikari installation complete ($TARGET_OS) ==="
@@ -952,6 +1135,11 @@ echo "  Loopback API:     http://127.0.0.1:${LOOPBACK_PORT}/healthz"
 if [ "$SNIPPET_ONLY" -eq 1 ]; then
   echo "  Caddy snippet:    $ETC_HIKARI/hikari-snippet.caddy"
   echo "  Action needed:    Add 'import ${REAL_ETC_HIKARI}/hikari-snippet.caddy' inside your existing Caddy site block."
+elif [ "$INTEGRATED" -eq 1 ]; then
+  echo "  Caddy:            joined existing Caddy ($INTEGRATE_CADDYFILE); undo with uninstall.sh or 'hikari caddy unintegrate'"
+  if [ -n "$TS_FQDN" ]; then
+    echo "  Dashboard URL:    https://${TS_FQDN}:${TAILNET_PORT}${BASE_PATH%/}/"
+  fi
 else
   echo "  Caddy executable: $RESOLVED_CADDY_BIN ($CADDY_ORIGIN)"
   echo "  Caddy config:     $ETC_HIKARI/Caddyfile"

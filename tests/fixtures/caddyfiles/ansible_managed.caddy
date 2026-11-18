@@ -1,0 +1,4 @@
+# Ansible managed: do not edit by hand
+example.com {
+	respond ok
+}

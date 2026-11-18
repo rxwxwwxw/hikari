@@ -4,7 +4,13 @@
 
 1. **Loopback-only D listener:** The `hikari` binary binds exclusively to `127.0.0.1` (or `::1`) and validates `loopback_bind` on startup. It never opens a public or tailnet-facing plain HTTP socket.
 2. **Tailscale-IP-only HTTPS proxy (`hikari-caddy`):** The dedicated Caddy instance binds only to the node's Tailscale IP on `listen.tailnet_port` (default `9100`), with `admin off` and `auto_https disable_redirects`. If Tailscale is offline at boot, Caddy does not fall back to `0.0.0.0`.
-3. **Existing service preservation:** Installers, updaters, and `hikari doctor` never modify, reload, or stop pre-existing Caddy or `tailscaled` configurations.
+3. **Existing service preservation:** Installers, updaters, and `hikari doctor` never modify `tailscaled` or unrelated services, and never restart or stop a pre-existing Caddy. The single exception is the verified integration into an existing Caddy (`caddy.mode=auto|integrate`, see [caddy-integration.md](caddy-integration.md)):
+   - one marked import line and a hikari-owned site file, shown in the installer plan before anything is written;
+   - proven with `caddy adapt` to leave every existing server and TLS policy unchanged;
+   - backed up and removable byte for byte;
+   - reloaded only on explicit request.
+
+   Use `caddy.mode=isolated` to keep an existing Caddy completely untouched. When joined, hikari's site is served by that Caddy and inherits its process identity; it still binds only to the Tailscale address.
 
 ## Tailnet Access Control & Certificates
 
@@ -15,9 +21,10 @@
 ## Browser & HTTP Hardening
 
 - **No wildcard CORS:** `Access-Control-Allow-Origin: *` is never emitted. `Origin` headers are validated against same-tailnet MagicDNS FQDNs, known nodes, configured `allowed_origins`, or loopback development origins, echoing the exact authorized origin with `Vary: Origin`.
-- **DNS rebinding protection:** `Host` headers are validated against loopback names and the node's MagicDNS FQDN.
+- **DNS rebinding protection:** `Host` headers are validated against loopback names and the node's MagicDNS FQDN. The last FQDN learned from `tailscale status` (seeded by the installer) is kept in `<state_dir>/local_fqdn`, so validation keeps working while the agent cannot read Tailscale status.
 - **XSS safety:** The dashboard renders all OS-supplied names (hostnames, processes, mounts, hardware strings) strictly via `textContent`, never `innerHTML`, and sanitizes control characters server-side.
-- **No administrative mutations over GET:** Read endpoints are strictly read-only and bounded in request/header size.
+- **No administrative mutations over GET:** Read endpoints are strictly read-only and bounded in request/header size. `?refresh=1` does not force probes over HTTP; forced collection is local CLI only (`hikari snapshot`, `hikari hardware --refresh`). On `/api/v1/nodes`, `?refresh=1` only requests an earlier background peer scan, rate-limited to once per 30 s.
+- **Bounded request work:** requests never wait on the Tailscale CLI (bounded to 5 s, run in the background) or on peer validation (background, once per tailnet TTL; peers Tailscale reports offline and recently identified non-hikari peers are skipped). A probe that hangs past `collection.probe_timeout_ms` is reported as `probe_hung`, and no second collector for that group starts until it returns.
 
 ## Privacy Redaction
 

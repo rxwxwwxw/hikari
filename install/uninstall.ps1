@@ -7,11 +7,15 @@ Stops and removes only the hikari-owned `hikari` and `hikari-caddy` services and
 Preserves config.json and state (node registry, hardware cache, Caddy certificates) unless
 -Purge is given. Never touches Tailscale, a shared/system Caddy, the firewall, or any service
 that hikari did not install. Also removes services left by earlier WinSW-based installs.
+
+If hikari was joined into an existing Caddy, its marked block and site file are removed first
+(the Caddyfile is restored byte for byte). That Caddy is reloaded only with -Reload.
 #>
 [CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$Purge,
+    [switch]$Reload,
     [string]$Root = "",
     [ValidateSet("auto", "skip")]
     [string]$ServiceMode = "auto"
@@ -35,6 +39,26 @@ if ($ManageServices -and -not $DryRun) {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw "System uninstall requires Administrator privileges (or pass -DryRun / -Root)."
     }
+}
+
+# Undo an integration into an existing Caddy before removing hikari's binary.
+$IntegrationRecord = Join-Path $StateDir "caddy-integration.json"
+if (Test-Path $IntegrationRecord) {
+    if (-not (Test-Path $InstalledExe)) {
+        throw "hikari is joined into an existing Caddy ($IntegrationRecord) but $InstalledExe is missing; reinstall, or remove the '# BEGIN hikari' block by hand, then re-run."
+    }
+    $unArgs = @("caddy", "unintegrate", "--config", $ConfigPath, "--state-dir", $StateDir, "--json")
+    if ($DryRun) { $unArgs += "--dry-run" }
+    if ($Reload) { $unArgs += "--reload" }
+    $ErrorActionPreference = "Continue"
+    $raw = (& $InstalledExe @unArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $ErrorActionPreference = "Stop"
+    $start = $raw.IndexOf("{")
+    $un = if ($start -ge 0) { $raw.Substring($start) | ConvertFrom-Json } else { $null }
+    if (-not $un -or -not $un.ok) {
+        throw "Could not remove hikari from the existing Caddy; nothing was uninstalled. $(if ($un) { $un.message } else { $raw })"
+    }
+    Write-Host "$(if ($DryRun) { '[dry-run] ' })$($un.message). $($un.reload)"
 }
 
 function Get-ServiceOwnership([string]$Name) {

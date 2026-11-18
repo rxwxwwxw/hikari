@@ -1,0 +1,2 @@
+# Caddyfile fixtures are byte-exact test inputs (CRLF, BOM, missing final newline).
+tests/fixtures/caddyfiles/** -text
