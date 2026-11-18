@@ -128,7 +128,7 @@ struct CounterTracker(K) {
     }
 
     void reset() @safe {
-        entries.clear();
+        entries = null;
         currentGen = 0;
     }
 
@@ -170,7 +170,7 @@ class SystemRateState {
         cpuBase = CpuSampleBaseline.init;
         netRxTracker.reset();
         netTxTracker.reset();
-        procEntries.clear();
+        procEntries = null;
         procGen = 0;
     }
 

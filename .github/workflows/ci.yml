@@ -131,7 +131,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install LDC2 and DUB
-        run: brew install ldc dub
+        run: |
+          brew install ldc dub openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
 
       - name: Build debug and release binaries
         run: |
