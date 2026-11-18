@@ -243,6 +243,24 @@ Linux is **done** only when all of the following are true:
 
 ---
 
+### Stage 3 execution record — 2026-11-17
+
+M0–M2 implementation is in progress. These checks do **not** waive the exit gates above.
+See [`docs/testing-macos.md`](docs/testing-macos.md) for commands, interpretation and the real-host matrix.
+
+- [x] Local Apple Silicon debug/release builds, nine native D test modules, browser regression tests, CLI status/hardware smoke, and a measured idle-agent observation.
+- [x] Native Mach/sysctl/libproc/64-bit NIC counters, public battery APIs, sanitized IOKit storage/GPU inventory, and friendly NIC labels exercised on an M1.
+- [x] Rootless installer/repair/uninstall and Caddy-reconciler fixtures; actual pinned-Caddy validation of spaced macOS paths, prefixed routes and the tailnet-only listener.
+- [x] Signed-input verification, immutable releases, failed-health rollback and interrupted-activation recovery exercised through local fixtures.
+- [x] Separate x86_64 release/test binaries linked with official LDC; nine modules pass under existing Rosetta. Native Intel hardware is still a release gate.
+- [ ] Native Intel execution and Linux/Windows regression runs on the updated code.
+- [x] User-run Apple Silicon temporary system LaunchDaemon passed low-privilege startup and crash recovery.
+- [ ] Real installer-account/permission tests and native Intel privileged service test (scripts added; require disposable hosts).
+- [ ] Real Tailscale variant/service-context certificate permissions, a mixed fleet over HTTPS, and preservation of an existing Caddy/Tailscale deployment.
+- [ ] Logout/login-window, reboot, sleep/wake, address-change, full installed-stack idle measurements and signed service-update/rollback gates.
+
+---
+
 ## 4. Test strategy (begin in L0; maintain through all stages)
 
 ### 4.1 Four distinct levels — don't substitute one for another

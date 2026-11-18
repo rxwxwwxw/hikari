@@ -150,14 +150,18 @@ IsaInfo detectHostX86Isa() {
     }
 }
 
-version (AArch64) {
+version (linux) version (AArch64) {
     private extern (C) ulong getauxval(ulong type) nothrow @nogc;
 }
+version (linux) {
+    version (AArch64) private enum nativeLinuxArm64 = true;
+    else private enum nativeLinuxArm64 = false;
+} else private enum nativeLinuxArm64 = false;
 
 IsaInfo detectHostArm64Isa(const string[] procCpuinfoFeatures) {
     IsaInfo isa;
     string[] hw;
-    version (AArch64) {
+    static if (nativeLinuxArm64) {
         enum ulong AT_HWCAP = 16;
         enum ulong AT_HWCAP2 = 26;
         ulong hc = getauxval(AT_HWCAP);

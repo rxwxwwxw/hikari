@@ -36,6 +36,7 @@ class FakePlatformBackend : PlatformBackend {
     // Injectable fault/delay controls for deterministic tests
     bool failCpu = false;
     bool failMemory = false;
+    bool failNetwork = false;
     bool failFilesystems = false;
     bool failGpus = false;
     bool failHardware = false;
@@ -120,11 +121,11 @@ class FakePlatformBackend : PlatformBackend {
         c.state = CapabilityState.ok;
         c.total_ticks = cpuTotalTicks;
         c.idle_ticks = cpuIdleTicks;
-        c.logical_cores = (profile == "arm64-sbc" || profile == "macos-arm64") ? 8 : 24;
+        c.logical_cores = profile == "macos-intel" ? 6 : (profile == "arm64-sbc" || profile == "macos-arm64") ? 8 : 24;
         if (profile != "windows-gaming") {
             c.load_1m = 1.35;
         }
-        if (profile != "vm-minimal" && profile != "windows-gaming" && profile != "macos-arm64") {
+        if (profile != "vm-minimal" && profile != "windows-gaming" && profile != "macos-arm64" && profile != "macos-intel") {
             c.temp_c = 49.5;
         }
         return c;
@@ -142,6 +143,11 @@ class FakePlatformBackend : PlatformBackend {
         if (profile == "arm64-sbc") {
             m.total_bytes = 8589934592UL;
             m.used_bytes = 2147483648UL;
+            m.swap_total_bytes = 0;
+            m.swap_used_bytes = 0;
+        } else if (profile == "macos-intel" || profile == "macos-arm64") {
+            m.total_bytes = 17179869184UL;
+            m.used_bytes = 4294967296UL;
             m.swap_total_bytes = 0;
             m.swap_used_bytes = 0;
         } else if (profile == "windows-gaming") {
@@ -162,10 +168,15 @@ class FakePlatformBackend : PlatformBackend {
     override RawNetworkResult sampleNetwork() {
         counts.networkCalls++;
         RawNetworkResult r;
+        if (failNetwork) {
+            r.state = CapabilityState.error;
+            r.error = "simulated_network_permission_failure";
+            return r;
+        }
         r.state = CapabilityState.ok;
         RawNetworkInterface eth;
         eth.id = "ifindex:2";
-        eth.name = (profile == "arm64-sbc") ? "end0" : "enp5s0";
+        eth.name = profile == "macos-arm64" || profile == "macos-intel" ? "en0" : (profile == "arm64-sbc") ? "end0" : "enp5s0";
         eth.kind = "physical";
         eth.rx_bytes = netRxBytes;
         eth.tx_bytes = netTxBytes;
@@ -174,8 +185,8 @@ class FakePlatformBackend : PlatformBackend {
 
         RawNetworkInterface ts;
         ts.id = "ifindex:3";
-        ts.name = "tailscale0";
-        ts.kind = "tailnet";
+        ts.name = profile == "macos-arm64" || profile == "macos-intel" ? "utun7" : "tailscale0";
+        ts.kind = profile == "macos-arm64" || profile == "macos-intel" ? "virtual" : "tailnet";
         ts.rx_bytes = netRxBytes / 10;
         ts.tx_bytes = netTxBytes / 10;
         ts.link_up = true;
@@ -189,12 +200,12 @@ class FakePlatformBackend : PlatformBackend {
         RawProcessResult r;
         r.state = CapabilityState.ok;
         r.total_cpu_ticks = cpuTotalTicks;
-        r.logical_cores = (profile == "arm64-sbc") ? 8 : 24;
+        r.logical_cores = profile == "macos-intel" ? 6 : (profile == "arm64-sbc" || profile == "macos-arm64") ? 8 : 24;
         r.processes = [
             RawProcess(procPid, procStartId, procName, procCpuTicks, 3272089600UL, "rss"),
             RawProcess(1024, "100", "ldc2", procCpuTicks / 3, 512000000UL, "rss"),
             RawProcess(512, "80", "tailscaled", 900, 96000000UL, "rss"),
-            RawProcess(1, "1", "systemd", 300, 18000000UL, "rss"),
+            RawProcess(1, "1", profile == "macos-arm64" || profile == "macos-intel" ? "launchd" : "systemd", 300, 18000000UL, "rss"),
         ];
         return r;
     }
@@ -215,8 +226,8 @@ class FakePlatformBackend : PlatformBackend {
         r.state = CapabilityState.ok;
         MountStatus rootMount;
         rootMount.mount = "/";
-        rootMount.source = (profile == "arm64-sbc") ? "/dev/mmcblk0p2" : "/dev/nvme0n1p2";
-        rootMount.fs = "btrfs";
+        rootMount.source = profile == "macos-arm64" || profile == "macos-intel" ? "/dev/disk3s1" : (profile == "arm64-sbc") ? "/dev/mmcblk0p2" : "/dev/nvme0n1p2";
+        rootMount.fs = profile == "macos-arm64" || profile == "macos-intel" ? "apfs" : "btrfs";
         rootMount.total_bytes = 1000204886016UL;
         rootMount.used_bytes = 225915279770UL;
         rootMount.pct = 22.6;
@@ -278,9 +289,11 @@ class FakePlatformBackend : PlatformBackend {
         counts.maintenanceCalls++;
         RawMaintenanceResult r;
         r.state = CapabilityState.ok;
-        r.drift.running_kernel = "6.12.4";
-        r.drift.installed_kernel = (profile == "desktop-x86_64") ? "6.12.5" : "6.12.4";
-        r.drift.reboot_required = (profile == "desktop-x86_64");
+        r.drift.running_kernel = profile == "macos-arm64" || profile == "macos-intel" ? "24.1.0" : "6.12.4";
+        if (profile != "macos-arm64" && profile != "macos-intel")
+            r.drift.installed_kernel = (profile == "desktop-x86_64") ? "6.12.5" : "6.12.4";
+        if (profile != "macos-arm64" && profile != "macos-intel")
+            r.drift.reboot_required = (profile == "desktop-x86_64");
         return r;
     }
 
@@ -324,9 +337,8 @@ class FakePlatformBackend : PlatformBackend {
                 "isa": CapabilityState.ok,
             ];
         } else if (profile == "macos-arm64") {
-            hw.system = SystemHardwareInfo("Apple Inc.", "Mac15,3", "macOS 15.1", "laptop", "");
+            hw.system = SystemHardwareInfo("Apple Inc.", "Mac15,3", "", "laptop", "");
             hw.board = BoardHardwareInfo("Apple Inc.", "Mac15,3", "");
-            hw.firmware = FirmwareHardwareInfo("Apple Boot", "Apple Inc.", "24B83", "");
             hw.cpu.display_name = "Apple M3";
             hw.cpu.vendor = "Apple";
             hw.cpu.architecture = "arm64";
@@ -347,6 +359,23 @@ class FakePlatformBackend : PlatformBackend {
                 "storage_devices": CapabilityState.unavailable,
                 "isa": CapabilityState.ok,
             ];
+        } else if (profile == "macos-intel") {
+            hw.system = SystemHardwareInfo("Apple Inc.", "iMac19,1", "", "desktop", "");
+            hw.board = BoardHardwareInfo("Apple Inc.", "iMac19,1", "");
+            hw.cpu.display_name = "Intel(R) Core(TM) i5-9600K CPU @ 3.70GHz";
+            hw.cpu.vendor = "Intel";
+            hw.cpu.architecture = "x86_64";
+            hw.cpu.sockets = 1;
+            hw.cpu.physical_cores = 6;
+            hw.cpu.logical_cores = 6;
+            hw.cpu.isa.hardware = ["sse2", "sse4_2", "avx", "avx2", "aes", "bmi1", "bmi2"];
+            hw.cpu.isa.usable = hw.cpu.isa.hardware.dup;
+            hw.cpu.isa.detection = "cpuid+os_state";
+            hw.memory.total_bytes = 17179869184UL;
+            hw.memory.module_enumeration = CapabilityState.unavailable;
+            hw.capabilities = ["board": CapabilityState.ok, "memory_modules": CapabilityState.unavailable,
+                "network_adapters": CapabilityState.unavailable, "storage_devices": CapabilityState.unavailable,
+                "graphics_adapters": CapabilityState.unavailable, "isa": CapabilityState.ok];
         } else {
             hw.system = SystemHardwareInfo("Micro-Star International", "MS-7C84", "Desktop", "desktop", "");
             hw.board = BoardHardwareInfo("Micro-Star International", "MAG X570 TOMAHAWK WIFI", "1.0");

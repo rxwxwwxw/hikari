@@ -5,21 +5,26 @@ import core.serializer : sanitizeOsString;
 import hardware.inventory;
 import hardware.isa_names;
 import platform.api;
+import platform.clock : continuousBootNanoseconds;
 import std.algorithm : canFind, startsWith;
 import std.conv : to;
 import std.format : format;
-import std.process : Config, execute;
+
 import std.string : fromStringz, indexOf, split, strip, toLower;
 import std.typecons : Nullable;
 
 version (OSX) {
     import core.sys.darwin.ifaddrs : freeifaddrs, getifaddrs, ifaddrs;
-    import core.sys.darwin.sys.sysctl : sysctlbyname;
+    import core.sys.darwin.sys.sysctl : sysctlbyname, sysctl;
+    import platform.darwin_native;
+    import core.sys.posix.unistd : sysconf, _SC_CLK_TCK, close;
+    import core.sys.posix.sys.socket : socket, AF_INET, SOCK_DGRAM;
+    import core.sys.posix.sys.ioctl : ioctl;
 
     private enum int H_HOST_CPU_LOAD_INFO = 3;
     private enum uint H_HOST_CPU_LOAD_INFO_COUNT = 4;
     private enum int H_HOST_VM_INFO64 = 4;
-    private enum uint H_HOST_VM_INFO64_COUNT = 38;
+    private enum uint H_HOST_VM_INFO64_COUNT = H_vm_statistics64.sizeof / int.sizeof;
     private enum int H_MNT_NOWAIT = 2;
     private enum int H_AF_LINK = 18;
     private enum int H_PROC_PIDTASKALLINFO = 2;
@@ -53,6 +58,7 @@ version (OSX) {
         uint external_page_count;
         uint internal_page_count;
         ulong total_uncompressed_pages_in_compressor;
+        ulong swapped_count;
     }
 
     private struct H_xsw_usage {
@@ -65,40 +71,39 @@ version (OSX) {
 
     private struct H_timeval {
         long tv_sec;
-        long tv_usec;
+        int tv_usec;
     }
 
-    private struct H_if_data {
-        ubyte ifi_type;
-        ubyte ifi_typelen;
-        ubyte ifi_physical;
-        ubyte ifi_addrlen;
-        ubyte ifi_hdrlen;
-        ubyte ifi_recvquota;
-        ubyte ifi_xmitquota;
-        ubyte ifi_unused1;
-        uint ifi_mtu;
-        uint ifi_metric;
-        uint ifi_baudrate;
-        uint ifi_ipackets;
-        uint ifi_ierrors;
-        uint ifi_opackets;
-        uint ifi_oerrors;
-        uint ifi_collisions;
-        uint ifi_ibytes;
-        uint ifi_obytes;
-        uint ifi_imcasts;
-        uint ifi_omcasts;
-        uint ifi_iqdrops;
-        uint ifi_noproto;
-        uint ifi_recvtiming;
-        uint ifi_xmittiming;
-        H_timeval ifi_lastchange;
-        uint ifi_unused2;
-        uint ifi_hwassist;
-        uint ifi_reserved1;
-        uint ifi_reserved2;
+    // Darwin SDK net/if_var.h uses 4-byte packing for if_data64.
+    private struct H_if_data64 {
+        align(4):
+        ubyte[8] header;
+        uint mtu;
+        uint metric;
+        ulong baudrate;
+        ulong ipackets, ierrors, opackets, oerrors, collisions;
+        ulong ibytes, obytes;
+        ulong imcasts, omcasts, iqdrops, noproto;
+        uint recvtiming, xmittiming;
+        int[2] lastchange;
     }
+    private struct H_ifmibdata {
+        align(4):
+        char[16] name;
+        uint pcount, flags, snd_len, snd_maxlen, snd_drops;
+        uint[4] filler;
+        H_if_data64 data;
+    }
+    static assert(H_if_data64.sizeof == 128);
+    static assert(H_ifmibdata.sizeof == 180);
+
+    private struct H_ifmediareq {
+        align(4):
+        char[16] name;
+        int current, mask, status, active, count;
+        int* list;
+    }
+    static assert(H_ifmediareq.sizeof == 44);
 
     private struct H_proc_bsdinfo {
         uint pbi_flags;
@@ -170,76 +175,77 @@ version (OSX) {
         uint[8] f_reserved;
     }
 
-    private struct H_mach_timebase_info {
-        uint numer;
-        uint denom;
-    }
+    static assert(H_statfs.sizeof == 2168);
+    static assert(H_proc_taskallinfo.sizeof == 232);
+    static assert(H_vm_statistics64.sizeof == 160);
 
     private extern (C) nothrow @nogc {
         uint mach_host_self();
+        extern __gshared uint mach_task_self_;
+        int mach_port_deallocate(uint task, uint name);
         int host_statistics(uint host_priv, int flavor, int* host_info_out, uint* host_info_outCnt);
         int host_statistics64(uint host_priv, int flavor, int* host_info_out, uint* host_info_outCnt);
-        int mach_timebase_info(H_mach_timebase_info* info);
         int proc_listallpids(void* buffer, int buffersize);
         int proc_pidinfo(int pid, int flavor, ulong arg, void* buffer, int buffersize);
-        int getfsstat(H_statfs* buf, int bufsize, int flags);
+        version (X86_64) {
+            // Intel Darwin retains a legacy ABI under the unsuffixed symbol.
+            pragma(mangle, "getfsstat$INODE64")
+            int getfsstat(H_statfs* buf, int bufsize, int flags);
+        } else {
+            int getfsstat(H_statfs* buf, int bufsize, int flags);
+        }
         uint if_nametoindex(const(char)* ifname);
         int getloadavg(double* loadavg, int nelem);
     }
 }
 
-BatteryStatus[] parsePmsetBatteryOutput(string pmsetText) {
-    BatteryStatus[] list;
-    uint idx = 0;
-    foreach (rawLine; pmsetText.split('\n')) {
-        auto line = rawLine.strip();
-        if (!line.canFind("InternalBattery") && !line.canFind("Battery-")) continue;
+private string boundedString(const(char)[] value) {
+    auto end = value.indexOf('\0');
+    return (end < 0 ? value : value[0 .. end]).idup;
+}
 
-        BatteryStatus b;
-        b.id = "BAT" ~ to!string(idx);
-        b.name = b.id;
-        idx++;
+// libproc exports native kernel Mach ticks, including to translated processes.
+// hw.tbfrequency describes that clock; Rosetta's mach_timebase_info instead
+// describes the translated process's emulated clock and cannot normalize it.
+Nullable!ulong normalizeDarwinCpuTicks(ulong user, ulong system, ulong frequency, ulong schedulerHz) pure nothrow @safe {
+    if (!frequency || !schedulerHz || system > ulong.max - user) return Nullable!ulong.init;
+    ulong total = user + system;
+    ulong whole = total / frequency;
+    ulong remainder = total % frequency;
+    if (whole > ulong.max / schedulerHz || remainder > ulong.max / schedulerHz)
+        return Nullable!ulong.init;
+    ulong base = whole * schedulerHz;
+    ulong fraction = remainder * schedulerHz / frequency;
+    if (fraction > ulong.max - base) return Nullable!ulong.init;
+    return Nullable!ulong(base + fraction);
+}
 
-        auto tab = line.indexOf('\t');
-        auto rest = tab >= 0 ? line[tab + 1 .. $].strip() : line;
-        // Example: "84%; discharging; 4:12 remaining present: true"
-        auto parts = rest.split(';');
-        if (parts.length >= 1) {
-            auto pctIdx = parts[0].indexOf('%');
-            if (pctIdx > 0) {
-                // Find token immediately preceding '%'
-                auto beforePct = parts[0][0 .. pctIdx].strip().split();
-                if (beforePct.length > 0) {
-                    try { b.pct = to!double(beforePct[$ - 1]); } catch (Exception) {}
-                }
-            }
-        }
-        if (parts.length >= 2) {
-            auto st = parts[1].strip().toLower();
-            if (st == "charging" || st == "finishing charge") b.status = "charging";
-            else if (st == "discharging") b.status = "discharging";
-            else if (st == "charged") b.status = "full";
-            else if (st == "ac attached" || st.canFind("not charging")) b.status = "not_charging";
-            else b.status = "unknown";
-        } else {
-            b.status = "unknown";
-        }
-        if (parts.length >= 3) {
-            auto rem = parts[2].strip().split();
-            if (rem.length > 0 && rem[0].canFind(':')) {
-                auto hm = rem[0].split(':');
-                if (hm.length == 2) {
-                    try {
-                        long h = to!long(hm[0]);
-                        long m = to!long(hm[1]);
-                        b.time_remaining_s = h * 3600L + m * 60L;
-                    } catch (Exception) {}
-                }
-            }
-        }
-        list ~= b;
-    }
-    return list;
+struct DarwinPowerSource {
+    string state;
+    Nullable!long currentCapacity;
+    Nullable!long maxCapacity;
+    Nullable!bool charging;
+    Nullable!bool charged;
+    Nullable!long minutesToEmpty;
+}
+
+BatteryStatus decodeDarwinPowerSource(const ref DarwinPowerSource source, string id) {
+    BatteryStatus b;
+    b.id = id;
+    b.name = "Internal battery";
+    if (!source.currentCapacity.isNull && !source.maxCapacity.isNull
+        && source.maxCapacity.get > 0 && source.currentCapacity.get >= 0
+        && source.currentCapacity.get <= source.maxCapacity.get)
+        b.pct = 100.0 * source.currentCapacity.get / source.maxCapacity.get;
+    b.status = "unknown";
+    if (!source.charging.isNull && source.charging.get) b.status = "charging";
+    else if (!source.charged.isNull && source.charged.get) b.status = "full";
+    else if (source.state == "Battery Power") b.status = "discharging";
+    else if (source.state == "AC Power") b.status = "not_charging";
+    if (b.status == "discharging" && !source.minutesToEmpty.isNull
+        && source.minutesToEmpty.get > 0 && source.minutesToEmpty.get <= long.max / 60)
+        b.time_remaining_s = source.minutesToEmpty.get * 60;
+    return b;
 }
 
 class DarwinPlatformBackend : PlatformBackend {
@@ -304,9 +310,8 @@ class DarwinPlatformBackend : PlatformBackend {
             size_t bsz = H_timeval.sizeof;
             if (sysctlbyname("kern.boottime".ptr, &bt, &bsz, null, 0) == 0 && bt.tv_sec > 0) {
                 id.boot_id = format!"darwinboot-%d"(bt.tv_sec);
-                import std.datetime.systime : Clock;
-                long nowWall = Clock.currTime.toUnixTime();
-                if (nowWall >= bt.tv_sec) id.uptime_s = nowWall - bt.tv_sec;
+                auto continuous = continuousBootNanoseconds();
+                if (continuous >= 0) id.uptime_s = continuous / 1_000_000_000L;
             } else {
                 id.boot_id = "darwin-boot";
             }
@@ -319,7 +324,9 @@ class DarwinPlatformBackend : PlatformBackend {
         version (OSX) {
             H_host_cpu_load_info_data info;
             uint cnt = H_HOST_CPU_LOAD_INFO_COUNT;
-            if (host_statistics(mach_host_self(), H_HOST_CPU_LOAD_INFO, cast(int*) &info, &cnt) != 0) {
+            auto host = mach_host_self();
+            scope (exit) mach_port_deallocate(mach_task_self_, host);
+            if (host_statistics(host, H_HOST_CPU_LOAD_INFO, cast(int*) &info, &cnt) != 0) {
                 c.state = CapabilityState.error;
                 c.error = "mach_host_statistics_failed";
                 return c;
@@ -365,10 +372,16 @@ class DarwinPlatformBackend : PlatformBackend {
 
             H_vm_statistics64 vm;
             uint cnt = H_HOST_VM_INFO64_COUNT;
-            if (host_statistics64(mach_host_self(), H_HOST_VM_INFO64, cast(int*) &vm, &cnt) == 0) {
+            auto host = mach_host_self();
+            scope (exit) mach_port_deallocate(mach_task_self_, host);
+            if (host_statistics64(host, H_HOST_VM_INFO64, cast(int*) &vm, &cnt) == 0) {
                 ulong usedPages = cast(ulong) vm.active_count + cast(ulong) vm.wire_count + cast(ulong) vm.compressor_page_count;
                 ulong usedB = usedPages * pageSize;
                 m.used_bytes = usedB <= memSize ? usedB : memSize;
+            } else {
+                m.state = CapabilityState.error;
+                m.error = "mach_vm_statistics_failed";
+                return m;
             }
 
             H_xsw_usage xsw;
@@ -381,7 +394,6 @@ class DarwinPlatformBackend : PlatformBackend {
             m.state = CapabilityState.ok;
         } else {
             m.state = CapabilityState.unsupported;
-            c_err:
             m.error = "darwin_only_backend";
         }
         return m;
@@ -398,6 +410,8 @@ class DarwinPlatformBackend : PlatformBackend {
             }
             scope (exit) freeifaddrs(head);
 
+            int mediaSocket = socket(AF_INET, SOCK_DGRAM, 0);
+            scope (exit) if (mediaSocket >= 0) close(mediaSocket);
             r.state = CapabilityState.ok;
             for (ifaddrs* cur = head; cur !is null; cur = cur.ifa_next) {
                 if (cur.ifa_addr is null || cur.ifa_data is null) continue;
@@ -406,20 +420,39 @@ class DarwinPlatformBackend : PlatformBackend {
                 auto ifName = sanitizeOsString(fromStringz(cur.ifa_name).idup, 64);
                 if (ifName.length == 0 || ifName == "lo0") continue;
 
-                auto data = cast(const(H_if_data)*) cur.ifa_data;
                 uint ifIdx = if_nametoindex(cur.ifa_name);
 
                 RawNetworkInterface ni;
                 ni.id = ifIdx > 0 ? ("ifindex:" ~ to!string(ifIdx)) : ("name:" ~ ifName);
                 ni.name = ifName;
-                if (ifName.startsWith("utun")) ni.kind = "tailnet";
+                // utun interfaces can belong to any VPN; identity requires tailnet metadata.
+                if (ifName.startsWith("utun")) ni.kind = "virtual";
                 else if (ifName.startsWith("en")) ni.kind = "physical";
                 else ni.kind = "virtual";
 
-                ni.rx_bytes = data.ifi_ibytes;
-                ni.tx_bytes = data.ifi_obytes;
-                if (data.ifi_baudrate > 0) ni.link_speed_bps = cast(ulong) data.ifi_baudrate;
-                ni.link_up = (cur.ifa_flags & 0x1) != 0; // IFF_UP
+                // Read the 64-bit IF-MIB counters; getifaddrs exposes only 32 bits.
+                int[6] mib = [4 /* CTL_NET */, 18 /* PF_LINK */, 0,
+                    2 /* IFMIB_IFDATA */, cast(int) ifIdx, 1 /* IFDATA_GENERAL */];
+                H_ifmibdata stats;
+                size_t statsSize = stats.sizeof;
+                if (ifIdx == 0 || sysctl(mib.ptr, mib.length, &stats, &statsSize, null, 0) != 0
+                    || statsSize != stats.sizeof) {
+                    // Never change counter width underneath an existing tracker identity.
+                    r.state = CapabilityState.error;
+                    r.error = "interface_counters_unavailable";
+                    continue;
+                }
+                ni.rx_bytes = stats.data.ibytes;
+                ni.tx_bytes = stats.data.obytes;
+                if (stats.data.baudrate > 0) ni.link_speed_bps = stats.data.baudrate;
+                // IFF_RUNNING is resource allocation, not carrier state.
+                if (mediaSocket >= 0 && ifName.length < 16) {
+                    H_ifmediareq media;
+                    media.name[0 .. ifName.length] = ifName[];
+                    enum ulong getMedia = 0xc02c6938UL; // SDK _IOWR('i', 56, ifmediareq)
+                    if (ioctl(mediaSocket, getMedia, &media) == 0 && (media.status & 1))
+                        ni.link_up = (media.status & 2) != 0;
+                }
                 r.interfaces ~= ni;
             }
         } else {
@@ -441,27 +474,34 @@ class DarwinPlatformBackend : PlatformBackend {
             r.total_cpu_ticks = cpu.total_ticks;
             r.logical_cores = cpu.logical_cores;
 
-            H_mach_timebase_info tb;
-            if (mach_timebase_info(&tb) != 0 || tb.denom == 0) {
-                tb.numer = 1;
-                tb.denom = 1;
-            }
-
-            int byteCap = proc_listallpids(null, 0);
-            if (byteCap <= 0) {
+            // libproc returns a PID count, while its buffer argument is in bytes.
+            int capacity = proc_listallpids(null, 0);
+            if (capacity <= 0 || capacity > 1_000_000) {
                 r.state = CapabilityState.error;
                 r.error = "proc_listallpids_failed";
                 return r;
             }
-            auto pids = new int[(byteCap / int.sizeof) + 64];
-            int actualBytes = proc_listallpids(pids.ptr, cast(int)(pids.length * int.sizeof));
-            if (actualBytes <= 0) {
+            auto pids = new int[capacity + 128];
+            int actual = proc_listallpids(pids.ptr, cast(int)(pids.length * int.sizeof));
+            if (actual <= 0 || actual > pids.length) {
                 r.state = CapabilityState.error;
-                r.error = "proc_listallpids_empty";
+                r.error = "proc_listallpids_failed";
                 return r;
             }
-            size_t count = actualBytes / int.sizeof;
+            size_t count = actual;
+            auto hz = sysconf(_SC_CLK_TCK);
+            if (hz <= 0) {
+                r.state = CapabilityState.error;
+                r.error = "clock_tick_frequency_unavailable";
+                return r;
+            }
 
+            ulong timebaseFrequency;
+            if (!sysctlU64("hw.tbfrequency".ptr, timebaseFrequency) || timebaseFrequency == 0) {
+                r.state = CapabilityState.unavailable;
+                r.error = "process_timebase_unavailable";
+                return r;
+            }
             r.state = CapabilityState.ok;
             foreach (i; 0 .. count) {
                 int pid = pids[i];
@@ -470,22 +510,21 @@ class DarwinPlatformBackend : PlatformBackend {
                 int resSz = proc_pidinfo(pid, H_PROC_PIDTASKALLINFO, 0, &pti, cast(int) H_proc_taskallinfo.sizeof);
                 if (resSz != cast(int) H_proc_taskallinfo.sizeof) continue;
 
-                auto pname = sanitizeOsString(fromStringz(pti.pbsd.pbi_name.ptr).idup, 128);
+                auto pname = sanitizeOsString(boundedString(pti.pbsd.pbi_name[]), 128);
                 if (pname.length == 0) {
-                    pname = sanitizeOsString(fromStringz(pti.pbsd.pbi_comm.ptr).idup, 128);
+                    pname = sanitizeOsString(boundedString(pti.pbsd.pbi_comm[]), 128);
                 }
                 if (pname.length == 0) pname = "pid-" ~ to!string(pid);
 
-                // Convert Mach timebase ticks to 10ms ticks matching host_statistics 100Hz clock
-                ulong machTicks = pti.ptinfo.pti_total_user + pti.ptinfo.pti_total_system;
-                ulong ns = (machTicks / tb.denom) * tb.numer;
-                ulong cpuTicks10ms = ns / 10_000_000UL;
+                auto cpuTicks = normalizeDarwinCpuTicks(pti.ptinfo.pti_total_user,
+                    pti.ptinfo.pti_total_system, timebaseFrequency, cast(ulong) hz);
+                if (cpuTicks.isNull) continue;
 
                 RawProcess rp;
                 rp.pid = cast(uint) pid;
                 rp.start_id = format!"%u:%u"(pti.pbsd.pbi_start_tvsec, pti.pbsd.pbi_start_tvusec);
                 rp.name = pname;
-                rp.cpu_ticks = cpuTicks10ms;
+                rp.cpu_ticks = cpuTicks.get;
                 rp.rss_bytes = pti.ptinfo.pti_resident_size;
                 rp.memory_kind = "rss";
                 r.processes ~= rp;
@@ -515,10 +554,13 @@ class DarwinPlatformBackend : PlatformBackend {
             }
 
             r.state = CapabilityState.ok;
+            if (actual > buf.length) actual = cast(int) buf.length;
             foreach (const ref fs; buf[0 .. actual]) {
-                auto fsType = sanitizeOsString(fromStringz(fs.f_fstypename.ptr).idup, 32).toLower();
-                auto mnt = sanitizeOsString(fromStringz(fs.f_mntonname.ptr).idup, 512);
-                auto src = sanitizeOsString(fromStringz(fs.f_mntfromname.ptr).idup, 256);
+                auto fsType = sanitizeOsString(boundedString(fs.f_fstypename[]), 32).toLower();
+                auto mnt = sanitizeOsString(boundedString(fs.f_mntonname[]), 512);
+                auto src = sanitizeOsString(boundedString(fs.f_mntfromname[]), 256);
+                // Network mount sources may contain usernames or credentials.
+                if (!src.startsWith("/dev/")) src = "";
                 if (fsType == "devfs" || fsType == "autofs" || fsType == "nullfs") continue;
                 if (mnt.startsWith("/System/Volumes/VM") || mnt.startsWith("/System/Volumes/Preboot")
                     || mnt.startsWith("/System/Volumes/Update") || mnt.startsWith("/System/Volumes/xarts")
@@ -555,15 +597,7 @@ class DarwinPlatformBackend : PlatformBackend {
     override RawBatteryResult sampleBatteries() {
         RawBatteryResult r;
         version (OSX) {
-            try {
-                auto ex = execute(["/usr/bin/pmset", "-g", "batt"], null, Config.none, 4096);
-                if (ex.status == 0) {
-                    r.state = CapabilityState.ok;
-                    r.batteries = parsePmsetBatteryOutput(ex.output);
-                    return r;
-                }
-            } catch (Exception) {}
-            r.state = CapabilityState.unavailable;
+            return nativePowerSources();
         } else {
             r.state = CapabilityState.unsupported;
             r.error = "darwin_only_backend";
@@ -576,6 +610,10 @@ class DarwinPlatformBackend : PlatformBackend {
         version (OSX) {
             r.state = CapabilityState.ok;
             r.drift.running_kernel = sysctlString("kern.osrelease");
+            if (r.drift.running_kernel.length == 0) {
+                r.state = CapabilityState.unavailable;
+                r.error = "local_kernel_metadata_unavailable";
+            }
             // Never invoke `softwareupdate -l` during passive telemetry
         } else {
             r.state = CapabilityState.unsupported;
@@ -591,24 +629,24 @@ class DarwinPlatformBackend : PlatformBackend {
             auto modelId = sysctlString("hw.model");
             hw.system.manufacturer = "Apple Inc.";
             hw.system.model = modelId;
-            hw.system.product_family = sysctlString("kern.osproductversion");
+            // OS version is not a hardware product family.
             auto lowMod = modelId.toLower();
             if (lowMod.canFind("macbook")) hw.system.form_factor = "laptop";
-            else if (lowMod.length > 0) hw.system.form_factor = "desktop";
+            else if (lowMod.startsWith("imac") || lowMod.startsWith("macmini")
+                || lowMod.startsWith("macpro") || lowMod.startsWith("macstudio"))
+                hw.system.form_factor = "desktop";
 
             // On Macs without PC-style motherboard info, expose Mac model identifier cleanly
             hw.board.manufacturer = "Apple Inc.";
             hw.board.model = modelId;
-            hw.firmware.type = "Apple Boot";
-            hw.firmware.vendor = "Apple Inc.";
-            hw.firmware.version_str = sysctlString("kern.osversion");
+            // Firmware is populated only from an actual firmware property.
 
             version (AArch64) hw.cpu.architecture = "arm64";
             else version (X86_64) hw.cpu.architecture = "x86_64";
             else hw.cpu.architecture = "unknown";
 
             hw.cpu.display_name = sysctlString("machdep.cpu.brand_string");
-            if (hw.cpu.display_name.length == 0) hw.cpu.display_name = modelId;
+
             version (AArch64) hw.cpu.vendor = "Apple";
             else {
                 auto bv = hw.cpu.display_name.toLower();
@@ -643,9 +681,9 @@ class DarwinPlatformBackend : PlatformBackend {
                 foreach (ni; netRes.interfaces) {
                     NetworkAdapterHardware na;
                     na.id = ni.id;
-                    na.display_name = ni.name == "utun" || ni.kind == "tailnet" ? ("Tailscale Tunnel (" ~ ni.name ~ ")") : ni.name;
+                    na.display_name = ni.name;
                     na.interface_name = ni.name;
-                    na.kind = ni.kind == "physical" ? "ethernet" : ni.kind;
+                    na.kind = ni.kind == "physical" ? "unknown" : ni.kind;
                     na.link_speed_bps = ni.link_speed_bps;
                     hw.network_adapters ~= na;
                 }
@@ -653,10 +691,11 @@ class DarwinPlatformBackend : PlatformBackend {
 
             hw.capabilities["board"] = hw.board.model.length > 0 ? CapabilityState.ok : CapabilityState.unavailable;
             hw.capabilities["memory_modules"] = CapabilityState.unsupported;
-            hw.capabilities["network_adapters"] = CapabilityState.ok;
+            hw.capabilities["network_adapters"] = netRes.state;
             hw.capabilities["storage_devices"] = CapabilityState.unavailable;
             hw.capabilities["isa"] = hw.cpu.isa.usable.length > 0 ? CapabilityState.ok : CapabilityState.unavailable;
 
+            enrichNativeHardware(hw);
             hw.collection.status = GroupStatus.fresh;
             hw.collection.partial = true;
             r.state = CapabilityState.ok;

@@ -13,6 +13,7 @@ import std.process : Config, execute;
 import std.string : indexOf, strip;
 import std.typecons : Nullable;
 import tailnet.registry;
+import platform.command : runLocalCommand, tailscaleExecutable;
 
 struct TailscalePeerCandidate {
     string tailscale_node_id;
@@ -232,8 +233,8 @@ class TailnetDiscoveryService {
             return readText(fixture);
         }
         try {
-            auto res = execute(["tailscale", "status", "--json"], null, Config.none, 1024 * 1024 * 4);
-            if (res.status == 0) return res.output;
+            auto res = runLocalCommand([tailscaleExecutable(), "status", "--json"], 5000, 1024 * 1024 * 4);
+            if (res.status == 0 && !res.outputTruncated) return res.output;
         } catch (Exception) {}
         return "";
     }
@@ -273,6 +274,10 @@ class TailnetDiscoveryService {
             res.error = "peer_fetch_exception";
             return res;
         }
+    }
+
+    TailscaleSnapshot cachedLocalTailscaleSnapshot() {
+        synchronized (mtx) return cachedTailnet;
     }
 
     TailscaleSnapshot getLocalTailscaleSnapshot(bool forceRefresh = false) {

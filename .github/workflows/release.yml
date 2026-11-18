@@ -23,10 +23,10 @@ jobs:
             runner: ubuntu-24.04-arm
           - os: darwin
             arch: arm64
-            runner: macos-14
+            runner: macos-15
           - os: darwin
             arch: x86_64
-            runner: macos-13
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +62,7 @@ jobs:
           cp caddy/snippet.caddy.tmpl "$STAGE/caddy/snippet.caddy.tmpl"
           cp install/install.sh "$STAGE/install/install.sh"
           cp install/uninstall.sh "$STAGE/install/uninstall.sh"
+          cp install/macos-*.sh install/*.py "$STAGE/install/"
           tar -czf "dist/hikari-${{ matrix.os }}-${{ matrix.arch }}.tar.gz" -C "$STAGE" .
 
       - uses: actions/upload-artifact@v4
@@ -113,7 +114,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Generate manifest.json and sign if release key configured
+      - name: Generate and sign release manifest
         env:
           SIGNING_KEY: ${{ secrets.HIKARI_RELEASE_ED25519_KEY }}
         run: |
@@ -145,6 +146,10 @@ jobs:
           }
           open("release-files/manifest.json", "w").write(json.dumps(manifest, indent=2) + "\n")
           PY
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "Refusing unsigned release: HIKARI_RELEASE_ED25519_KEY is required" >&2
+            exit 1
+          fi
           if [ -n "$SIGNING_KEY" ]; then
             printf '%s\n' "$SIGNING_KEY" > /tmp/rel.pem
             openssl pkeyutl -sign -inkey /tmp/rel.pem -rawin -in release-files/manifest.json -out release-files/manifest.sig

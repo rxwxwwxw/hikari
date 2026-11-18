@@ -60,7 +60,10 @@ class HikariRouter {
         resp.headers["X-Content-Type-Options"] = "nosniff";
         resp.headers["Cache-Control"] = "no-store";
 
-        auto snap = discovery !is null ? discovery.getLocalTailscaleSnapshot(false) : TailscaleSnapshot.init;
+        auto routePath = stripConfiguredBasePath(req.path, config.listen.base_path);
+        bool cheap = routePath == "/healthz" || routePath == "/api/v1/info";
+        auto snap = discovery is null ? TailscaleSnapshot.init
+            : cheap ? discovery.cachedLocalTailscaleSnapshot() : discovery.getLocalTailscaleSnapshot(false);
         string localFqdn = snap.available ? snap.selfNode.fqdn : "";
         if (localFqdn.length > 0 && coordinator !is null) {
             coordinator.updateFqdn(localFqdn);
@@ -98,8 +101,6 @@ class HikariRouter {
         if (req.method != "GET" && req.method != "HEAD") {
             return jsonError(405, "Method Not Allowed", "method_not_allowed", "Only GET/HEAD/OPTIONS permitted", resp.headers);
         }
-
-        auto routePath = stripConfiguredBasePath(req.path, config.listen.base_path);
 
         if (routePath == "/healthz") {
             auto hr = coordinator.getHealth();

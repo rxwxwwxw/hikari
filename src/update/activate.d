@@ -3,7 +3,7 @@ module update.activate;
 import core.thread : Thread;
 import core.time : msecs;
 import std.algorithm : canFind;
-import std.file : exists, mkdirRecurse, readText, remove, rename, write;
+import std.file : exists, mkdirRecurse, readText, remove, rename, write, isSymlink, FileException;
 version (Posix) {
     import std.file : readLink, symlink;
 }
@@ -12,6 +12,9 @@ import std.process : Config, execute;
 import std.string : strip;
 import update.stage;
 import update.verify;
+import platform.command : runLocalCommand;
+import platform.durable : syncUpdatePath;
+import std.path : dirName;
 
 alias ServiceRestartFn = bool delegate(string action); // "restart"
 alias HealthCheckFn = bool delegate(string expectedVersion);
@@ -27,9 +30,12 @@ struct ActivationOutcome {
 void atomicSetSymlink(string target, string linkPath) {
     version (Posix) {
         auto tmpLink = linkPath ~ ".tmp";
-        if (exists(tmpLink)) remove(tmpLink);
+        bool danglingLink;
+        try { danglingLink = isSymlink(tmpLink); } catch (FileException) {}
+        if (exists(tmpLink) || danglingLink) remove(tmpLink);
         symlink(target, tmpLink);
         rename(tmpLink, linkPath);
+        syncUpdatePath(dirName(linkPath), true);
     } else version (Windows) {
         // Store target path atomically and update directory junction without overwriting running .exe
         auto txtPath = linkPath ~ ".txt";
@@ -69,10 +75,10 @@ bool defaultRestartHikariServices(string action) {
         }
         return true;
     } else version (OSX) {
-        auto r1 = execute(["launchctl", "kickstart", "-k", "system/io.hikari.agent"], null, Config.none, 4096);
+        auto r1 = runLocalCommand(["/bin/launchctl", "kickstart", "-k", "system/io.hikari.agent"], 10000, 4096);
         if (r1.status != 0) return false;
         if (exists("/Library/LaunchDaemons/io.hikari.caddy.plist")) {
-            auto r2 = execute(["launchctl", "kickstart", "-k", "system/io.hikari.caddy"], null, Config.none, 4096);
+            auto r2 = runLocalCommand(["/bin/launchctl", "kickstart", "-k", "system/io.hikari.caddy"], 10000, 4096);
             if (r2.status != 0) return false;
         }
         return true;
@@ -127,14 +133,21 @@ ActivationOutcome activateAndVerifyRelease(
     HealthCheckFn healthHook = null
 ) {
     ActivationOutcome outc;
+    validateReleaseDirectoryName(targetVersion);
     auto targetDir = versionsDir ~ "/" ~ targetVersion;
     if (!exists(versionBinaryPath(targetDir))) {
         outc.message = "Target version directory is incomplete: " ~ targetDir;
         return outc;
     }
 
-    auto lock = new UpdateLock(stateDir);
+    auto lock = new UpdateLock(versionsDir);
     scope (exit) lock.release();
+
+    auto pendingPath = versionsDir ~ "/.activation-previous";
+    if (exists(pendingPath)) {
+        outc.message = "An interrupted activation requires `hikari update recover` first";
+        return outc;
+    }
 
     auto currentLink = versionsDir ~ "/current";
     auto prevLink = versionsDir ~ "/previous";
@@ -146,6 +159,12 @@ ActivationOutcome activateAndVerifyRelease(
         atomicSetSymlink(versionsDir ~ "/" ~ oldVersion, prevLink);
     }
 
+    if (oldVersion.length > 0 && oldVersion != targetVersion) {
+        write(pendingPath ~ ".tmp", oldVersion ~ "\n");
+        syncUpdatePath(pendingPath ~ ".tmp");
+        rename(pendingPath ~ ".tmp", pendingPath);
+        syncUpdatePath(versionsDir, true);
+    }
     atomicSetSymlink(targetDir, currentLink);
 
     import std.functional : toDelegate;
@@ -154,6 +173,7 @@ ActivationOutcome activateAndVerifyRelease(
     bool healthy = restarted && (healthHook is null || healthHook(targetVersion));
 
     if (healthy) {
+        if (exists(pendingPath)) { remove(pendingPath); syncUpdatePath(versionsDir, true); }
         outc.ok = true;
         outc.activeVersion = targetVersion;
         outc.message = "Activated version " ~ targetVersion;
@@ -163,13 +183,45 @@ ActivationOutcome activateAndVerifyRelease(
     // Automatic rollback to previous known-good release
     if (oldVersion.length > 0 && exists(versionsDir ~ "/" ~ oldVersion)) {
         atomicSetSymlink(versionsDir ~ "/" ~ oldVersion, currentLink);
-        restartFn("restart");
+        bool recovered = restartFn("restart") && (healthHook is null || healthHook(oldVersion));
+        if (recovered && exists(pendingPath)) { remove(pendingPath); syncUpdatePath(versionsDir, true); }
         outc.rolledBack = true;
         outc.activeVersion = oldVersion;
         outc.message = "Health check or service restart failed for " ~ targetVersion ~ "; automatically rolled back to " ~ oldVersion;
     } else {
         outc.message = "Activation failed for " ~ targetVersion ~ " and no previous release available";
     }
+    return outc;
+}
+
+ActivationOutcome recoverInterruptedActivation(
+    string versionsDir, string stateDir,
+    ServiceRestartFn serviceHook = null, HealthCheckFn healthHook = null
+) {
+    ActivationOutcome outc;
+    auto lock = new UpdateLock(versionsDir);
+    scope (exit) lock.release();
+    auto pendingPath = versionsDir ~ "/.activation-previous";
+    if (!exists(pendingPath)) {
+        outc.ok = true;
+        outc.message = "No interrupted activation";
+        return outc;
+    }
+    auto previous = readText(pendingPath).strip();
+    validateReleaseDirectoryName(previous);
+    if (!exists(versionBinaryPath(versionsDir ~ "/" ~ previous))) {
+        outc.message = "Interrupted activation has no usable prior release";
+        return outc;
+    }
+    atomicSetSymlink(versionsDir ~ "/" ~ previous, versionsDir ~ "/current");
+    import std.functional : toDelegate;
+    auto restartFn = serviceHook !is null ? serviceHook : toDelegate(&defaultRestartHikariServices);
+    outc.ok = restartFn("restart") && (healthHook is null || healthHook(previous));
+    outc.rolledBack = true;
+    outc.activeVersion = previous;
+    if (outc.ok) { remove(pendingPath); syncUpdatePath(versionsDir, true); }
+    outc.message = outc.ok ? "Recovered interrupted activation to " ~ previous
+        : "Prior release restored; service recovery still requires attention";
     return outc;
 }
 
@@ -180,30 +232,17 @@ ActivationOutcome rollbackToPrevious(
     HealthCheckFn healthHook = null
 ) {
     ActivationOutcome outc;
-    auto lock = new UpdateLock(stateDir);
-    scope (exit) lock.release();
-
-    auto currentLink = versionsDir ~ "/current";
-    auto prevLink = versionsDir ~ "/previous";
-    auto prevVer = readVersionSymlink(prevLink);
+    auto prevVer = readVersionSymlink(versionsDir ~ "/previous");
     if (prevVer.length == 0 || !exists(versionBinaryPath(versionsDir ~ "/" ~ prevVer))) {
         outc.message = "No valid previous version available for rollback";
         return outc;
     }
-
-    auto curVer = readVersionSymlink(currentLink);
-    outc.previousVersion = curVer;
-    atomicSetSymlink(versionsDir ~ "/" ~ prevVer, currentLink);
-
-    import std.functional : toDelegate;
-    auto restartFn = serviceHook !is null ? serviceHook : toDelegate(&defaultRestartHikariServices);
-    bool restarted = restartFn("restart");
-    bool healthy = restarted && (healthHook is null || healthHook(prevVer));
-    outc.ok = healthy;
-    outc.rolledBack = true;
-    outc.activeVersion = prevVer;
-    outc.message = healthy
-        ? ("Rolled back to " ~ prevVer)
-        : ("Rolled back symlink to " ~ prevVer ~ ", but health check failed");
+    // Rollback is itself a transaction: a broken previous version must not strand
+    // the operator on an unhealthy release or lose interrupted-operation recovery.
+    outc = activateAndVerifyRelease(versionsDir, stateDir, prevVer, serviceHook, healthHook);
+    if (outc.ok) {
+        outc.rolledBack = true;
+        outc.message = "Rolled back to " ~ prevVer;
+    }
     return outc;
 }

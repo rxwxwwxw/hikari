@@ -19,6 +19,10 @@ Written in D (compiled with `ldc2`) with zero external D package dependencies an
 ## Quickstart (Linux)
 
 ### Prerequisites
+
+The Unix installer requires Python 3. Signed archive installation and updates
+also require OpenSSL with Ed25519 support. These are maintenance tools; the D
+telemetry agent does not use a Python runtime.
 - Linux (`x86_64` or `aarch64`): Fedora, CachyOS/Arch, Ubuntu, Linux Mint, Armbian, or Debian.
 - [Tailscale](https://tailscale.com/) installed and logged in with MagicDNS and HTTPS certificates enabled.
 - [LDC (`ldc2`) and DUB (`dub`)](https://wiki.dlang.org/LDC) to build from source (version `0.1.0` tested with LDC 1.43.0 / DUB 1.42.0).

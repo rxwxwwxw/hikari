@@ -3,7 +3,49 @@ module http.caddy;
 import core.config : normalizeBasePath;
 import std.conv : to;
 import std.file : exists, readText;
-import std.string : replace;
+import std.string : replace, split, toLower;
+import std.algorithm : endsWith, startsWith, canFind;
+import std.ascii : isAlphaNum;
+import std.socket : parseAddress;
+
+private string caddyToken(string value) {
+    foreach (c; value) if (c < 0x20 || c == 0x7f)
+        throw new Exception("Control character in Caddy path");
+    if (value.canFind("{$")) throw new Exception("Environment substitution is not allowed in Caddy paths");
+    return `"` ~ value.replace(`\`, `\\`).replace(`"`, `\"`) ~ `"`;
+}
+
+private string checkedBasePath(string value) {
+    auto path = normalizeBasePath(value);
+    foreach (c; path) if (!isAlphaNum(c) && c != '/' && c != '-' && c != '_'
+        && c != '.' && c != '~' && c != '%')
+        throw new Exception("Unsafe endpoint base path");
+    return path;
+}
+
+private string checkedTailnetAddress(string value) {
+    auto address = parseAddress(value).toAddrString().toLower(); // numeric only; never DNS
+    auto octets = address.split('.');
+    if (octets.length == 4 && octets[0] == "100") {
+        auto second = to!uint(octets[1]);
+        if (second >= 64 && second <= 127) return address;
+    }
+    if (address.startsWith("fd7a:115c:a1e0:")) return address;
+    throw new Exception("Caddy must bind a Tailscale address");
+}
+
+private string checkedMagicDnsName(string value) {
+    auto name = value.toLower();
+    if (!name.endsWith(".ts.net") || name.length > 253)
+        throw new Exception("Expected a MagicDNS .ts.net hostname");
+    foreach (label; name.split('.')) {
+        if (!label.length || label.length > 63 || label[0] == '-' || label[$-1] == '-')
+            throw new Exception("Invalid MagicDNS hostname");
+        foreach (c; label) if (!isAlphaNum(c) && c != '-')
+            throw new Exception("Invalid MagicDNS hostname");
+    }
+    return name;
+}
 
 string renderCaddyfile(
     string tmplPath,
@@ -25,22 +67,27 @@ string renderCaddyfile(
         ? readText(tmplPath)
         : "{\n\tadmin off\n\tauto_https disable_redirects\n\tstorage file_system __STATE_DIR__/caddy\n}\n\nhttps://__MAGIC_DNS_FQDN__:__PORT__ {\n\tbind __TAILSCALE_IP__\n\n\thandle __BASE_PATH_API__ {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
 
-    auto bp = normalizeBasePath(basePath);
+    auto bp = checkedBasePath(basePath);
+    fqdn = checkedMagicDnsName(fqdn);
+    tailscaleIp = checkedTailnetAddress(tailscaleIp);
+    if (!tailnetPort || !loopbackPort) throw new Exception("Caddy ports must be nonzero");
+    auto quotedWebDir = caddyToken(webDir);
     string apiPattern = (bp == "/") ? "/api/v1/*" : (bp ~ "/api/v1/*");
 
     auto rendered = tmpl
-        .replace("__STATE_DIR__", stateDir)
+        .replace("__STATE_DIR__/caddy", caddyToken(stateDir ~ "/caddy"))
+        .replace("__STATE_DIR__", caddyToken(stateDir))
         .replace("__MAGIC_DNS_FQDN__", fqdn)
         .replace("__PORT__", to!string(tailnetPort))
         .replace("__TAILSCALE_IP__", tailscaleIp)
         .replace("__BASE_PATH_API__", apiPattern)
         .replace("__LOCAL_PORT__", to!string(loopbackPort))
-        .replace("__WEB_DIR__", webDir);
+        .replace("__WEB_DIR__", caddyToken(webDir));
 
     if (bp != "/") {
         rendered = rendered.replace(
-            "\thandle {\n\t\troot * " ~ webDir ~ "\n\t\tfile_server\n\t}",
-            "\thandle_path " ~ bp ~ "/* {\n\t\troot * " ~ webDir ~ "\n\t\tfile_server\n\t}"
+            "\thandle {\n\t\troot * " ~ quotedWebDir ~ "\n\t\tfile_server\n\t}",
+            "\thandle_path " ~ bp ~ "/* {\n\t\troot * " ~ quotedWebDir ~ "\n\t\tfile_server\n\t}"
         );
     }
     return rendered;
@@ -56,10 +103,10 @@ string renderCaddySnippet(
         ? readText(tmplPath)
         : "handle_path __BASE_PATH_PREFIX__/* {\n\thandle /api/v1/* {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
 
-    auto bp = normalizeBasePath(basePath);
+    auto bp = checkedBasePath(basePath);
     string prefix = (bp == "/") ? "/hikari" : bp;
     return tmpl
         .replace("__BASE_PATH_PREFIX__", prefix)
         .replace("__LOCAL_PORT__", to!string(loopbackPort))
-        .replace("__WEB_DIR__", webDir);
+        .replace("__WEB_DIR__", caddyToken(webDir));
 }

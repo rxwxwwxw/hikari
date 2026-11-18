@@ -7,7 +7,7 @@ import core.model;
 import core.serializer;
 import hardware.inventory;
 import platform.api;
-import platform.darwin : parsePmsetBatteryOutput;
+import platform.darwin : DarwinPowerSource, decodeDarwinPowerSource, normalizeDarwinCpuTicks;
 import std.algorithm : canFind;
 import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
 import std.json : JSONType;
@@ -51,15 +51,26 @@ unittest {
     assert(parsed.memoryModules[0].speed_mt_s.get == 6000);
     assert(parsed.memoryModules[0].technology == "DDR5");
 
-    // 2. macOS pmset -g batt parser
-    auto bats = parsePmsetBatteryOutput(
-        "Now drawing from 'Battery Power'\n" ~
-        " -InternalBattery-0 (id=1234567)\t84%; discharging; 4:12 remaining present: true\n"
-    );
-    assert(bats.length == 1);
-    assert(abs(bats[0].pct.get - 84.0) < 0.01);
-    assert(bats[0].status == "discharging");
-    assert(bats[0].time_remaining_s.get == 4 * 3600 + 12 * 60);
+    // Native macOS power-source semantics, including unknown time/capacity.
+    DarwinPowerSource source;
+    source.state = "Battery Power";
+    source.currentCapacity = 84;
+    source.maxCapacity = 100;
+    source.minutesToEmpty = 252;
+    auto battery = decodeDarwinPowerSource(source, "battery:0");
+    assert(abs(battery.pct.get - 84.0) < 0.01);
+    assert(battery.status == "discharging");
+    assert(battery.time_remaining_s.get == 4 * 3600 + 12 * 60);
+    source.minutesToEmpty = -1;
+    source.maxCapacity = 0;
+    battery = decodeDarwinPowerSource(source, "battery:0");
+    assert(battery.pct.isNull && battery.time_remaining_s.isNull);
+    source.charging = true;
+    assert(decodeDarwinPowerSource(source, "battery:0").status == "charging");
+    source.charging = false;
+    source.charged = true;
+    assert(decodeDarwinPowerSource(source, "battery:0").status == "full");
+
 }
 
 unittest {
@@ -96,4 +107,25 @@ unittest {
     assert(macJson["cpu"]["efficiency_cores"].uinteger == 4);
     assert(macJson["board"]["model"].str == "Mac15,3");
     assert(macJson["cpu"]["isa"]["usable"].array.length > 0);
+}
+
+unittest {
+    auto intel = new FakePlatformBackend("macos-intel");
+    auto identity = intel.identity();
+    auto hardware = intel.scanHardware().inventory;
+    assert(identity.os == "darwin" && identity.arch == "x86_64");
+    assert(hardware.system.model == "iMac19,1");
+    assert(hardware.cpu.vendor == "Intel" && hardware.cpu.physical_cores.get == 6);
+    assert(hardware.cpu.performance_cores.isNull && hardware.cpu.efficiency_cores.isNull);
+    assert(hardware.firmware.version_str.length == 0);
+    assert(hardware.cpu.isa.usable.canFind("avx2"));
+    assert(intel.sampleCpu().logical_cores == intel.sampleProcesses().logical_cores);
+}
+
+unittest {
+    assert(normalizeDarwinCpuTicks(4_800_000, 0, 24_000_000, 100).get == 20);
+    assert(normalizeDarwinCpuTicks(200_000_000, 0, 1_000_000_000, 100).get == 20);
+    assert(normalizeDarwinCpuTicks(0, 0, 24_000_000, 100).get == 0);
+    assert(normalizeDarwinCpuTicks(1, 0, 0, 100).isNull);
+    assert(normalizeDarwinCpuTicks(ulong.max, 1, 24_000_000, 100).isNull);
 }

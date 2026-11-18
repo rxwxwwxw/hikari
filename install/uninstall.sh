@@ -75,11 +75,13 @@ if [ "$TARGET_OS" = "macos" ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
       echo "[dry-run] Would bootout system/io.hikari.caddy and system/io.hikari.agent"
     else
+      launchctl bootout system/io.hikari.recover 2>/dev/null || true
       launchctl bootout system/io.hikari.caddy 2>/dev/null || true
       launchctl bootout system/io.hikari.agent 2>/dev/null || true
     fi
   fi
 
+  remove_path "$UNIT_DIR/io.hikari.recover.plist"
   remove_path "$UNIT_DIR/io.hikari.agent.plist"
   remove_path "$UNIT_DIR/io.hikari.caddy.plist"
   remove_path "$OPT_HIKARI"

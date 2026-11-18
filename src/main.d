@@ -11,6 +11,7 @@ import http.caddy;
 import http.routes;
 import http.server;
 import platform.api;
+import platform.command : runLocalCommand;
 import platform.linux;
 import std.algorithm : canFind, startsWith;
 import std.conv : to;
@@ -164,12 +165,6 @@ private int cmdServe(string[] args) {
     auto reg = new NodeRegistry(cfg.paths.state_dir);
     auto disc = new TailnetDiscoveryService(cfg, reg);
 
-    // Populate initial local FQDN cheaply without polling peers
-    auto snap = disc.getLocalTailscaleSnapshot(false);
-    if (snap.available && snap.selfNode.fqdn.length > 0) {
-        coord.updateFqdn(snap.selfNode.fqdn);
-    }
-
     string webIndex = hasFlag(args, "--serve-web") || fixture.length > 0 || tsFixture.length > 0
         ? findWebIndexPath(cfg)
         : "";
@@ -182,6 +177,18 @@ private int cmdServe(string[] args) {
         AGENT_VERSION, server.bindAddr, server.actualPort(),
         cfg.listen.base_path == "/" ? "" : cfg.listen.base_path, nodeId);
     stdout.flush();
+
+    // Local identity lookup is bounded, but Tailscale may be disconnected or
+    // inaccessible to this service account. Never delay loopback health on it.
+    auto identityInit = new Thread({
+        try {
+            auto snap = disc.getLocalTailscaleSnapshot(false);
+            if (snap.available && snap.selfNode.fqdn.length > 0)
+                coord.updateFqdn(snap.selfNode.fqdn);
+        } catch (Exception) {}
+    });
+    identityInit.isDaemon = true;
+    identityInit.start();
 
     server.serveLoop();
     return 0;
@@ -232,7 +239,21 @@ private int cmdCaddy(string[] args) {
     if (tsFixture.length > 0) cfg.tailscale_fixture = tsFixture;
     auto outPath = getFlagValue(args, "--out", "-");
 
+    if (sub == "validate") {
+        auto binary = getFlagValue(args, "--caddy-bin", "caddy");
+        auto path = getFlagValue(args, "--caddyfile", "");
+        if (!path.length) { stderr.writeln("Missing --caddyfile"); return 2; }
+        auto result = runLocalCommand([binary, "validate", "--adapter", "caddyfile", "--config", path], 10000, 65536);
+        if (result.status != 0 || result.outputTruncated) {
+            stderr.writeln(result.timedOut ? "Caddy validation timed out" : "Caddy validation failed");
+            return 1;
+        }
+        return 0;
+    }
+
     if (sub == "snippet") {
+        cfg.listen.base_path = getFlagValue(args, "--base-path", cfg.listen.base_path);
+        cfg.paths.web_dir = getFlagValue(args, "--web-dir", cfg.paths.web_dir);
         auto tmpl = getFlagValue(args, "--template", "caddy/snippet.caddy.tmpl");
         auto text = renderCaddySnippet(tmpl, cfg.listen.loopback_port, cfg.listen.base_path, cfg.paths.web_dir);
         writeOutput(outPath, text);
@@ -245,8 +266,7 @@ private int cmdCaddy(string[] args) {
         string tsIp = getFlagValue(args, "--tailscale-ip", "");
 
         if (fqdn.length == 0 || tsIp.length == 0) {
-            auto reg = new NodeRegistry(cfg.paths.state_dir);
-            auto disc = new TailnetDiscoveryService(cfg, reg);
+            auto disc = new TailnetDiscoveryService(cfg, null);
             auto snap = disc.getLocalTailscaleSnapshot(true);
             if (!snap.available) {
                 stderr.writeln("Tailscale status unavailable; cannot determine MagicDNS FQDN and Tailscale IP");
@@ -315,7 +335,7 @@ private int cmdDoctor(string[] args) {
         if (h.status == 0) {
             rep.checks ~= DoctorCheck("local_agent", "pass", "Loopback agent responded healthy on /healthz", "");
         } else {
-            rep.checks ~= DoctorCheck("local_agent", "warn", "Local hikari agent is not currently listening on loopback port " ~ to!string(cfg.listen.loopback_port), "Start hikari.service or run `hikari serve`");
+            rep.checks ~= DoctorCheck("local_agent", "warn", "Local hikari agent is not currently listening on loopback port " ~ to!string(cfg.listen.loopback_port), "Start the installed hikari agent service or run `hikari serve`");
             if (rep.overall == "pass") rep.overall = "warn";
         }
     } catch (Exception) {
@@ -338,6 +358,15 @@ private int cmdDoctor(string[] args) {
     } else {
         rep.checks ~= DoctorCheck("tailscale", "fail", "Tailscale status unavailable (" ~ snap.error ~ ")", "Ensure tailscaled is running and this node is logged into your tailnet");
         rep.overall = "fail";
+    }
+
+    version (OSX) {
+        import platform.darwin_service : macosServiceChecks;
+        auto url = cfg.tailscale_fixture.length == 0 && snap.available
+            ? buildHttpsUrl(snap.selfNode.fqdn, cfg.listen.tailnet_port, cfg.listen.base_path, "/api/v1/info") : "";
+        auto checks = macosServiceChecks(url, snap.selfNode.fqdn);
+        rep.checks ~= checks;
+        foreach (check; checks) if (check.status == "warn" && rep.overall == "pass") rep.overall = "warn";
     }
 
     // 5. Caddy binary & Caddyfile validation
@@ -377,7 +406,9 @@ private int cmdDoctor(string[] args) {
                 if (snap.available && snap.selfNode.fqdn.length > 0 && snap.selfNode.tailscale_ips.length > 0) {
                     auto tmpCf = tempDir() ~ "/hikari-doctor-Caddyfile";
                     try {
-                        auto rendered = renderCaddyfile("caddy/Caddyfile.tmpl", snap.selfNode.fqdn, cfg.listen.tailnet_port, snap.selfNode.tailscale_ips[0], cfg.listen.loopback_port, cfg.listen.base_path, cfg.paths.state_dir, cfg.paths.web_dir);
+                        auto templatePath = cfg.paths.versions_dir ~ "/current/caddy/Caddyfile.tmpl";
+                        if (!exists(templatePath)) templatePath = "caddy/Caddyfile.tmpl";
+                        auto rendered = renderCaddyfile(templatePath, snap.selfNode.fqdn, cfg.listen.tailnet_port, snap.selfNode.tailscale_ips[0], cfg.listen.loopback_port, cfg.listen.base_path, cfg.paths.state_dir, cfg.paths.web_dir);
                         write(tmpCf, rendered);
                         auto val = execute([caddyBin, "validate", "--adapter", "caddyfile", "--config", tmpCf], null, Config.none, 4096);
                         if (val.status == 0) {
@@ -512,16 +543,15 @@ private int cmdUpdate(string[] args) {
             stderr.writeln("Usage: hikari update apply --manifest <path> --sig <path> --archive <path>");
             return 2;
         }
-        verifyVerifiedReleasePackage(cfg, manifestPath, sigPath, archivePath, AGENT_VERSION, targetOs, arch);
-        auto m = parseReleaseManifest(readText(manifestPath));
-        stageVerifiedArchive(archivePath, versionsDir, m.version_str);
+        auto staged = stageSignedRelease(cfg, manifestPath, sigPath, archivePath,
+            versionsDir, AGENT_VERSION, targetOs, arch);
         import std.functional : toDelegate;
         bool noRestartFn(string _) { return true; }
         auto noRestart = toDelegate(&noRestartFn);
         auto outc = activateAndVerifyRelease(
             versionsDir,
             stateDir,
-            m.version_str,
+            staged.versionString,
             hasFlag(args, "--no-restart") ? noRestart : null,
             hasFlag(args, "--no-restart") ? noRestart : makeLoopbackHealthChecker(cfg.listen.loopback_bind, cfg.listen.loopback_port)
         );
@@ -529,11 +559,12 @@ private int cmdUpdate(string[] args) {
         return outc.ok ? 0 : 1;
     }
 
-    if (sub == "rollback") {
+    if (sub == "rollback" || sub == "recover") {
         import std.functional : toDelegate;
         bool noRestartFn(string _) { return true; }
         auto noRestart = toDelegate(&noRestartFn);
-        auto outc = rollbackToPrevious(
+        auto operation = sub == "recover" ? &recoverInterruptedActivation : &rollbackToPrevious;
+        auto outc = operation(
             versionsDir,
             stateDir,
             hasFlag(args, "--no-restart") ? noRestart : null,
