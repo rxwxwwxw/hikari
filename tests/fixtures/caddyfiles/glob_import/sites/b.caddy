@@ -1,0 +1,3 @@
+b.example.com {
+	respond "b"
+}

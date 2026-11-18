@@ -600,6 +600,38 @@ version (Windows) {
         return "removed";
     }
 
+    private struct H_ENUM_SERVICE_STATUS_PROCESSW {
+        wchar* lpServiceName;
+        wchar* lpDisplayName;
+        DWORD[9] status; // SERVICE_STATUS_PROCESS
+    }
+
+    private extern (Windows) nothrow @nogc BOOL EnumServicesStatusExW(SC_HANDLE hSCManager, int InfoLevel, DWORD dwServiceType,
+        DWORD dwServiceState, ubyte* lpServices, DWORD cbBufSize, DWORD* pcbBytesNeeded, DWORD* lpServicesReturned,
+        DWORD* lpResumeHandle, const(wchar)* pszGroupName);
+
+    /// Names of all Win32 services (read-only enumeration).
+    string[] listServiceNames() {
+        enum DWORD SC_MANAGER_ENUMERATE_SERVICE = 0x0004, SERVICE_WIN32 = 0x30, SERVICE_STATE_ALL = 3, ERROR_MORE_DATA = 234;
+        string[] names;
+        auto scm = openScm(SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+        scope (exit) CloseServiceHandle(scm);
+        DWORD resume = 0;
+        auto buf = new ubyte[64 * 1024];
+        while (true) {
+            DWORD needed = 0, returned = 0;
+            auto ok = EnumServicesStatusExW(scm, 0, SERVICE_WIN32, SERVICE_STATE_ALL, buf.ptr, cast(DWORD) buf.length,
+                &needed, &returned, &resume, null);
+            auto err = ok ? 0 : GetLastError();
+            if (!ok && err != ERROR_MORE_DATA) break;
+            auto entries = (cast(H_ENUM_SERVICE_STATUS_PROCESSW*) buf.ptr)[0 .. returned];
+            foreach (ref e; entries) names ~= fromWz(e.lpServiceName);
+            if (ok) break;
+            if (needed > buf.length) buf = new ubyte[needed];
+        }
+        return names;
+    }
+
     bool startService(string name, uint timeoutMs = 30_000) {
         auto scm = openScm(SC_MANAGER_CONNECT);
         scope (exit) CloseServiceHandle(scm);

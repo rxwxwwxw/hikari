@@ -4,7 +4,13 @@
 
 1. **Loopback-only D listener:** The `hikari` binary binds exclusively to `127.0.0.1` (or `::1`) and validates `loopback_bind` on startup. It never opens a public or tailnet-facing plain HTTP socket.
 2. **Tailscale-IP-only HTTPS proxy (`hikari-caddy`):** The dedicated Caddy instance binds only to the node's Tailscale IP on `listen.tailnet_port` (default `9100`), with `admin off` and `auto_https disable_redirects`. If Tailscale is offline at boot, Caddy does not fall back to `0.0.0.0`.
-3. **Existing service preservation:** Installers, updaters, and `hikari doctor` never modify, reload, or stop pre-existing Caddy or `tailscaled` configurations.
+3. **Existing service preservation:** Installers, updaters, and `hikari doctor` never modify `tailscaled` or unrelated services, and never restart or stop a pre-existing Caddy. The single exception is the verified integration into an existing Caddy (`caddy.mode=auto|integrate`, see [caddy-integration.md](caddy-integration.md)):
+   - one marked import line and a hikari-owned site file, shown in the installer plan before anything is written;
+   - proven with `caddy adapt` to leave every existing server and TLS policy unchanged;
+   - backed up and removable byte for byte;
+   - reloaded only on explicit request.
+
+   Use `caddy.mode=isolated` to keep an existing Caddy completely untouched. When joined, hikari's site is served by that Caddy and inherits its process identity; it still binds only to the Tailscale address.
 
 ## Tailnet Access Control & Certificates
 

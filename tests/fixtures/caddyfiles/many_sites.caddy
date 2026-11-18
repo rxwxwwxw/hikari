@@ -1,0 +1,17 @@
+{
+	email ops@example.com
+}
+
+www.example.com, example.com {
+	redir https://example.com{uri}
+}
+
+http://intranet.lan {
+	root * /srv/intranet
+	file_server browse
+}
+
+:8443 {
+	tls internal
+	respond "admin" 200
+}

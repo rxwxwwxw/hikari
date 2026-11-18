@@ -1,0 +1,18 @@
+app.example.com {
+	@api {
+		path /api/*
+		method GET POST
+	}
+	handle_path /static/* {
+		root * /srv/static
+		file_server
+	}
+	reverse_proxy @api 127.0.0.1:9000 127.0.0.1:9001 {
+		lb_policy round_robin
+		health_uri /healthz
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000;"
+		-Server
+	}
+}

@@ -13,7 +13,7 @@ The dashboard must answer two questions:
 
 **Priorities, in order:**
 
-1. **Do not break or modify other services**, particularly pre-existing Caddy or Tailscale configuration.
+1. **Do not break other services.** Never modify Tailscale or unrelated services. An existing Caddy may only be changed by the verified, reversible integration in §7.1 (one marked import line plus a hikari-owned site file); it is never restarted and is reloaded only on explicit request.
 2. **Be quiet when nobody is looking:** no agent-initiated peer telemetry/discovery probes, high-frequency sampling, or polling loops while the dashboard is closed. Any exceptional update or certificate traffic must be documented and configurable.
 3. **Be correct and honest:** distinguish missing, unsupported, stale, failed, and zero-valued measurements. Do not invent hardware details.
 4. **Be secure and recoverable:** tailnet-only transport, least privilege, signed releases, transactional updates, and safe rollback.
@@ -25,7 +25,7 @@ The dashboard must answer two questions:
 Each participating machine ordinarily runs:
 
 - **`hikari`**: one native D executable, with an idle loopback HTTP listener, an in-memory telemetry cache, a persistent hardware/known-node registry, and platform-specific collectors. It **does not periodically poll peers**.
-- **An isolated `hikari-caddy` instance**: serves the single-file dashboard and proxies versioned API requests to the local D listener. It listens **only on the machine's Tailscale address**, with HTTPS using Caddy's native Tailscale certificate integration.
+- **An HTTPS front end**: either an existing Caddy that hikari joined under §7.1, or an isolated `hikari-caddy` instance. Either way, hikari's site serves the single-file dashboard and proxies versioned API requests to the local D listener, listens **only on the machine's Tailscale address**, and uses Caddy's native Tailscale certificate integration.
 - **An optional maintenance policy**: release checks/updates are **deferred until dashboard activity by default**, or may be explicitly enabled on a schedule. Never silently enable periodic peer telemetry polling.
 
 Each machine is independently useful. There is **no central coordinator, database, message broker, hosted service, or account required by hikari**. Any machine with the dashboard can show the fleet. Tailscale itself, Caddy, and the OS service manager are required infrastructure; “no D package dependencies” does **not** mean literally zero external software.
@@ -51,7 +51,7 @@ Each machine is independently useful. There is **no central coordinator, databas
 7. **No network calls from telemetry probes.** Package/version status must use locally available state unless an explicitly named maintenance operation is invoked.
 8. **Preserve operator intent.** Config changes, installation reruns, auto-updates, and uninstalls must not erase aliases, custom ports, ignored devices, or other operator-owned settings.
 9. **Least privilege.** Avoid running the telemetry service as root/Administrator; represent permission failures explicitly. Do not elevate within a probe.
-10. **No silent global changes.** Never reconfigure unrelated firewalls, Tailscale policies, system Caddy, package sources, or existing services.
+10. **No silent global changes.** Never reconfigure unrelated firewalls, Tailscale policies, package sources, or existing services. The only permitted change to a system Caddy is the verified, recorded and reversible integration of §7.1, reported in the installer's plan before it happens.
 
 ---
 
@@ -75,7 +75,7 @@ Browser (visible dashboard only)
                           `-- trusted, transactional updater
 ```
 
-**No public HTTP listener is permitted for the D agent.** Bind only `127.0.0.1` (optionally `::1` when deliberately configured) and ensure the chosen port belongs to hikari. The public-facing Caddy process binds only to a Tailscale interface address. If that address is unavailable, retry/reconcile without binding to all interfaces.
+**No public HTTP listener is permitted for the D agent.** Bind only `127.0.0.1` (optionally `::1` when deliberately configured) and ensure the chosen port belongs to hikari. The public-facing Caddy (isolated `hikari-caddy` or a joined existing Caddy) binds hikari's site only to a Tailscale interface address. If that address is unavailable, retry/reconcile without binding to all interfaces.
 
 The **dashboard** makes peer requests only while visible, and **each peer** collects only what has become due. The node hosting the dashboard may do limited, on-demand discovery on behalf of its browser; this is not a central collector.
 
@@ -359,9 +359,17 @@ Show `last seen`, `last successful telemetry`, and last sampled timestamps separ
 
 ## 7. HTTPS, CORS, identity, and coexistence
 
-### 7.1 Caddy isolation is mandatory
+### 7.1 Coexisting with Caddy: verified integration or an isolated instance
 
-Many machines already use Caddy, `tailscale serve`, and HTTPS on `:443`. The installer and updater **must not read/modify/reload/restart** existing Caddy configuration, service units, or `tailscale serve` settings.
+Many machines already use Caddy, `tailscale serve`, and HTTPS on `:443`. The installer and updater **never modify** `tailscale serve` settings or Caddy service units, and never restart an existing Caddy. `caddy.mode` (`auto` by default, `integrate`, `isolated`, `snippet`) selects how hikari is served:
+
+- **Integration (`auto`, `integrate`).** When an existing Caddy *service* runs a Caddyfile and every check passes, hikari appends exactly one marked block importing a hikari-owned site file, or drops that file into an existing top-level glob import, and changes nothing else. Requirements:
+  - Parse the whole config, imports included, and **refuse anything uncertain**: parse errors, JSON or admin-API (`--resume`) configs, `{$ENV}` addresses, config-management headers, import cycles, port/host/`servers`/`http(s)_port` conflicts, brace-less site files, hand-edited or duplicated markers, foreign files at hikari's site path, Caddy older than 2.6.
+  - Before writing, prove with `caddy adapt` that every original server and TLS policy is preserved. Only hikari's listener on `<tailscale-ip>:<port>` and policies that are provably equivalent may be added.
+  - Edit by byte offset only (no re-serialization), write atomically, and keep a timestamped backup. Removal must restore the original bytes exactly. Re-verify after writing and roll back on any difference.
+  - Reload only on explicit request (`--reload`/`-Reload`, or `caddy.reload`), restoring the original files if the reload fails.
+  - Record what was done in hikari's state directory, so that repair, mode switches and uninstall reverse exactly that.
+- **Isolated (`isolated`, and the fallback whenever integration is refused).** A dedicated `hikari-caddy`, configured as follows.
 
 - Default dedicated service name: `hikari-caddy`; default external port: **9100**, configurable.
 - Use a **separate Caddyfile**, storage directory, logs, runtime environment, and `admin off`. Disable automatic HTTP redirects to avoid port 80. Bind to the current **Tailscale address only**, never `0.0.0.0`, `:80`, or `:443` by default.
@@ -594,7 +602,7 @@ Regenerate only **hikari-owned generated files** when a release template or rele
 - Install the chosen platform binary, self-contained web assets, generated dedicated Caddy config, and isolated service definitions. Avoid introducing a permanent high-privilege helper.
 - Run the telemetry agent as a restricted account where feasible. Document unavoidable local permissions and explain opt-in richer hardware enumeration.
 - If a port is occupied, fail or request a different port. Never kill/reconfigure an unrelated listener.
-- Uninstall removes **only hikari-owned** services/files. Keep config/state by default; require an explicit `--purge` to delete user-owned state. Never uninstall Tailscale or an existing shared Caddy binary.
+- Uninstall removes **only hikari-owned** services/files and reverses any §7.1 Caddy integration byte for byte (refusing to proceed if it cannot). Keep config/state by default; require an explicit `--purge` to delete user-owned state. Never uninstall Tailscale or an existing shared Caddy binary.
 - On reboot, start safely when Tailscale is absent and reconcile its eventual readiness without a busy loop. On sleep/resume, clear invalid rate baselines and recover listeners/certificates as needed.
 
 ### 12.2 Per-platform service strategy
@@ -695,7 +703,8 @@ No feature is complete merely because it compiles or returns plausible JSON. Add
 - JSON contract tests: schema version, nullable measurements, valid URLs, group timestamps, conversion boundaries, and cross-version unknown fields.
 - Tailnet tests: rename, offline for 30+ days, custom port/base path, no MagicDNS, unrelated HTTPS service, unreachable peers, and TLS validation failure.
 - Browser tests: mixed online/offline/collecting nodes, no polling when hidden, per-host timeout isolation, prefixed URL handling, hostile strings escaped, and hardware-on-demand behavior.
-- Installer tests: idempotence, existing Caddy untouched, unrelated port occupied, no Tailscale at boot, reinstall preserves state, uninstall only removes hikari assets.
+- Installer tests: idempotence; an existing Caddy untouched in isolated mode and changed only by the marked block when joined; join/repair/mode-switch/uninstall round trips restore the Caddyfile byte for byte; refused integrations fall back or fail before writing; unrelated port occupied; no Tailscale at boot; reinstall preserves state; uninstall only removes hikari assets.
+- Caddyfile tests: a fixture corpus parsed by hikari and replayed against a real Caddy (listener agreement, rejection agreement, verified integrate/unintegrate round trips).
 - Update tests: bad signature, malicious archive entries, interrupted download, lock contention, failed startup, Windows running binary, rollback, and preservation of user config.
 
 ### 14.2 Performance and network quietness
@@ -725,13 +734,13 @@ Measure on representative Linux, macOS (Intel and Apple Silicon where available)
 - Poll peers or execute high-frequency telemetry probes on a background timer by default.
 - Advertise a stale/unsupported/failed measurement as a fresh zero.
 - Bind telemetry or Caddy publicly, use insecure HTTP for tailnet peer status, disable TLS certificate verification, or expose administrative actions without authorization.
-- Modify, restart, overwrite, or uninstall pre-existing Caddy or Tailscale services/settings without an explicit, separately documented operator action.
+- Modify Tailscale services/settings, or restart, overwrite or uninstall a pre-existing Caddy. The only permitted change to an existing Caddy is the verified, recorded, reversible integration of §7.1, reloaded only on request.
 - Download PCI names, drivers, packages, models, or OS updates in telemetry collection.
 - Collect default hardware serials, MAC addresses, auth tokens, full process command lines, or other unnecessary private identifiers.
 - Replace a running Windows executable, execute an unsigned update, silently migrate trust roots, or skip rollback protections.
 - Discard offline nodes merely because they have not been reachable for a week.
 - Add a central collector, external frontend dependency, telemetry SaaS, or background browser service worker without explicit approval.
-- Let an agent-generated file edit an existing application's routes or configuration implicitly.
+- Let an agent-generated file edit an existing application's routes or configuration, other than the documented, verified Caddy integration of §7.1.
 - Assume a feature exists because a CPU model, driver name, OS version, or JSON property suggests it might.
 
 ## 16. Authoritative references for integrations

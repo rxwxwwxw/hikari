@@ -1,0 +1,12 @@
+*.example.com {
+	tls internal
+
+	@foo host foo.example.com
+	handle @foo {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	handle {
+		abort
+	}
+}

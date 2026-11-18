@@ -60,6 +60,14 @@ Configuration lives at `/etc/hikari/config.json` on Linux. User settings and unk
 
 - **`listen.loopback_bind`:** Must be `127.0.0.1`, `::1`, or `localhost`. Any public bind address (`0.0.0.0`, `::`, LAN IP) is rejected at startup.
 - **`listen.base_path`:** `/` by default, or a prefix such as `/hikari` when sharing a Caddy site via `--snippet-only`.
+- **`caddy.mode`:** how the dashboard is served over HTTPS.
+  - `auto` (default): join an existing Caddy service when every safety check passes, otherwise use the isolated `hikari-caddy`.
+  - `integrate`: join, or fail before changing anything.
+  - `isolated`: never touch an existing Caddy.
+  - `snippet`: only write a snippet.
+
+  The installer's `--caddy-mode` / `-CaddyMode` overrides it for one run. What was actually done is recorded in `<state_dir>/caddy-integration.json` (inspect it with `hikari caddy status`), so repair, mode switches and uninstall reverse exactly that.
+- **`caddy.reload`:** `false` by default. When `true`, the installer reloads a joined Caddy after changing it (rolling back if the reload fails); otherwise it prints the reload command.
 - **`collection.ttl_seconds` & `max_stale_seconds`:** Request-driven freshness windows (never background polling intervals). When age is between `ttl` and `max_stale`, hikari returns the stale snapshot immediately labeled `stale` while refreshing once in the background.
 - **`updates.mode`:**
   - `on_dashboard_open` (default): quiet when dashboards are closed; checks verified releases only when active and due.

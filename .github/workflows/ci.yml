@@ -51,6 +51,24 @@ jobs:
       - name: Run shellcheck on scripts
         run: shellcheck -S warning install/install.sh install/uninstall.sh tests/integration/linux/*.sh tests/integration/macos/*.sh
 
+      - name: Caddyfile differential test against real Caddy
+        shell: bash
+        run: |
+          # Same pinned, checksum-verified Caddy the installer uses.
+          ver=$(sed -n 's/^CADDY_PINNED_VERSION="\(.*\)"/\1/p' install/install.sh)
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sha=$(sed -n 's/^CADDY_SHA512_LINUX_AMD64="\(.*\)"/\1/p' install/install.sh) ;;
+            aarch64) arch=arm64; sha=$(sed -n 's/^CADDY_SHA512_LINUX_ARM64="\(.*\)"/\1/p' install/install.sh) ;;
+          esac
+          dl="$RUNNER_TEMP/caddy-dl"; mkdir -p "$dl"
+          curl -fsSL -o "$dl/caddy.tgz" "https://github.com/caddyserver/caddy/releases/download/v${ver}/caddy_${ver}_linux_${arch}.tar.gz"
+          echo "$sha  $dl/caddy.tgz" | sha512sum -c -
+          tar -xzf "$dl/caddy.tgz" -C "$dl" caddy
+          pwsh -NoProfile -File tests/integration/caddy/differential.ps1 -Caddy "$dl/caddy"
+
+      - name: Installer test with an existing Caddy (join, repair, mode switch, uninstall)
+        run: bash tests/integration/linux/test-existing-caddy.sh "$RUNNER_TEMP/caddy-dl/caddy"
+
       - name: Run Linux installer, service, and container suite
         run: bash tests/integration/linux/run.sh --distro "${{ matrix.docker_distro }}"
 
@@ -77,14 +95,14 @@ jobs:
         shell: pwsh
         run: |
           $failed = $false
-          foreach ($f in Get-ChildItem install/*.ps1, tests/integration/windows/*.ps1) {
+          foreach ($f in Get-ChildItem install/*.ps1, tests/integration/windows/*.ps1, tests/integration/caddy/*.ps1) {
             $errs = $null
             [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs) | Out-Null
             if ($errs) { $failed = $true; $errs | ForEach-Object { Write-Error "$($f.Name):$($_.Extent.StartLineNumber) $($_.Message)" } }
           }
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -ErrorAction SilentlyContinue
           if (Get-Module -ListAvailable PSScriptAnalyzer) {
-            $issues = Invoke-ScriptAnalyzer -Path install, tests/integration/windows -Recurse -Severity Error
+            $issues = Invoke-ScriptAnalyzer -Path install, tests/integration/windows, tests/integration/caddy -Recurse -Severity Error
             if ($issues) { $issues | Format-Table -AutoSize | Out-String | Write-Host; $failed = $true }
           }
           if ($failed) { exit 1 }
@@ -110,6 +128,14 @@ jobs:
           if ($got -ne $sha) { throw "Pinned Caddy SHA-512 mismatch: expected $sha got $got" }
           Expand-Archive "$dl\caddy.zip" -DestinationPath "$dl\x" -Force
           .\tests\integration\windows\test-service.ps1 -CaddyExe "$dl\x\caddy.exe" -RequireCaddy
+
+      - name: Caddyfile differential test against real Caddy
+        shell: pwsh
+        run: .\tests\integration\caddy\differential.ps1 -Caddy "$env:RUNNER_TEMP\caddy-dl\x\caddy.exe"
+
+      - name: Installer test with an existing Caddy (join, repair, mode switch, uninstall)
+        shell: pwsh
+        run: .\tests\integration\windows\test-existing-caddy.ps1 -CaddyExe "$env:RUNNER_TEMP\caddy-dl\x\caddy.exe"
 
   macos-build-and-test:
     name: macOS (${{ matrix.arch }})

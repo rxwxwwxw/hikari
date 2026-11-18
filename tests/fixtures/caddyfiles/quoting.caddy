@@ -1,0 +1,7 @@
+# A comment with { unbalanced braces
+example.com {
+	header X-Quote "a \"quoted\" value with } brace"
+	header X-Hash "#not-a-comment"
+	respond `raw "text" {braces}` 200
+	header X-Inline value#hash # real comment {
+}

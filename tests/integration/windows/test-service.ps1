@@ -35,6 +35,10 @@ $CaddySvc = "hikari-caddy-citest"
 $ForeignSvc = "hikari-citest-foreign"
 $AgentPort = 19650
 $CaddyPort = 19652
+$UserCaddySvc = "hikari-usercaddy-citest"
+$UserSitePort = 19661
+$UserAdminPort = 19662
+$JoinPort = 19663
 
 # Under ProgramData (not the user profile) so the virtual service account can read the exe.
 $Root = Join-Path $env:ProgramData ("hikari-citest-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -168,6 +172,48 @@ https://localhost:$CaddyPort {
         if ($r.Code -ne 0) { Fail "caddy stop: $($r.Out)" }
         $r = Invoke-Hikari @("service", "uninstall", "--name", $CaddySvc, "--kind", "caddy", "--caddyfile", $Caddyfile)
         if ($r.Code -ne 0) { Fail "caddy uninstall: $($r.Out)" }
+
+        Step "joining a running user Caddy service: reload, rollback on failed reload, unjoin"
+        # A "user" Caddy that hikari did not install, running as its own Windows service.
+        $UserDir = Join-Path $Root "user-caddy"
+        New-Item -ItemType Directory -Force -Path $UserDir | Out-Null
+        $UserCf = Join-Path $UserDir "Caddyfile"
+        $userStore = ($UserDir -replace '\\', '/') + "/storage"
+        $userCfText = "{`n`tadmin localhost:$UserAdminPort`n`tstorage file_system $userStore`n`tskip_install_trust`n}`n`nhttp://:$UserSitePort {`n`tbind 127.0.0.1`n`trespond `"user site`"`n}`n"
+        [System.IO.File]::WriteAllText($UserCf, $userCfText, (New-Object System.Text.UTF8Encoding($false)))
+        $origUserHash = (Get-FileHash $UserCf).Hash
+        & sc.exe create $UserCaddySvc binPath= "`"$((Resolve-Path $CaddyExe).Path)`" run --config `"$UserCf`" --adapter caddyfile" start= demand | Out-Null
+        Start-Service $UserCaddySvc
+        Wait-Until { (Get-Http "http://127.0.0.1:$UserSitePort/").Body -match "user site" } 30 "user Caddy serving its own site"
+        $join = @("caddy", "integrate", "--caddyfile", $UserCf, "--caddy", (Resolve-Path $CaddyExe).Path, "--fqdn", "hikari-citest.localhost",
+            "--tailscale-ip", "127.0.0.1", "--port", "$JoinPort", "--config", (Join-Path $Root "none.json"), "--state-dir", $StateDir, "--web-dir", $UserDir, "--json")
+
+        # 1. A reload that fails (hikari's port is taken) restores the original file and keeps the user site up.
+        $blocker = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse("127.0.0.1"), $JoinPort)
+        $blocker.Start()
+        try {
+            $r = Invoke-Hikari ($join + @("--reload"))
+            if ($r.Out -notmatch '"ok":\s*false' -or $r.Out -notmatch "restored original") { Fail "failed reload should roll back: $($r.Out)" }
+        } finally { $blocker.Stop() }
+        if ((Get-FileHash $UserCf).Hash -ne $origUserHash) { Fail "rollback after a failed reload did not restore the user Caddyfile" }
+        if (Test-Path (Join-Path $UserDir "hikari.caddy")) { Fail "rollback left hikari.caddy behind" }
+        if ((Get-Http "http://127.0.0.1:$UserSitePort/").Body -notmatch "user site") { Fail "user site down after rollback" }
+
+        # 2. A successful join with reload: hikari's listener comes up inside the user's Caddy.
+        $r = Invoke-Hikari ($join + @("--reload"))
+        if ($r.Out -notmatch '"ok":\s*true' -or $r.Out -notmatch "reloaded") { Fail "join with reload failed: $($r.Out)" }
+        Wait-Until { (Get-NetTCPConnection -State Listen -LocalPort $JoinPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -eq "127.0.0.1" }) } 15 "hikari listener inside the user Caddy"
+        if ((Get-Http "http://127.0.0.1:$UserSitePort/").Body -notmatch "user site") { Fail "user site broken after join" }
+        $st = Invoke-Hikari @("caddy", "status", "--config", (Join-Path $Root "none.json"), "--state-dir", $StateDir, "--json")
+        if ($st.Out -notmatch '"manager":\s*"scm"' -or $st.Out -notmatch [regex]::Escape($UserCaddySvc)) { Fail "integration record should name the user Caddy service: $($st.Out)" }
+
+        # 3. Unjoin with reload: file byte-identical, hikari's listener gone, user site still up.
+        $r = Invoke-Hikari @("caddy", "unintegrate", "--config", (Join-Path $Root "none.json"), "--state-dir", $StateDir, "--reload", "--json")
+        if ($r.Out -notmatch '"ok":\s*true') { Fail "unjoin failed: $($r.Out)" }
+        if ((Get-FileHash $UserCf).Hash -ne $origUserHash) { Fail "unjoin did not restore the user Caddyfile byte for byte" }
+        Wait-Until { -not (Get-NetTCPConnection -State Listen -LocalPort $JoinPort -ErrorAction SilentlyContinue) } 15 "hikari listener removed from the user Caddy"
+        if ((Get-Http "http://127.0.0.1:$UserSitePort/").Body -notmatch "user site") { Fail "user site broken after unjoin" }
+        Stop-Service $UserCaddySvc
     } else {
         Write-Host "--- (skipping Caddy gate: pass -CaddyExe <caddy.exe>)"
     }
@@ -206,6 +252,6 @@ https://localhost:$CaddyPort {
 
     Write-Host "Windows native service test PASSED."
 } finally {
-    foreach ($n in @($CaddySvc, $Svc, $ForeignSvc)) { Remove-TestService $n }
+    foreach ($n in @($UserCaddySvc, $CaddySvc, $Svc, $ForeignSvc)) { Remove-TestService $n }
     if (Test-Path $Root) { Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue }
 }

@@ -1,0 +1,4 @@
+:443 {
+	tls internal
+	respond "catch-all" 404
+}

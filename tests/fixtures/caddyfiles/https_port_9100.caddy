@@ -1,0 +1,7 @@
+{
+	https_port 9100
+}
+
+example.com {
+	respond ok
+}

@@ -1,0 +1,485 @@
+{
+  "fqdn": "box.tail1234.ts.net",
+  "tailscale_ip": "100.64.0.10",
+  "port": 9100,
+  "fixtures": [
+    {
+      "file": "single_site.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "many_sites.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "www.example.com",
+          "port": 443,
+          "binds": []
+        },
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        },
+        {
+          "address": "http://intranet.lan",
+          "port": 80,
+          "binds": []
+        },
+        {
+          "address": ":8443",
+          "port": 8443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443",
+        ":80",
+        ":8443"
+      ]
+    },
+    {
+      "file": "catch_all_443.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": ":443",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "wildcard.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "*.example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "matchers_proxy.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "app.example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "snippets_import.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "lan.example.com",
+          "port": 443,
+          "binds": [
+            "192.168.1.5"
+          ]
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        "192.168.1.5:443"
+      ],
+      "snippets": [
+        "common"
+      ]
+    },
+    {
+      "file": "glob_import/Caddyfile",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "a.example.com",
+          "port": 443,
+          "binds": []
+        },
+        {
+          "address": "b.example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ],
+      "plan": "drop_in",
+      "site_file": "glob_import/sites/hikari.caddy"
+    },
+    {
+      "file": "cycle/Caddyfile",
+      "parsed": true,
+      "verdict": "isolated",
+      "reason": "import_cycle",
+      "adapt": "fail"
+    },
+    {
+      "file": "global_options.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "http://example.com",
+          "port": 80,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "admin": "off",
+      "auto_https": "off",
+      "listeners": [
+        ":80"
+      ]
+    },
+    {
+      "file": "servers_option_9100.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "conflict",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "heredoc.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "quoting.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "env_placeholder.caddy",
+      "parsed": true,
+      "verdict": "isolated",
+      "reason": "unresolved_placeholder",
+      "adapt": "skip"
+    },
+    {
+      "file": "crlf_bom.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.org",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "crlf": true,
+      "bom": true,
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "tabs_spaces.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.net",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "conflict_9100.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": ":9100",
+          "port": 9100,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "conflict",
+      "listeners": [
+        ":9100"
+      ]
+    },
+    {
+      "file": "conflict_same_host.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "box.tail1234.ts.net:9100",
+          "port": 9100,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "conflict",
+      "listeners": [
+        ":9100"
+      ]
+    },
+    {
+      "file": "bind_other_ip_9100.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": ":9100",
+          "port": 9100,
+          "binds": [
+            "127.0.0.1"
+          ]
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        "127.0.0.1:9100"
+      ]
+    },
+    {
+      "file": "ansible_managed.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "config_management",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "already_integrated/Caddyfile",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "already_integrated",
+      "hikari_markers": 1,
+      "plan": "append_import",
+      "site_file": "already_integrated/hikari.caddy",
+      "original": "example.com {\n\trespond ok\n}\n",
+      "adapt": "skip_listeners"
+    },
+    {
+      "file": "broken.caddy",
+      "parsed": false,
+      "verdict": "isolated",
+      "reason": "parse_error",
+      "adapt": "fail"
+    },
+    {
+      "file": "import_missing.caddy",
+      "parsed": false,
+      "verdict": "isolated",
+      "reason": "parse_error",
+      "adapt": "fail"
+    },
+    {
+      "file": "braceless.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "localhost",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "braceless_site_block",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "named_routes.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "https_port_9100.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 9100,
+          "binds": []
+        }
+      ],
+      "verdict": "isolated",
+      "reason": "conflict",
+      "listeners": [
+        ":9100"
+      ]
+    },
+    {
+      "file": "http_port_custom.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "http://example.com",
+          "port": 8080,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":8080"
+      ]
+    },
+    {
+      "file": "ipv6.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "[::1]:8080",
+          "port": 8080,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":8080"
+      ]
+    },
+    {
+      "file": "multiline_keys.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "a.example.com",
+          "port": 443,
+          "binds": []
+        },
+        {
+          "address": "b.example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "no_final_newline.caddy",
+      "parsed": true,
+      "sites": [
+        {
+          "address": "example.com",
+          "port": 443,
+          "binds": []
+        }
+      ],
+      "verdict": "integrate",
+      "reason": "ok",
+      "listeners": [
+        ":443"
+      ]
+    },
+    {
+      "file": "empty.caddy",
+      "parsed": true,
+      "sites": [],
+      "verdict": "integrate",
+      "reason": "ok",
+      "adapt": "skip"
+    }
+  ]
+}

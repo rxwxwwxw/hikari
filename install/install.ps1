@@ -9,6 +9,15 @@ services: hikari.exe implements the SCM protocol itself and Caddy supports it na
 no wrapper binary is involved. Services start at boot and keep running with no user signed in, during Fast User Switching and
 after every user signs out.
 
+Caddy modes (-CaddyMode, default from config.json `caddy.mode`, else auto):
+  auto       join an existing Caddy service when every safety check passes (one marked
+             import line + a hikari-owned site file, verified with `caddy adapt`), otherwise
+             run the isolated hikari-caddy service
+  integrate  join an existing Caddy or fail before changing anything
+  isolated   always run the isolated hikari-caddy; never touch an existing Caddy
+  snippet    only write an importable snippet (same as -SnippetOnly)
+An existing Caddy is reloaded only with -Reload; otherwise the exact command is printed.
+
 Guarantees:
   * Prints the full plan before changing anything; -DryRun changes nothing.
   * Never modifies Tailscale, IIS, firewall rules, or any pre-existing Caddy service.
@@ -21,6 +30,13 @@ param(
     [switch]$DryRun,
     [switch]$Repair,
     [switch]$SnippetOnly,
+    [ValidateSet("", "auto", "integrate", "isolated", "snippet")]
+    [string]$CaddyMode = "",
+    [switch]$Reload,
+    # Point at a specific existing Caddyfile/binary instead of detecting the Caddy service
+    # (also the only way integration is considered under -Root, so tests never touch a real Caddy).
+    [string]$ExistingCaddyfile = "",
+    [string]$ExistingCaddyBin = "",
     [ValidateSet("auto", "private", "existing")]
     [string]$CaddySource = "auto",
     [int]$TailnetPort = 9100,
@@ -109,6 +125,20 @@ if (Test-Path $ConfigPath) {
     }
 }
 
+# Effective Caddy mode: explicit flag > operator config > auto.
+$EffectiveCaddyMode = "auto"
+$EffectiveReload = [bool]$Reload
+if ($existingCfg -and $existingCfg.caddy) {
+    if ($existingCfg.caddy.mode) { $EffectiveCaddyMode = [string]$existingCfg.caddy.mode }
+    if ($existingCfg.caddy.reload) { $EffectiveReload = $true }
+}
+if ($CaddyMode) { $EffectiveCaddyMode = $CaddyMode }
+if ($SnippetOnly) { $EffectiveCaddyMode = "snippet" }
+$SnippetOnly = ($EffectiveCaddyMode -eq "snippet")
+if ($existingCfg -and $existingCfg.paths -and $existingCfg.paths.state_dir -and -not $Root) { $StateDir = [string]$existingCfg.paths.state_dir }
+$IntegrationRecord = Join-Path $StateDir "caddy-integration.json"
+$WasIntegrated = Test-Path $IntegrationRecord
+
 if (-not $BinarySource) {
     $cand = Join-Path $RepoRoot "bin\hikari.exe"
     if (Test-Path $cand) { $BinarySource = $cand }
@@ -177,6 +207,48 @@ function Test-TcpPortInUse([int]$Port) {
         return $false
     }
 }
+# Run hikari's own read-only analysis of any existing Caddy (no changes anywhere).
+function Invoke-Native([string]$Exe, [string[]]$NArgs) {
+    $ErrorActionPreference = "Continue"
+    $o = (& $Exe @NArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    return @{ Code = $LASTEXITCODE; Out = $o }
+}
+$ProbeExe = $BinarySource
+$ProbeDir = ""
+if ($BinarySource -like "*.zip") {
+    $ProbeDir = Join-Path $env:TEMP ("hikari-probe-" + [guid]::NewGuid().ToString("N"))
+    Expand-Archive -Path $BinarySource -DestinationPath $ProbeDir -Force
+    $ProbeExe = Join-Path $ProbeDir "hikari.exe"
+}
+$CaddyDecision = "isolated"
+$CaddyDecisionReason = ""
+$IntegrateCaddyfile = ""
+if ($EffectiveCaddyMode -eq "auto" -or $EffectiveCaddyMode -eq "integrate") {
+    if ($Root -and -not $ExistingCaddyfile) {
+        $CaddyDecisionReason = "existing-Caddy detection is disabled under -Root (pass -ExistingCaddyfile to test integration)"
+    } else {
+        $inspectArgs = @("caddy", "inspect", "--verdict", "--config", $ConfigPath, "--state-dir", $StateDir, "--port", "$TailnetPort")
+        if ($TsFqdn) { $inspectArgs += @("--fqdn", $TsFqdn) }
+        if ($TsIp) { $inspectArgs += @("--tailscale-ip", $TsIp) }
+        if ($ExistingCaddyfile) { $inspectArgs += @("--caddyfile", $ExistingCaddyfile) }
+        if ($ExistingCaddyBin) { $inspectArgs += @("--caddy", $ExistingCaddyBin) }
+        $v = Invoke-Native $ProbeExe $inspectArgs
+        $line = ($v.Out -split "`n" | Where-Object { $_ -match '^(integrate |isolated:)' } | Select-Object -First 1)
+        if ($line -and $line.StartsWith("integrate ")) {
+            $CaddyDecision = "integrate"
+            $IntegrateCaddyfile = $line.Substring(10).Trim()
+        } else {
+            $CaddyDecisionReason = if ($line) { ($line -replace '^isolated:\s*', '') } else { "inspection failed: $($v.Out)" }
+        }
+    }
+    if ($EffectiveCaddyMode -eq "integrate" -and $CaddyDecision -ne "integrate") {
+        throw "-CaddyMode integrate: cannot join the existing Caddy ($CaddyDecisionReason). Nothing was changed."
+    }
+} elseif ($EffectiveCaddyMode -eq "isolated") {
+    $CaddyDecisionReason = "caddy mode is 'isolated'"
+}
+if ($ProbeDir) { Remove-Item -Recurse -Force $ProbeDir -ErrorAction SilentlyContinue }
+
 # Ports held by our own running services are expected on reinstall.
 $OurAgentRunning = $OwnedServices.ContainsKey("hikari") -and $OwnedServices["hikari"].State -eq "Running"
 $OurCaddyRunning = $OwnedServices.ContainsKey("hikari-caddy") -and $OwnedServices["hikari-caddy"].State -eq "Running"
@@ -184,27 +256,29 @@ if (-not $Repair) {
     if (-not $OurAgentRunning -and (Test-TcpPortInUse $LoopbackPort)) {
         throw "Port conflict: loopback port $LoopbackPort is already used by another program. Re-run with -LoopbackPort <free port>."
     }
-    if (-not $SnippetOnly -and -not $OurCaddyRunning -and (Test-TcpPortInUse $TailnetPort)) {
+    if (-not $SnippetOnly -and $CaddyDecision -eq "isolated" -and -not $OurCaddyRunning -and (Test-TcpPortInUse $TailnetPort)) {
         throw "Port conflict: tailnet port $TailnetPort is already used by another program. Re-run with -TailnetPort <free port>."
     }
 }
 
-# Caddy resolution (an existing Caddy is used read-only; its service is never touched).
+# Caddy binary for the isolated instance (an existing Caddy binary is used read-only; its
+# service is never touched).
 $ResolvedCaddy = ""
 $CaddyOrigin = "none"
 $NeedCaddyDownload = $false
-if (-not $SnippetOnly) {
+function Resolve-IsolatedCaddy {
     if ($CaddyBin -and (Test-Path $CaddyBin)) {
-        $ResolvedCaddy = $CaddyBin; $CaddyOrigin = "explicit"
+        $script:ResolvedCaddy = $CaddyBin; $script:CaddyOrigin = "explicit"
     } elseif ($CaddySource -ne "private" -and (Get-Command caddy.exe -ErrorAction SilentlyContinue)) {
-        $ResolvedCaddy = (Get-Command caddy.exe).Source; $CaddyOrigin = "existing_readonly"
+        $script:ResolvedCaddy = (Get-Command caddy.exe).Source; $script:CaddyOrigin = "existing_readonly"
     } elseif ($CaddySource -eq "existing") {
         throw "No existing caddy.exe found on PATH (-CaddySource existing)."
     } else {
-        $ResolvedCaddy = Join-Path $PrivateBinDir "caddy.exe"; $CaddyOrigin = "private"
-        $NeedCaddyDownload = -not (Test-Path $ResolvedCaddy)
+        $script:ResolvedCaddy = Join-Path $PrivateBinDir "caddy.exe"; $script:CaddyOrigin = "private"
+        $script:NeedCaddyDownload = -not (Test-Path $script:ResolvedCaddy)
     }
 }
+if (-not $SnippetOnly -and $CaddyDecision -eq "isolated") { Resolve-IsolatedCaddy }
 
 $AppVersion = if (Test-Path (Join-Path $RepoRoot "VERSION")) { (Get-Content -Raw (Join-Path $RepoRoot "VERSION")).Trim() } else { "0.1.0" }
 
@@ -212,14 +286,24 @@ Write-Host "=== hikari Windows install plan ==="
 Write-Host "  Version:          $AppVersion -> $VersionsDir\$AppVersion (versions\current junction)"
 Write-Host "  Config / state:   $ConfigDir (config.json preserved if present) / $StateDir"
 Write-Host "  Ports:            tailnet=$TailnetPort loopback=127.0.0.1:$LoopbackPort base_path=$BasePath"
-Write-Host "  Caddy binary:     $(if ($ResolvedCaddy) { $ResolvedCaddy } else { '<none>' }) ($CaddyOrigin$(if ($NeedCaddyDownload) { ', will download pinned v' + $CaddyPinnedVersion }))"
+if ($SnippetOnly) {
+    Write-Host "  Caddy:            snippet only (written to $ConfigDir; nothing imported or reloaded)"
+} elseif ($CaddyDecision -eq "integrate") {
+    Write-Host "  Caddy:            join existing Caddy: append one marked import line to $IntegrateCaddyfile + hikari-owned site file (verified with caddy adapt, backup kept)"
+    Write-Host "                    reload: $(if ($EffectiveReload) { 'yes (rolled back if the reload fails)' } else { 'no - the exact reload command is printed' })"
+    if ($OwnedServices.ContainsKey("hikari-caddy")) { Write-Host "                    the isolated hikari-caddy service will be removed (its port moves to the existing Caddy)" }
+} else {
+    Write-Host "  Caddy:            isolated hikari-caddy$(if ($CaddyDecisionReason) { " ($CaddyDecisionReason)" })"
+    Write-Host "  Caddy binary:     $(if ($ResolvedCaddy) { $ResolvedCaddy } else { '<none>' }) ($CaddyOrigin$(if ($NeedCaddyDownload) { ', will download pinned v' + $CaddyPinnedVersion }))"
+    if ($WasIntegrated) { Write-Host "                    hikari's block will first be removed from the previously joined Caddy (restored byte for byte)" }
+}
 Write-Host "  Tailscale:        FQDN=$(if ($TsFqdn) { $TsFqdn } else { '<unavailable>' }) IP=$(if ($TsIp) { $TsIp } else { '<none>' }) service=$(if ($TsServicePresent) { 'present' } else { 'absent' })"
-Write-Host "  Services:         $(if ($ManageServices) { "native SCM: hikari ($(if ($AgentAccount -eq 'Virtual') { 'NT SERVICE\hikari' } else { 'LocalSystem' })), hikari-caddy (LocalSystem)" } else { 'not managed (-Root or -ServiceMode skip)' })"
+Write-Host "  Services:         $(if ($ManageServices) { "native SCM: hikari ($(if ($AgentAccount -eq 'Virtual') { 'NT SERVICE\hikari' } else { 'LocalSystem' }))$(if (-not $SnippetOnly -and $CaddyDecision -eq 'isolated') { ', hikari-caddy (LocalSystem)' })" } else { 'not managed (-Root or -ServiceMode skip)' })"
 if ($LegacyServices.Count -gt 0) {
     Write-Host "  Migration:        replace WinSW-wrapped $($LegacyServices -join ', ') with native services (config/state kept)"
 }
 Write-Host "  ACLs:             $(if ($Root) { 'skipped (-Root)' } else { 'restrict ProgramData\hikari to SYSTEM/Administrators; agent service gets config read + state/logs write' })"
-Write-Host "  Not modified:     Tailscale, firewall, IIS, any other Caddy, any other service"
+Write-Host "  Not modified:     Tailscale, firewall, IIS, any other service$(if ($CaddyDecision -ne 'integrate') { ', any other Caddy' })"
 if ($ManageServices -and -not $TsServicePresent) {
     Write-Host "  WARNING: Tailscale service not found. hikari-caddy will retry with backoff until Tailscale is installed and up."
 }
@@ -254,7 +338,8 @@ if (-not $Root) {
 # ---------------------------------------------------------------------------
 # 3. Helper downloads (verified before use)
 # ---------------------------------------------------------------------------
-if ($NeedCaddyDownload) {
+function Install-PrivateCaddyIfNeeded {
+    if (-not $script:NeedCaddyDownload) { return }
     $url = "https://github.com/caddyserver/caddy/releases/download/v$CaddyPinnedVersion/caddy_${CaddyPinnedVersion}_windows_amd64.zip"
     $dlDir = Join-Path $env:TEMP ("hikari-caddy-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $dlDir | Out-Null
@@ -265,12 +350,14 @@ if ($NeedCaddyDownload) {
         $hash = (Get-FileHash -Path $tmpZip -Algorithm SHA512).Hash.ToLower()
         if ($hash -ne $CaddySha512WinAmd64) { throw "Caddy checksum mismatch! expected=$CaddySha512WinAmd64 actual=$hash" }
         Expand-Archive -Path $tmpZip -DestinationPath (Join-Path $dlDir "x") -Force
-        Copy-Item (Join-Path $dlDir "x\caddy.exe") $ResolvedCaddy -Force
-        Write-Log "Installed verified private Caddy at $ResolvedCaddy"
+        Copy-Item (Join-Path $dlDir "x\caddy.exe") $script:ResolvedCaddy -Force
+        $script:NeedCaddyDownload = $false
+        Write-Log "Installed verified private Caddy at $($script:ResolvedCaddy)"
     } finally {
         Remove-Item -Recurse -Force $dlDir -ErrorAction SilentlyContinue
     }
 }
+Install-PrivateCaddyIfNeeded
 
 # ---------------------------------------------------------------------------
 # 4. Service helpers (hikari-owned services only)
@@ -385,6 +472,7 @@ if (-not (Test-Path $ConfigPath)) {
         discovery = @{ enabled_on_dashboard_open = $true; max_concurrent_probes = 4; probe_timeout_ms = 3000 }
         updates = @{ repo = $Repo; mode = "on_dashboard_open"; auto_install_verified = $true; check_interval_hours = 24; public_key = $PubKey; channel = "stable" }
         privacy = @{ expose_serials = $false; expose_mac_addresses = $false }
+        caddy = @{ mode = $EffectiveCaddyMode; reload = [bool]$EffectiveReload }
         paths = @{
             state_dir = $StateDir
             config_dir = $ConfigDir
@@ -404,11 +492,53 @@ if (-not (Test-Path $ConfigPath)) {
 # ---------------------------------------------------------------------------
 $InstalledExe = Join-Path $CurrentJunction "hikari.exe"
 $CaddyfileChanged = $false
+$Integrated = $false
+$ReloadHint = ""
+
+function Invoke-HikariJson([string[]]$HArgs) {
+    $r = Invoke-Native $InstalledExe $HArgs
+    $start = $r.Out.IndexOf("{")
+    if ($start -lt 0) { throw "hikari $($HArgs -join ' ') returned no JSON: $($r.Out)" }
+    return ($r.Out.Substring($start) | ConvertFrom-Json)
+}
+
+if (-not $SnippetOnly -and $CaddyDecision -eq "integrate") {
+    $intArgs = @("caddy", "integrate", "--config", $ConfigPath, "--state-dir", $StateDir, "--port", "$TailnetPort", "--json")
+    if ($TsFqdn) { $intArgs += @("--fqdn", $TsFqdn) }
+    if ($TsIp) { $intArgs += @("--tailscale-ip", $TsIp) }
+    if ($IntegrateCaddyfile) { $intArgs += @("--caddyfile", $IntegrateCaddyfile) }
+    if ($ExistingCaddyBin) { $intArgs += @("--caddy", $ExistingCaddyBin) }
+    $res = Invoke-HikariJson $intArgs
+    if ($res.ok) {
+        $Integrated = $true
+        $ReloadHint = [string]$res.reload
+        Write-Log "Joined existing Caddy: $($res.message)$(if ($res.backup) { "; backup $($res.backup)" })"
+    } elseif ($EffectiveCaddyMode -eq "integrate") {
+        throw "Could not join the existing Caddy: $($res.message) $(@($res.problems) -join '; ')"
+    } else {
+        Write-Log "Not joining the existing Caddy ($($res.message)); using the isolated hikari-caddy instead"
+        $CaddyDecision = "isolated"
+        Resolve-IsolatedCaddy
+        Install-PrivateCaddyIfNeeded
+    }
+}
+
+if (-not $SnippetOnly -and $CaddyDecision -eq "isolated" -and $WasIntegrated) {
+    # Switching back to isolated: remove hikari's block from the previously joined Caddy first.
+    $unArgs = @("caddy", "unintegrate", "--config", $ConfigPath, "--state-dir", $StateDir, "--json")
+    if ($EffectiveReload) { $unArgs += "--reload" }
+    $un = Invoke-HikariJson $unArgs
+    if (-not $un.ok) { throw "Could not remove hikari from the previously joined Caddy: $($un.message)" }
+    Write-Log "Removed hikari from the previously joined Caddy ($($un.message)). $($un.reload)"
+}
+
 if ($SnippetOnly) {
     $SnippetPath = Join-Path $ConfigDir "hikari-snippet.caddy"
     & $InstalledExe caddy snippet --config $ConfigPath --template (Join-Path $RelDir "caddy\snippet.caddy.tmpl") --out $SnippetPath
     if ($LASTEXITCODE -ne 0) { throw "Snippet generation failed" }
     Write-Log "Generated Caddy snippet at $SnippetPath (not imported anywhere; include it deliberately)"
+} elseif ($Integrated) {
+    # The existing Caddy serves hikari; no isolated Caddyfile is needed.
 } elseif ($TsFqdn -and $TsIp) {
     $newCaddyfile = "$CaddyfilePath.new"
     & $InstalledExe caddy render --config $ConfigPath --template (Join-Path $RelDir "caddy\Caddyfile.tmpl") --fqdn $TsFqdn --tailscale-ip $TsIp --out $newCaddyfile
@@ -458,7 +588,13 @@ if ($ManageServices) {
     }
 
     $caddyResult = ""
-    if (-not $SnippetOnly -and $ResolvedCaddy -and (Test-Path $CaddyfilePath)) {
+    if ($Integrated -and $OwnedServices.ContainsKey("hikari-caddy")) {
+        # The existing Caddy now serves the tailnet port; free it before any reload.
+        Invoke-HikariService @("uninstall", "--name", "hikari-caddy", "--kind", "caddy", "--caddyfile", $CaddyfilePath) | Out-Null
+        $OwnedServices.Remove("hikari-caddy")
+        Write-Log "Removed the isolated hikari-caddy service (switched to the existing Caddy)"
+    }
+    if (-not $SnippetOnly -and -not $Integrated -and $ResolvedCaddy -and (Test-Path $CaddyfilePath)) {
         $caddyResult = Invoke-HikariService @("install", "--name", "hikari-caddy", "--kind", "caddy", "--caddy", $ResolvedCaddy, "--caddyfile", $CaddyfilePath)
         $script:OwnedServices["hikari-caddy"] = $true
     }
@@ -479,6 +615,20 @@ if ($ManageServices) {
     }
 } elseif ($StoppedForUpgrade.Count -gt 0) {
     foreach ($n in $StoppedForUpgrade) { Start-Service -Name $n -ErrorAction SilentlyContinue }
+}
+
+if ($Integrated) {
+    if ($EffectiveReload) {
+        $rl = Invoke-Native $InstalledExe @("caddy", "reload", "--config", $ConfigPath, "--state-dir", $StateDir)
+        if ($rl.Code -eq 1) {
+            # The reload was attempted and failed: put the existing Caddy's files back.
+            $un = Invoke-HikariJson @("caddy", "unintegrate", "--config", $ConfigPath, "--state-dir", $StateDir, "--reload", "--json")
+            throw "Reloading the existing Caddy failed ($($rl.Out)); hikari's change was removed again ($($un.message)). Re-run with -CaddyMode isolated to use hikari's own Caddy."
+        }
+        Write-Log $rl.Out
+    } elseif ($ReloadHint) {
+        Write-Log $ReloadHint
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -514,7 +664,10 @@ Write-Host "`n=== hikari Windows installation complete ==="
 Write-Host "  Version:       $AppVersion"
 Write-Host "  Config:        $ConfigPath"
 Write-Host "  Logs:          $LogsDir (hikari.log, caddy.log, install.log)"
-if ($TsFqdn -and -not $SnippetOnly -and (Test-Path $CaddyfilePath)) {
+if ($Integrated) {
+    Write-Host "  Caddy:         joined existing Caddy ($IntegrateCaddyfile); undo with uninstall.ps1 or 'hikari caddy unintegrate'"
+}
+if ($TsFqdn -and -not $SnippetOnly -and ($Integrated -or (Test-Path $CaddyfilePath))) {
     Write-Host "  Dashboard URL: https://${TsFqdn}:${TailnetPort}$($BasePath.TrimEnd('/'))/"
     Write-Host "  Note: restrict TCP $TailnetPort in your Tailscale ACLs; hikari does not change Windows Firewall or Tailscale policy."
 }

@@ -1,0 +1,5 @@
+import Caddyfile
+
+other.example.com {
+	respond other
+}

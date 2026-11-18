@@ -1,0 +1,7 @@
+{$SITE_ADDRESS} {
+	reverse_proxy localhost:3000
+}
+
+example.com:{$APP_PORT} {
+	respond ok
+}

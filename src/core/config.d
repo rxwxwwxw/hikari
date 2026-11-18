@@ -102,6 +102,14 @@ struct PrivacyConfig {
     bool expose_mac_addresses = false;
 }
 
+/// How hikari serves its dashboard over HTTPS. `auto` joins an existing Caddy when every
+/// safety check passes and otherwise runs the isolated hikari-caddy; `integrate` requires
+/// joining; `isolated` never touches an existing Caddy; `snippet` only writes a snippet.
+struct CaddyConfig {
+    string mode = "auto";
+    bool reload = false; // reload an existing Caddy after integrating (otherwise print the command)
+}
+
 struct PathsConfig {
     version (Windows) {
         string state_dir = `C:\ProgramData\hikari\state`;
@@ -135,6 +143,7 @@ struct HikariConfig {
     UpdatesConfig updates;
     PrivacyConfig privacy;
     PathsConfig paths;
+    CaddyConfig caddy;
     string tailscale_fixture;
     // Preserves unknown operator keys across config round-trips
     JSONValue[string] extra_top_level;
@@ -163,6 +172,9 @@ void validateConfig(const ref HikariConfig cfg) {
     }
     if (cfg.listen.loopback_port == 0 || cfg.listen.tailnet_port == 0) {
         throw new Exception("Ports must be non-zero");
+    }
+    if (!["auto", "integrate", "isolated", "snippet"].canFind(cfg.caddy.mode)) {
+        throw new Exception("caddy.mode must be one of auto, integrate, isolated, snippet; got: " ~ cfg.caddy.mode);
     }
     if (cfg.discovery.max_concurrent_probes == 0 || cfg.discovery.max_concurrent_probes > 32) {
         throw new Exception("discovery.max_concurrent_probes must be between 1 and 32");
@@ -293,9 +305,16 @@ HikariConfig parseConfigJson(string content) {
         }
     }
 
+    if (auto pCaddy = "caddy" in root.object) {
+        if (pCaddy.type == JSONType.object) {
+            cfg.caddy.mode = readStringField(*pCaddy, "mode", cfg.caddy.mode);
+            cfg.caddy.reload = readBoolField(*pCaddy, "reload", cfg.caddy.reload);
+        }
+    }
+
     cfg.tailscale_fixture = readStringField(root, "tailscale_fixture", "");
 
-    enum knownTop = ["schema_version", "listen", "collection", "discovery", "updates", "privacy", "paths", "tailscale_fixture"];
+    enum knownTop = ["schema_version", "listen", "collection", "discovery", "updates", "privacy", "paths", "caddy", "tailscale_fixture"];
     foreach (k, v; root.object) {
         if (!knownTop.canFind(k)) {
             cfg.extra_top_level[k] = v;
@@ -385,6 +404,11 @@ JSONValue configToJson(const ref HikariConfig cfg) {
     paths["versions_dir"] = cfg.paths.versions_dir;
     paths["web_dir"] = cfg.paths.web_dir;
     root["paths"] = paths;
+
+    JSONValue caddy = JSONValue.emptyObject;
+    caddy["mode"] = cfg.caddy.mode;
+    caddy["reload"] = cfg.caddy.reload;
+    root["caddy"] = caddy;
 
     return root;
 }

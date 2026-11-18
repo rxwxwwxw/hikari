@@ -1,0 +1,11 @@
+{
+	email admin@example.com
+	storage file_system /var/lib/caddy
+	admin off
+	auto_https off
+}
+
+http://example.com {
+	root * /srv
+	file_server
+}
