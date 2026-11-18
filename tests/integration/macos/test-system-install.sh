@@ -42,7 +42,9 @@ install_test
 sudo -n -u _hikari /bin/test -r "$CONFIG"
 sudo -n -u _hikari_caddy /bin/test -r "$CONFIG"
 # Match the LaunchDaemon's 077 umask for files created by its account.
-sudo -n -u _hikari /bin/bash -c 'umask 077; exec "$@"' _ \
+# Capture output as the root test runner; only the agent runs as _hikari.
+# shellcheck disable=SC2024
+sudo -n -u _hikari /bin/bash -c 'cd /; umask 077; exec "$@"' _ \
   /opt/hikari/versions/current/hikari hardware --fixture macos-arm64 --state-dir "$STATE" > "$ROOT/hardware.json"
 test -f "$STATE/hardware_cache.json"
 if sudo -n -u _hikari_caddy /bin/test -r "$STATE/hardware_cache.json"; then echo 'Caddy can read private agent state' >&2; exit 1; fi

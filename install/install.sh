@@ -201,7 +201,8 @@ else
 fi
 
 log() {
-  local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+  local msg
+  msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
   echo "$msg"
   if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$(dirname "$LOG_FILE")"
