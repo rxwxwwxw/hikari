@@ -115,7 +115,9 @@ def extract_zip(archive, extract_dir):
             path = PurePosixPath(name)
             parts = path.parts
             mode = entry.external_attr >> 16
-            if (not parts or path.is_absolute() or "\\" in name
+            # ZipInfo rewrites os.sep to "/" on Windows; check the raw stored name too.
+            raw = getattr(entry, "orig_filename", name)
+            if (not parts or path.is_absolute() or "\\" in name or "\\" in raw
                     or any(p in (".", "..") or p.endswith((".", " "))
                            or re.search(r'[<>:"|?*\x00-\x1f]', p)
                            or re.fullmatch(r"(?i:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?", p)

@@ -30,6 +30,7 @@ class ReleaseVerification(unittest.TestCase):
                     bundle.writestr("web/index.html", b"dashboard")
                     if name:
                         entry = zipfile.ZipInfo(name)
+                        entry.filename = name  # keep raw backslashes; ZipInfo maps os.sep to "/" on Windows
                         if link:
                             entry.create_system = 3
                             entry.external_attr = 0o120777 << 16
