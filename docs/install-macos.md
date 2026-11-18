@@ -1,11 +1,11 @@
 # macOS Installation Guide (Stage 3)
 
-This guide covers building, testing, and installing **hikari** on **Apple Silicon (`arm64`)** and **Intel (`x86_64`)** Macs using system-domain **launchd LaunchDaemons** (`/Library/LaunchDaemons/`) so monitoring remains active at the login window and after users log out.
+This guide covers building, testing, and installing **hikari** on **Apple Silicon (`arm64`)** Macs using system-domain **launchd LaunchDaemons** (`/Library/LaunchDaemons/`) so monitoring remains active at the login window and after users log out. Intel macOS support is deferred for this release; Intel Macs running Linux use the Linux targets.
 
 ## Prerequisites
 
 - macOS with **Tailscale** installed and enrolled (MagicDNS and HTTPS certificates enabled).
-- **Homebrew** installed (`/opt/homebrew` on Apple Silicon or `/usr/local` on Intel).
+- **Homebrew** installed (normally `/opt/homebrew` on Apple Silicon).
 - **LDC2 (`ldc2`) and DUB (`dub`)** (`brew install ldc dub`) to build from source.
 
 ## Building & Testing Locally
@@ -59,8 +59,8 @@ sudo ./install/uninstall.sh --purge
 ## Current validation status
 
 See [macOS testing and release gates](testing-macos.md). Native Apple Silicon
-builds and local tests are exercised during development; Stage 3 remains gated on
-Intel execution and real service/tailnet/logout/reboot/sleep tests. Do not infer
+builds, unit tests and disposable installer-account/permission checks passed in CI;
+Stage 3 remains gated on real tailnet/logout/reboot/sleep tests. Do not infer
 production readiness from a successful build or staged installer test.
 
 Python 3 and an OpenSSL build supporting Ed25519 are also required for archive
@@ -106,7 +106,7 @@ sudo -u _hikari /opt/homebrew/bin/tailscale status --json
 sudo -u _hikari_caddy /opt/homebrew/bin/tailscale status --json
 ```
 
-Adjust the executable for Intel Homebrew or the installed Tailscale app. Do not
+Adjust the executable for your Homebrew prefix or the installed Tailscale app. Do not
 commit the resulting peer metadata. The [Tailscale macOS variants](https://tailscale.com/docs/concepts/macos-variants)
 have different daemon/CLI behavior. A successful interactive status command does
 not establish that Caddy can access its certificate API. Follow the
@@ -133,7 +133,7 @@ sudo /opt/hikari/versions/current/hikari update apply \
 sudo /opt/hikari/versions/current/hikari update recover
 ```
 
-Use `x86_64` artifacts on Intel. The bootstrap validates the signature, pinned
+The bootstrap validates the signature, pinned
 repository, target architecture, size, digest, archive paths and file types before
 extracting. A trusted local binary build can still be installed without an archive.
 Do not use `--no-restart` for production updates: it deliberately bypasses service

@@ -42,10 +42,14 @@ checks config access and isolation between telemetry and certificate state, repa
 uninstalls, and removes its own test accounts. It skips service activation and uses
 a fake Caddy; the native service and pinned-Caddy checks cover those separately.
 
-The official LDC 1.43.0 Intel macOS package was downloaded to temporary storage and verified against its published SHA-256 digest. A separate x86_64 release binary and test executable linked successfully; all nine D test modules passed under the machine’s already-installed Rosetta runtime. This found and fixed the Intel `getfsstat$INODE64` binding and native Mach process-counter normalization. Rosetta execution does not establish native Intel hardware behavior or replace its real-host gate.
+The official LDC 1.43.0 Intel macOS package was downloaded to temporary storage and verified against its published SHA-256 digest. A separate x86_64 release binary and test executable linked successfully; all nine D test modules passed under the machine’s already-installed Rosetta runtime. This found and fixed the Intel `getfsstat$INODE64` binding and native Mach process-counter normalization. This is historical compatibility evidence, not a claim of supported Intel macOS behavior.
 
-CI uses explicit Apple Silicon and Intel runner labels and runs these checks.
-A workflow declaration is not evidence of a successful CI run.
+macOS support is scoped to Apple Silicon for this release. Intel macOS validation
+and artifacts are deferred; Intel machines running Linux remain Linux targets.
+CI uses the Apple Silicon runner. Its build, unit, CLI, pinned-Caddy, temporary
+LaunchDaemon and real installer-account/permission checks passed in
+[run 44210913386](https://github.com/rxwxwwxw/hikari/actions/runs/44210913386).
+That run's Linux/Windows static-check failures are separate regression work.
 
 ## Real-host matrix (required before declaring Stage 3 complete)
 
@@ -53,18 +57,19 @@ Record macOS release, architecture, Tailscale variant/version, Caddy version,
 commands, results, and any limitations. Keep private hostnames and identifiers out
 of committed results.
 
-| Gate | Apple Silicon | Intel |
-| --- | --- | --- |
-| Native debug/release build and D tests | Local M1 passed during implementation | x86_64 build and nine modules pass under Rosetta; native runner pending |
-| Native CLI telemetry and hardware | Local M1 exercised | Pending native runner |
-| Low-privilege system LaunchDaemon smoke | User-run temporary job passed startup as nobody and crash recovery | Pending privileged run |
-| Production install/repair/uninstall; existing services unchanged | Pending disposable host | Pending disposable host |
-| Valid HTTPS from another tailnet device; service-account certificate permission | Pending enrolled hosts | Pending enrolled hosts |
-| Logout/login window and reboot | Pending operator-run host test | Pending operator-run host test |
-| Sleep/wake, network disconnect and address change | Pending operator-run host test | Pending operator-run host test |
-| Signed update, health failure, rollback and interrupted activation under launchd | Pending full service integration | Pending full service integration |
-| Mixed Linux/Windows/macOS fleet and hardware cards | Browser fixtures pass; real fleet pending | Same |
-| Idle CPU, RSS, wakeups, disk writes and connections | Local 20-second agent measurement below; installed stack pending | Pending measurement |
+| Gate | Apple Silicon |
+| --- | --- |
+| Native debug/release build and D tests | Local M1 and native CI passed |
+| Native CLI telemetry and hardware | Local M1 and native CI exercised |
+| Low-privilege system LaunchDaemon smoke | User-run temporary job and native CI passed startup as nobody and crash recovery |
+| Installer identities, permissions, repair and retained-state uninstall | Disposable native CI passed with service activation skipped and fake Caddy |
+| Production installed stack; existing services unchanged | Pending full service integration |
+| Valid HTTPS from another tailnet device; service-account certificate permission | Pending enrolled hosts |
+| Logout/login window and reboot | Pending operator-run host test |
+| Sleep/wake, network disconnect and address change | Pending operator-run host test |
+| Signed update, health failure, rollback and interrupted activation under launchd | Pending full service integration |
+| Mixed Linux/Windows/macOS fleet and hardware cards | Browser fixtures pass; real fleet pending |
+| Idle CPU, RSS, wakeups, disk writes and connections | Local 20-second agent measurement below; installed stack pending |
 
 Do not reboot or log out somebody's active development machine to satisfy a test.
 Use disposable/test hosts and arrange these disruptive gates explicitly.
