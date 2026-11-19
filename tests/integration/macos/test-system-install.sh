@@ -29,7 +29,7 @@ trap cleanup EXIT
 chmod 0755 "$ROOT"
 cat > "$ROOT/caddy" <<'MOCK'
 #!/bin/bash
-if [ "$1" = version ]; then echo 'v2.9.1'; fi
+if [ "$1" = version ]; then echo 'v2.11.9'; fi
 exit 0
 MOCK
 chmod 0755 "$ROOT/caddy"

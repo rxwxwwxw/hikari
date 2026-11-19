@@ -33,7 +33,7 @@ hikari never restarts, stops or deletes an existing `caddy.service`. When it joi
 
 For the isolated instance, the binary is chosen as follows:
 
-- **`--caddy-source=auto` (default):** If a compatible `caddy` binary is already on `PATH`, `hikari-caddy.service` invokes that binary with its own isolated `/etc/hikari/Caddyfile` (`admin off`, `auto_https disable_redirects`, storage in `/var/lib/hikari/caddy`, bound exclusively to the Tailscale IP). If Caddy is absent, hikari downloads a verified, SHA-256-pinned Caddy binary to `/opt/hikari/bin/caddy`.
+- **`--caddy-source=auto` (default):** If a compatible `caddy` binary (`>= 2.10.0`) is already on `PATH`, `hikari-caddy.service` invokes that binary with its own isolated `/etc/hikari/Caddyfile` (`admin off`, `auto_https disable_redirects`, storage in `/var/lib/hikari/caddy`, bound exclusively to the Tailscale IP). When no compatible `caddy` is installed, hikari refreshes package metadata (`pacman`/`dnf`/`apt`), checks if the distro package is `>= 2.10.0`, and offers to install it without enabling a system `caddy.service`; if the distro package is older than `2.10.0`, unavailable, fails, or is declined, hikari downloads the verified, SHA-512-pinned Caddy binary (`v2.11.9`) to `/opt/hikari/bin/caddy`.
 - **`--caddy-source=private`:** Always installs/uses the private pinned binary in `/opt/hikari/bin/caddy`.
 - **`--caddy-source=system-package`:** Installs the distro `caddy` package via `dnf`/`pacman`/`apt`, still running `hikari-caddy.service` separately.
 - **`--snippet-only`:** Writes `/etc/hikari/hikari-snippet.caddy` mounted under `/hikari/*` so you can `import /etc/hikari/hikari-snippet.caddy` into an existing Caddy site block manually.

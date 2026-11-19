@@ -22,7 +22,7 @@ mkdir -p "$MOCK_BIN_DIR"
 cat > "$MOCK_BIN_DIR/caddy" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = "version" ]; then
-  echo "v2.9.1 h1:mock-caddy"
+  echo "v2.11.9 h1:mock-caddy"
   exit 0
 fi
 if [ "$1" = "validate" ]; then
@@ -243,5 +243,150 @@ test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.path"
 test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.timer"
 test ! -e "$INST_ROOT/etc/systemd/system/hikari-maintenance.service"
 echo "  [pass] uninstall and --purge behaved cleanly"
+
+echo "=== 6. Testing package-manager Caddy version check & fallback ==="
+build_no_caddy_path() {
+  local out_dir="$1"
+  local new_path="" d f
+  local -a dirs
+  IFS=':' read -ra dirs <<< "$PATH"
+  for d in "${dirs[@]}"; do
+    [ -d "$d" ] || continue
+    if [ -e "$d/caddy" ]; then
+      local mirror
+      mirror="$out_dir/$(printf '%s' "$d" | tr '/' '_')"
+      mkdir -p "$mirror"
+      for f in "$d"/*; do
+        [ -e "$f" ] || continue
+        [ "${f##*/}" = "caddy" ] && continue
+        ln -sf "$f" "$mirror/${f##*/}"
+      done
+      new_path="${new_path:+$new_path:}$mirror"
+    else
+      new_path="${new_path:+$new_path:}$d"
+    fi
+  done
+  printf '%s\n' "$new_path"
+}
+
+CLEAN_HOST_PATH=$(build_no_caddy_path "$TMP_BASE/clean-sys-bin")
+
+# 6a. apt offers Caddy < 2.10.0 -> skip apt install and fall back to private binary
+APT_ROOT="$TMP_BASE/pkg-apt"
+APT_BIN="$TMP_BASE/apt-bin"
+mkdir -p "$APT_ROOT/opt/hikari/bin" "$APT_BIN"
+cp "$MOCK_BIN_DIR/caddy" "$APT_ROOT/opt/hikari/bin/caddy"
+chmod +x "$APT_ROOT/opt/hikari/bin/caddy"
+cat > "$APT_BIN/apt-get" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "update" ]; then exit 0; fi
+touch "$APT_ROOT/apt-install-called"
+exit 1
+EOF
+cat > "$APT_BIN/apt-cache" <<'EOF'
+#!/usr/bin/env bash
+echo "caddy:"
+echo "  Installed: (none)"
+echo "  Candidate: 2.6.2-6"
+EOF
+chmod +x "$APT_BIN/apt-get" "$APT_BIN/apt-cache"
+APT_OUT=$(HIKARI_TEST_ALLOW_PKG_INSTALL=1 HIKARI_NONINTERACTIVE=1 PATH="$APT_BIN:$CLEAN_HOST_PATH" \
+  bash "$REPO_ROOT/install/install.sh" --target-os=linux \
+  --root "$APT_ROOT" \
+  --os-release "$REPO_ROOT/tests/fixtures/os-release/ubuntu" \
+  --binary-source "$HIKARI_BIN" \
+  --tailscale-fixture "$TS_FIXTURE" \
+  --systemd-mode=skip)
+echo "$APT_OUT" | grep -q "older than v2.10.0" || {
+  echo "Expected old apt caddy version warning, got:" >&2
+  echo "$APT_OUT" >&2
+  exit 1
+}
+test ! -e "$APT_ROOT/apt-install-called"
+grep -q "ExecStart=$APT_ROOT/opt/hikari/bin/caddy " "$APT_ROOT/etc/systemd/system/hikari-caddy.service"
+echo "  [pass] old distro caddy (v2.6.2) skipped package install and fell back to private binary"
+
+# 6b. pacman offers Caddy >= 2.10.0, user declines prompt -> fall back to private binary
+PAC_DECLINE_ROOT="$TMP_BASE/pkg-pacman-decline"
+PAC_DECLINE_BIN="$TMP_BASE/pacman-decline-bin"
+mkdir -p "$PAC_DECLINE_ROOT/opt/hikari/bin" "$PAC_DECLINE_BIN"
+cp "$MOCK_BIN_DIR/caddy" "$PAC_DECLINE_ROOT/opt/hikari/bin/caddy"
+chmod +x "$PAC_DECLINE_ROOT/opt/hikari/bin/caddy"
+cat > "$PAC_DECLINE_BIN/pacman" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -Sy) exit 0 ;;
+  -Si)
+    echo "Name            : caddy"
+    echo "Version         : 2.11.7-1.1"
+    exit 0
+    ;;
+  -S)
+    IFS= read -r ans || ans="n"
+    case "$ans" in
+      [Yy]*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+esac
+exit 1
+EOF
+chmod +x "$PAC_DECLINE_BIN/pacman"
+PAC_DEC_OUT=$(printf 'n\n' | HIKARI_TEST_ALLOW_PKG_INSTALL=1 HIKARI_TEST_STDIN_PROMPT=1 PATH="$PAC_DECLINE_BIN:$CLEAN_HOST_PATH" \
+  bash "$REPO_ROOT/install/install.sh" --target-os=linux \
+  --root "$PAC_DECLINE_ROOT" \
+  --os-release "$REPO_ROOT/tests/fixtures/os-release/cachyos" \
+  --binary-source "$HIKARI_BIN" \
+  --tailscale-fixture "$TS_FIXTURE" \
+  --systemd-mode=skip)
+echo "$PAC_DEC_OUT" | grep -q "declined or did not complete" || {
+  echo "Expected declined pacman install fallback message, got:" >&2
+  echo "$PAC_DEC_OUT" >&2
+  exit 1
+}
+grep -q "ExecStart=$PAC_DECLINE_ROOT/opt/hikari/bin/caddy " "$PAC_DECLINE_ROOT/etc/systemd/system/hikari-caddy.service"
+echo "  [pass] declined package manager install fell back to private binary"
+
+# 6c. pacman offers Caddy >= 2.10.0 and installs it -> installer uses system_package caddy
+PAC_OK_ROOT="$TMP_BASE/pkg-pacman-ok"
+PAC_OK_BIN="$TMP_BASE/pacman-ok-bin"
+mkdir -p "$PAC_OK_ROOT" "$PAC_OK_BIN"
+cat > "$PAC_OK_BIN/pacman" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  -Sy) exit 0 ;;
+  -Si)
+    echo "Name            : caddy"
+    echo "Version         : 2.11.7-1.1"
+    exit 0
+    ;;
+  -S)
+    cat > "$PAC_OK_BIN/caddy" <<'MCADDY'
+#!/usr/bin/env bash
+if [ "\$1" = "version" ]; then echo "v2.11.7 h1:mock-pkg"; exit 0; fi
+if [ "\$1" = "validate" ]; then exit 0; fi
+exit 0
+MCADDY
+    chmod +x "$PAC_OK_BIN/caddy"
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+chmod +x "$PAC_OK_BIN/pacman"
+PAC_OK_OUT=$(HIKARI_TEST_ALLOW_PKG_INSTALL=1 HIKARI_NONINTERACTIVE=1 PATH="$PAC_OK_BIN:$CLEAN_HOST_PATH" \
+  bash "$REPO_ROOT/install/install.sh" --target-os=linux \
+  --root "$PAC_OK_ROOT" \
+  --os-release "$REPO_ROOT/tests/fixtures/os-release/cachyos" \
+  --binary-source "$HIKARI_BIN" \
+  --tailscale-fixture "$TS_FIXTURE" \
+  --systemd-mode=skip)
+echo "$PAC_OK_OUT" | grep -q "(system_package)" || {
+  echo "Expected system_package origin in output, got:" >&2
+  echo "$PAC_OK_OUT" >&2
+  exit 1
+}
+grep -q "ExecStart=$PAC_OK_BIN/caddy " "$PAC_OK_ROOT/etc/systemd/system/hikari-caddy.service"
+echo "  [pass] compatible distro caddy (>= v2.10.0) installed via package manager"
 
 echo "All Linux installer integration checks PASSED."

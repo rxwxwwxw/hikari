@@ -14,6 +14,7 @@ INSTALL_ARGS=("$@")
 #   snippet    only write an importable snippet (same as --snippet-only)
 # An existing Caddy is reloaded only with --reload; otherwise the reload command is printed.
 
+CADDY_MIN_VERSION="2.10.0"
 CADDY_PINNED_VERSION="2.11.9"
 CADDY_SHA512_LINUX_AMD64="0e85544340290a16ce4bfb76fe7d65e9de1bf3a6e67f5ccfff30b30d27ea4c73e078077b7bf3e58ae60b6b12e44327705287059c775bca5782e8ee85ea7edd75"
 CADDY_SHA512_LINUX_ARM64="9e5e76d7888542924de2c25353ae87c5f77e2a22c5b1198633cae13688922282e05383d142599205c88d8d80eee5e967d291214d7abce4835329a191b20dd6e0"
@@ -531,35 +532,267 @@ fi
 RESOLVED_CADDY_BIN=""
 CADDY_ORIGIN="none"
 
-detect_existing_caddy() {
+extract_caddy_semver() {
+  local raw="${1:-}"
+  if [[ "$raw" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+caddy_version_at_least() {
+  local raw_ver min_ver
+  raw_ver=$(extract_caddy_semver "${1:-}") || return 1
+  min_ver=$(extract_caddy_semver "${2:-}") || return 1
+  local r1 r2 r3 m1 m2 m3
+  IFS=. read -r r1 r2 r3 <<< "$raw_ver"
+  IFS=. read -r m1 m2 m3 <<< "$min_ver"
+  if [ "$((10#$r1))" -gt "$((10#$m1))" ]; then return 0; fi
+  if [ "$((10#$r1))" -lt "$((10#$m1))" ]; then return 1; fi
+  if [ "$((10#$r2))" -gt "$((10#$m2))" ]; then return 0; fi
+  if [ "$((10#$r2))" -lt "$((10#$m2))" ]; then return 1; fi
+  [ "$((10#$r3))" -ge "$((10#$m3))" ]
+}
+
+interactive_tty_available() {
+  if [ "${HIKARI_NONINTERACTIVE:-0}" = "1" ]; then
+    return 1
+  fi
+  if [ "${HIKARI_TEST_STDIN_PROMPT:-0}" = "1" ]; then
+    return 0
+  fi
+  { [ -t 0 ] || { [ -t 1 ] && [ -t 2 ]; }; } && ( true < /dev/tty ) 2>/dev/null
+}
+
+run_pkg_tty() {
+  if [ "${HIKARI_TEST_STDIN_PROMPT:-0}" = "1" ]; then
+    "$@"
+  else
+    "$@" < /dev/tty
+  fi
+}
+
+run_brew() {
+  if [ -z "${BREW_BIN:-}" ]; then
+    return 1
+  fi
+  if [ "$(id -u)" -eq 0 ]; then
+    if [ -z "${SUDO_USER:-}" ]; then
+      return 1
+    fi
+    local cmd
+    printf -v cmd '%q ' "$BREW_BIN" "$@"
+    su - "$SUDO_USER" -c "$cmd"
+  else
+    "$BREW_BIN" "$@"
+  fi
+}
+
+detect_system_caddy() {
   if [ -n "$CADDY_BIN_OVERRIDE" ] && [ -x "$CADDY_BIN_OVERRIDE" ]; then
     RESOLVED_CADDY_BIN="$CADDY_BIN_OVERRIDE"
     CADDY_ORIGIN="explicit"
     return 0
   fi
-  if [ -x "$PRIVATE_BIN_DIR/caddy" ]; then
-    RESOLVED_CADDY_BIN="$PRIVATE_BIN_DIR/caddy"
-    CADDY_ORIGIN="private"
-    return 0
-  fi
   if [ "$TARGET_OS" = "macos" ]; then
     for cand in /opt/homebrew/bin/caddy /usr/local/bin/caddy; do
-      if [ -x "$cand" ] && "$cand" version >/dev/null 2>&1; then
-        RESOLVED_CADDY_BIN="$cand"
-        CADDY_ORIGIN="existing_homebrew_readonly"
-        return 0
+      if [ -x "$cand" ]; then
+        local cand_ver_out
+        cand_ver_out=$("$cand" version 2>/dev/null || true)
+        if caddy_version_at_least "$cand_ver_out" "$CADDY_MIN_VERSION"; then
+          RESOLVED_CADDY_BIN="$cand"
+          CADDY_ORIGIN="existing_homebrew_readonly"
+          return 0
+        elif [ -n "$cand_ver_out" ]; then
+          log "Ignoring $cand ($cand_ver_out): requires Caddy >= v$CADDY_MIN_VERSION for current Tailscale certificates."
+        fi
       fi
     done
   fi
   if command -v caddy >/dev/null 2>&1; then
-    local sys_caddy
+    local sys_caddy sys_ver_out
     sys_caddy="$(command -v caddy)"
-    if "$sys_caddy" version >/dev/null 2>&1; then
-      RESOLVED_CADDY_BIN="$sys_caddy"
-      CADDY_ORIGIN="existing_system_binary_readonly"
-      return 0
+    if [ "$sys_caddy" != "$PRIVATE_BIN_DIR/caddy" ]; then
+      sys_ver_out=$("$sys_caddy" version 2>/dev/null || true)
+      if caddy_version_at_least "$sys_ver_out" "$CADDY_MIN_VERSION"; then
+        RESOLVED_CADDY_BIN="$sys_caddy"
+        CADDY_ORIGIN="existing_system_binary_readonly"
+        return 0
+      elif [ -n "$sys_ver_out" ]; then
+        log "Ignoring $sys_caddy ($sys_ver_out): requires Caddy >= v$CADDY_MIN_VERSION for current Tailscale certificates."
+      fi
     fi
   fi
+  return 1
+}
+
+detect_private_caddy() {
+  if [ -x "$PRIVATE_BIN_DIR/caddy" ]; then
+    local priv_ver_out
+    priv_ver_out=$("$PRIVATE_BIN_DIR/caddy" version 2>/dev/null || true)
+    if caddy_version_at_least "$priv_ver_out" "$CADDY_MIN_VERSION"; then
+      RESOLVED_CADDY_BIN="$PRIVATE_BIN_DIR/caddy"
+      CADDY_ORIGIN="private"
+      return 0
+    elif [ -n "$priv_ver_out" ]; then
+      log "Existing private Caddy at $PRIVATE_BIN_DIR/caddy ($priv_ver_out) is older than v$CADDY_MIN_VERSION; replacing."
+    fi
+  fi
+  return 1
+}
+
+detect_existing_caddy() {
+  detect_system_caddy || detect_private_caddy
+}
+
+query_package_manager_caddy_version() {
+  case "$PKG_FAMILY" in
+    pacman)
+      pacman -Si caddy 2>/dev/null | awk '/^Version[[:space:]]*:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}'
+      ;;
+    dnf)
+      dnf info caddy 2>/dev/null | awk '/^Version[[:space:]]*:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}'
+      ;;
+    apt)
+      apt-cache policy caddy 2>/dev/null | awk '/^[[:space:]]*Candidate:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}'
+      ;;
+    homebrew)
+      run_brew info --json=v2 caddy 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(data["formulae"][0]["versions"]["stable"])
+except Exception:
+    pass
+'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+try_install_system_package_caddy() {
+  local mode="${1:-auto}"
+  if [ -n "$ROOT_PREFIX" ] && [ "${HIKARI_TEST_ALLOW_PKG_INSTALL:-0}" != "1" ] && [ "$DRY_RUN" -eq 0 ]; then
+    return 1
+  fi
+  case "$PKG_FAMILY" in
+    pacman|dnf|apt|homebrew) ;;
+    *) return 1 ;;
+  esac
+  if [ "$PKG_FAMILY" = "homebrew" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+    if [ "$mode" = "explicit" ]; then
+      echo "Refusing to run brew install as root without SUDO_USER." >&2
+    else
+      log "Cannot run Homebrew as root without SUDO_USER; will download pinned Caddy v${CADDY_PINNED_VERSION} instead."
+    fi
+    return 1
+  fi
+
+  local cand_raw cand_ver
+  if [ "$DRY_RUN" -eq 1 ]; then
+    cand_raw=$(query_package_manager_caddy_version || true)
+    cand_ver=$(extract_caddy_semver "$cand_raw" || true)
+    if [ -n "$cand_ver" ] && ! caddy_version_at_least "$cand_ver" "$CADDY_MIN_VERSION"; then
+      echo "[dry-run] Distro caddy package in $PKG_FAMILY is v${cand_ver} (< v${CADDY_MIN_VERSION} required for current Tailscale certificates); would fall back to pinned Caddy v${CADDY_PINNED_VERSION}"
+      return 1
+    fi
+    echo "[dry-run] Would refresh $PKG_FAMILY metadata, verify caddy >= v${CADDY_MIN_VERSION}${cand_ver:+ (currently v$cand_ver)}, and install caddy package without enabling system caddy service"
+    RESOLVED_CADDY_BIN=$([ "$TARGET_OS" = "macos" ] && echo "/opt/homebrew/bin/caddy" || echo "/usr/bin/caddy")
+    CADDY_ORIGIN="system_package_planned"
+    return 0
+  fi
+
+  case "$PKG_FAMILY" in
+    pacman)
+      log "Refreshing pacman package databases..."
+      pacman -Sy >/dev/null 2>&1 || true
+      ;;
+    dnf)
+      log "Refreshing dnf package metadata..."
+      dnf makecache --quiet >/dev/null 2>&1 || true
+      ;;
+    apt)
+      log "Refreshing apt package indexes..."
+      apt-get update -qq >/dev/null 2>&1 || true
+      ;;
+    homebrew)
+      log "Refreshing Homebrew formula metadata..."
+      run_brew update --quiet >/dev/null 2>&1 || true
+      ;;
+  esac
+
+  cand_raw=$(query_package_manager_caddy_version || true)
+  cand_ver=$(extract_caddy_semver "$cand_raw" || true)
+  if [ -z "$cand_ver" ]; then
+    log "Could not determine candidate caddy package version from $PKG_FAMILY; will download pinned Caddy v${CADDY_PINNED_VERSION} instead."
+    return 1
+  fi
+  if ! caddy_version_at_least "$cand_ver" "$CADDY_MIN_VERSION"; then
+    log "Package manager ($PKG_FAMILY) offers caddy v${cand_ver}, which is older than v${CADDY_MIN_VERSION} (required for current Tailscale HTTPS certificates); will download pinned Caddy v${CADDY_PINNED_VERSION} instead."
+    return 1
+  fi
+  log "Package manager ($PKG_FAMILY) offers compatible caddy v${cand_ver} (>= v${CADDY_MIN_VERSION})."
+
+  local had_caddy_active=0 had_caddy_enabled=0
+  if [ "$PKG_FAMILY" = "apt" ] && [ -z "$ROOT_PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet caddy.service 2>/dev/null && had_caddy_active=1
+    systemctl is-enabled --quiet caddy.service 2>/dev/null && had_caddy_enabled=1
+  fi
+
+  local pkg_rc=0
+  set +e
+  if interactive_tty_available; then
+    case "$PKG_FAMILY" in
+      pacman) run_pkg_tty pacman -S --needed caddy; pkg_rc=$? ;;
+      dnf) run_pkg_tty dnf install caddy; pkg_rc=$? ;;
+      apt) run_pkg_tty apt-get install caddy; pkg_rc=$? ;;
+      homebrew)
+        local reply=""
+        if [ "${HIKARI_TEST_STDIN_PROMPT:-0}" = "1" ]; then
+          printf 'Install Caddy v%s via Homebrew (%s install caddy)? [Y/n] ' "$cand_ver" "$BREW_BIN"
+          IFS= read -r reply || reply="n"
+        else
+          printf 'Install Caddy v%s via Homebrew (%s install caddy)? [Y/n] ' "$cand_ver" "$BREW_BIN" > /dev/tty
+          IFS= read -r reply < /dev/tty || reply="n"
+        fi
+        case "$reply" in
+          [Nn]*) pkg_rc=1 ;;
+          *) run_brew install caddy; pkg_rc=$? ;;
+        esac
+        ;;
+    esac
+  else
+    case "$PKG_FAMILY" in
+      pacman) pacman -S --noconfirm --needed caddy; pkg_rc=$? ;;
+      dnf) dnf install -y caddy; pkg_rc=$? ;;
+      apt) DEBIAN_FRONTEND=noninteractive apt-get install -y caddy; pkg_rc=$? ;;
+      homebrew) run_brew install caddy; pkg_rc=$? ;;
+    esac
+  fi
+  set -e
+
+  if [ "$PKG_FAMILY" = "apt" ] && [ -z "$ROOT_PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ "$had_caddy_active" -eq 0 ] && systemctl is-active --quiet caddy.service 2>/dev/null; then
+      systemctl stop caddy.service >/dev/null 2>&1 || true
+    fi
+    if [ "$had_caddy_enabled" -eq 0 ] && systemctl is-enabled --quiet caddy.service 2>/dev/null; then
+      systemctl disable caddy.service >/dev/null 2>&1 || true
+    fi
+  fi
+
+  hash -r
+  if [ "$pkg_rc" -eq 0 ] && detect_system_caddy; then
+    CADDY_ORIGIN="system_package"
+    if [ -e "$PRIVATE_BIN_DIR/caddy" ] && [ "$RESOLVED_CADDY_BIN" != "$PRIVATE_BIN_DIR/caddy" ]; then
+      rm -f "$PRIVATE_BIN_DIR/caddy"
+    fi
+    return 0
+  fi
+
+  log "Package manager install of caddy was declined or did not complete; will download pinned Caddy v${CADDY_PINNED_VERSION} instead."
   return 1
 }
 
@@ -615,8 +848,16 @@ install_private_caddy() {
 resolve_isolated_caddy() {
   case "$CADDY_SOURCE" in
     auto)
-      if ! detect_existing_caddy; then
-        install_private_caddy
+      if detect_system_caddy; then
+        return 0
+      fi
+      if [ "$REPAIR" -eq 1 ] && detect_private_caddy; then
+        return 0
+      fi
+      if ! try_install_system_package_caddy "auto"; then
+        if ! detect_private_caddy; then
+          install_private_caddy
+        fi
       fi
       ;;
     existing)
@@ -629,37 +870,14 @@ resolve_isolated_caddy() {
       if [ -n "$CADDY_BIN_OVERRIDE" ] && [ -x "$CADDY_BIN_OVERRIDE" ]; then
         RESOLVED_CADDY_BIN="$CADDY_BIN_OVERRIDE"
         CADDY_ORIGIN="private_override"
-      elif [ -x "$PRIVATE_BIN_DIR/caddy" ]; then
-        RESOLVED_CADDY_BIN="$PRIVATE_BIN_DIR/caddy"
-        CADDY_ORIGIN="private"
-      else
+      elif ! detect_private_caddy; then
         install_private_caddy
       fi
       ;;
     system-package)
-      if [ "$DRY_RUN" -eq 1 ]; then
-        echo "[dry-run] Would install caddy package via $PKG_FAMILY without enabling system caddy service"
-        RESOLVED_CADDY_BIN=$([ "$TARGET_OS" = "macos" ] && echo "/opt/homebrew/bin/caddy" || echo "/usr/bin/caddy")
-        CADDY_ORIGIN="system_package_planned"
-      else
-        case "$PKG_FAMILY" in
-          dnf) dnf install -y caddy ;;
-          pacman) pacman -S --noconfirm --needed caddy ;;
-          apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y caddy ;;
-          homebrew)
-            if [ -z "${SUDO_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
-              echo "Refusing to run brew install as root without SUDO_USER." >&2; exit 1
-            fi
-            if [ -n "${SUDO_USER:-}" ]; then
-              su - "$SUDO_USER" -c "$BREW_BIN install caddy"
-            else
-              "$BREW_BIN" install caddy
-            fi
-            ;;
-          *) echo "Unsupported package manager ($PKG_FAMILY) for --caddy-source=system-package" >&2; exit 1 ;;
-        esac
-        detect_existing_caddy || true
-        CADDY_ORIGIN="system_package"
+      if ! try_install_system_package_caddy "explicit"; then
+        echo "Failed to install compatible caddy (>= v${CADDY_MIN_VERSION}) via package manager ($PKG_FAMILY) for --caddy-source=system-package." >&2
+        exit 1
       fi
       ;;
   esac

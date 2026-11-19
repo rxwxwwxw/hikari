@@ -22,7 +22,7 @@ MOCK_BIN="$TMP_ROOT/mock-bin"
 mkdir -p "$MOCK_BIN"
 cat > "$MOCK_BIN/caddy" <<'EOF'
 #!/usr/bin/env bash
-if [ "$1" = "version" ]; then echo "v2.9.1 h1:mock"; exit 0; fi
+if [ "$1" = "version" ]; then echo "v2.11.9 h1:mock"; exit 0; fi
 if [ "$1" = "validate" ]; then exit 0; fi
 exit 0
 EOF
@@ -140,7 +140,7 @@ grep -q '"mac_custom": "keep"' "$INST/Library/Application Support/hikari/config.
 echo "=== Testing validation failure leaves activation unchanged ==="
 cat > "$MOCK_BIN/reject-caddy" <<'REJECT'
 #!/bin/bash
-if [ "$1" = version ]; then echo 'v2.9.1'; exit 0; fi
+if [ "$1" = version ]; then echo 'v2.11.9'; exit 0; fi
 exit 1
 REJECT
 chmod +x "$MOCK_BIN/reject-caddy"
