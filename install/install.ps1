@@ -66,9 +66,9 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 & python -c "import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)"
 if ($LASTEXITCODE -ne 0) { throw "Python 3.9+ is required; install it and rerun." }
 
-$CaddyPinnedVersion = "2.9.1"
-# Official Caddy v2.9.1 windows_amd64.zip SHA-512 from caddy_2.9.1_checksums.txt
-$CaddySha512WinAmd64 = "4f0f85b42015ff2276d08705751472e6a98bdc7fda5ec76dd41b7a0c16fee90af012f1a7beb226164408cfbe656bd3453ed5ccbb596f80c45d0fa1c749fc8da2"
+$CaddyPinnedVersion = "2.11.9"
+# Official Caddy v2.11.9 windows_amd64.zip SHA-512 from caddy_2.11.9_checksums.txt
+$CaddySha512WinAmd64 = "98753d5d42650383d00619ac70917a217141f9e92314185bf6c1b8b439cfcfdf8393da0ebb4675c8cb3b23d29a19aabe99dc5aca64fa1bfc3a1ba22509b06871"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir

@@ -69,14 +69,14 @@ Before writing, hikari runs `caddy adapt` (pure: no network, no servers, no stor
 - one server listening on `<tailscale-ip>:<port>`;
 - TLS policies that name only your Tailscale FQDN.
 
-Three differences Caddy itself introduces when any site is added are treated as equivalent. Each was found by running the corpus against real Caddy 2.9.1 and is covered by a unit test:
+Three differences Caddy itself introduces when any site is added are treated as equivalent. Each was found by running the corpus against real Caddy 2.9.1, still holds on the pinned 2.11.9, and is covered by a unit test:
 - **Handle group names:** `handle` groups are numbered across the whole config, so adding a site can rename `group0` to `group2` in your servers. They are compared modulo a consistent per-server renaming.
 - **Config path in `file_server`:** Caddy puts the config file's own path in `file_server`'s hide list, and the candidate file has a different name. That path is mapped back to the real one before comparing.
 - **Default TLS policies:** once hikari's Tailscale policy exists, Caddy also emits default-behaviour policies for your sites (e.g. `{"subjects":["example.com"]}`, or `{}` for host-less sites). These are accepted only if they are identical to the original default and name only hosts your config already serves.
 
 hikari checks again after writing and restores the backup if anything differs.
 
-**Reloading:** with `--reload`, hikari reloads through your own systemd unit (`systemctl reload caddy`) or with `caddy reload`. If the reload fails, it restores the original files and reloads again. If your Caddy has `admin off` and there is no systemd unit, hikari will not restart your server; it prints the command to run instead. Without `--reload`, hikari prints the exact reload command.
+**Reloading:** with `--reload`, hikari reloads through your own systemd unit (`systemctl reload caddy`) or with `caddy reload`. If the reload fails, it restores the original files and reloads again. On Caddy 2.11 and newer, a reload that fails (for example because hikari's port is taken) stops Caddy's existing sites before it gives up, so they stay down for the moment until that restoring reload brings them back up. Caddy 2.9 kept serving the old config throughout. If your Caddy has `admin off` and there is no systemd unit, hikari will not restart your server; it prints the command to run instead. Without `--reload`, hikari prints the exact reload command.
 
 ## Tests
 
