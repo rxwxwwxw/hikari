@@ -83,7 +83,8 @@ struct DiscoveryConfig {
 
 struct UpdatesConfig {
     string repo = "OWNER/REPO";
-    UpdateMode mode = UpdateMode.on_dashboard_open;
+    // Check at boot and then daily; `on_dashboard_open` and `manual` are quieter opt-ins.
+    UpdateMode mode = UpdateMode.scheduled;
     bool auto_install_verified = true;
     uint check_interval_hours = 24;
     string public_key = "";
@@ -283,6 +284,7 @@ HikariConfig parseConfigJson(string content) {
             string m = readStringField(*pUpd, "mode", cast(string) cfg.updates.mode);
             if (m == "manual") cfg.updates.mode = UpdateMode.manual;
             else if (m == "scheduled") cfg.updates.mode = UpdateMode.scheduled;
+            // An unrecognized value falls back to the quieter dashboard-triggered mode.
             else cfg.updates.mode = UpdateMode.on_dashboard_open;
             cfg.updates.auto_install_verified = readBoolField(*pUpd, "auto_install_verified", cfg.updates.auto_install_verified);
             cfg.updates.check_interval_hours = cast(uint) readLongField(*pUpd, "check_interval_hours", cfg.updates.check_interval_hours);

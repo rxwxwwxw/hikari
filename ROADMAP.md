@@ -24,7 +24,7 @@ The goal is a useful, low-overhead personal tailnet monitor that can be installe
   - **Otherwise:** run an isolated `hikari-caddy`, reusing a compatible `caddy` executable read-only or arranging a **private hikari-owned Caddy binary** from a verified, pinned release. Optional distro/Homebrew package installation is a deliberate operator choice, because package hooks can alter system services.
   - Never start, stop or restart an unrelated system Caddy instance.
 - **System-owned installation, not user login:** Linux, Windows, and macOS services must start at boot and remain available after the installing account signs out. No `systemctl --user`, Windows Startup folder/logon-only scheduled task, macOS Login Item, or `~/Library/LaunchAgents` dependency for core service availability.
-- **Network-quiet by default:** listening on tailnet/loopback is permitted; sampling is request-driven, with per-group TTLs and accurate stale states. Peer requests and default GitHub checks start only from dashboard activity or explicit commands. Caddy/Tailscale/OS network behavior is outside the agent's blanket control and must be documented.
+- **Network-quiet by default:** listening on tailnet/loopback is permitted; sampling is request-driven, with per-group TTLs and accurate stale states. Peer requests start only from dashboard activity or explicit commands. Caddy/Tailscale/OS network behavior is outside the agent's blanket control and must be documented.
 - **No public exposure:** the D HTTP listener remains loopback-only; hikari's Caddy site (isolated or joined) binds only to the node's Tailscale address. No insecure production fallback when the certificate, identity, or Tailscale interface is unavailable.
 - **No cross-platform shortcuts:** platform-specific code belongs in `src/platform/`, lifecycle wrappers, or installers, never in shared schema/business logic.
 - **Hardware inventory is part of the product:** boards, firmware, CPU extensions usable by the OS, memory, NICs, storage and GPUs should have friendly cards, with unmeasurable properties shown as unavailable rather than guessed.
@@ -145,7 +145,7 @@ Implement `tests/integration/linux/` with Dockerfiles/Compose or a shell runner,
 
 - Signed release manifest and pinned trust root; per-platform artifacts and validated version metadata. Safe staging, size/time limits, archive traversal protection, cross-process update lock, signature + hash verification, and semantic-version comparison.
 - Versioned installation directories, activation pointer/launcher, restart of only hikari-owned services, local health/version check and automatic rollback. Never overwrite the executing binary in place.
-- Separate `update check`, `update apply`, `update rollback`; default on-dashboard activity with bounded check cache/jitter; optional `manual` and explicitly opted-in `scheduled` policies. Do not restart mid-request; tolerate GitHub outage.
+- Separate `update check`, `update apply`, `update rollback`; default `scheduled` checks after boot and daily with bounded check cache/jitter; optional quieter `on_dashboard_open` and `manual` policies. Do not restart mid-request; tolerate GitHub outage.
 - Reconciliation only of hikari-generated configuration, including Caddy template changes. Preserve user-owned `config.json`, aliases, endpoint overrides, known nodes, hardware cache and dedicated certificate store.
 - Document and test a **first-install trust bootstrap**: where verified release manifests and trusted keys come from, how the installer pins them, and why GitHub TLS alone or a neighboring unsigned SHA file is insufficient.
 
@@ -160,7 +160,7 @@ Linux is **done** only when all of the following are true:
 - [ ] Docker distro suite, native CI, Caddy configuration validation, JSON contract fixtures, mocked browser tests and installer idempotence suite pass.
 - [ ] Two or more real Tailscale endpoints serve HTTPS; real certificate permissions and ACL behavior are tested. No public listener; existing Caddy/`tailscale serve` configuration is untouched.
 - [ ] UI has a polished fleet overview plus CPU/ISA, board/firmware, memory, GPU, NIC and disk cards; offline devices and stale samples are labeled correctly.
-- [ ] No requests while all dashboards are closed ⇒ no high-frequency sampling, no agent-driven peer HTTP polling, and no *default* background GitHub update checks. Idle CPU/wakeups/RSS/writes/connections are measured and recorded.
+- [ ] No requests while all dashboards are closed ⇒ no high-frequency sampling, no agent-driven peer HTTP polling, and no GitHub traffic beyond the boot/daily release check (none in `on_dashboard_open` or `manual` mode). Idle CPU/wakeups/RSS/writes/connections are measured and recorded.
 - [ ] Reboot, disconnect/reconnect, sleep/resume where available, hostname change, failed probes, custom port, and >30-day simulated offline retention work.
 - [ ] Versioned signed update and automatic rollback are demonstrated; repair/reinstall/uninstall preserve unrelated services and operator configuration.
 - [ ] Quickstart documents a normal install, `doctor`, dashboard URL, Caddy resolution, certificate permission requirements, data sensitivity and rollback/uninstall.
@@ -313,7 +313,7 @@ The Linux tester should have **one top-level reproducible command** and a docume
 Automate comparisons where possible and record measurements rather than inventing guaranteed fixed CPU/wakeup budgets:
 
 - Requests within TTL don't rerun a probe; expired requests refresh at most once concurrently; cold calls return documented collecting/error states.
-- With dashboard closed and default update policy, no hikari-initiated peer HTTP requests, no high-frequency metrics scans and no unsolicited GitHub polling. Distinguish idle listener sockets from outbound connections.
+- With dashboard closed, no hikari-initiated peer HTTP requests and no high-frequency metrics scans; GitHub is contacted only by the boot/daily release check (never in `on_dashboard_open` or `manual` mode). Distinguish idle listener sockets from outbound connections.
 - Check RSS, CPU time, system wakeups, disk writes, collection latency, and max transient CPU under dashboard activity on representative desktops/laptops/ARM boards.
 - Hardware scan latency and storage-query timeouts cannot indefinitely block the fast endpoint; permission and unsupported states remain clear.
 - Existing Caddy configs, service status and listeners are unchanged by install, reinstall, update, and uninstall.

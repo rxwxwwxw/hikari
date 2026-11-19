@@ -315,7 +315,7 @@ if ($ManageServices) {
 }
 
 Write-Host "=== hikari Windows install plan ==="
-Write-Host "  Maintenance:      hikari-maintenance scheduled task (SYSTEM), local eligibility every 5 min; network only when update policy permits."
+Write-Host "  Maintenance:      hikari-maintenance scheduled task (SYSTEM), local eligibility every 5 min; checks GitHub for signed releases after boot and daily by default (updates.mode)."
 Write-Host "  Version:          $AppVersion -> $VersionsDir\$AppVersion (versions\current junction)"
 Write-Host "  Config / state:   $ConfigDir (config.json preserved if present) / $StateDir"
 Write-Host "  Ports:            tailnet=$TailnetPort loopback=127.0.0.1:$LoopbackPort base_path=$BasePath"
@@ -508,7 +508,7 @@ if (-not (Test-Path $ConfigPath)) {
             probe_timeout_ms = 5000
         }
         discovery = @{ enabled_on_dashboard_open = $true; max_concurrent_probes = 4; probe_timeout_ms = 3000 }
-        updates = @{ repo = $Repo; mode = "on_dashboard_open"; auto_install_verified = $true; check_interval_hours = 24; public_key = $PubKey; channel = "stable" }
+        updates = @{ repo = $Repo; mode = "scheduled"; auto_install_verified = $true; check_interval_hours = 24; public_key = $PubKey; channel = "stable" }
         privacy = @{ expose_serials = $false; expose_mac_addresses = $false }
         caddy = @{ mode = $EffectiveCaddyMode; reload = [bool]$EffectiveReload }
         paths = @{

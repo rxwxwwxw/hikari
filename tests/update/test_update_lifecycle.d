@@ -129,6 +129,8 @@ unittest {
         return true;
     };
     hooks.health = (string _) => true;
+    // Dashboard-triggered mode (an opt-in since `scheduled` became the default).
+    autoCfg.updates.mode = UpdateMode.on_dashboard_open;
     assert(maintainRelease(autoCfg, "linux", "x86_64", hooks) == 0);
     assert(downloads == 0);
     write(autoCfg.paths.state_dir ~ "/update-request", to!string(now));
@@ -284,15 +286,33 @@ unittest {
     HikariConfig cfg;
     cfg.updates.repo = "example/hikari";
     cfg.updates.public_key = "pinned-test-key";
+    assert(cfg.updates.mode == UpdateMode.scheduled, "default: check at boot and daily");
+    cfg.updates.mode = UpdateMode.on_dashboard_open;
     assert(!maintenanceDue(cfg, 100000, 0, 0));
     assert(maintenanceDue(cfg, 100000, 0, 99999));
     assert(!maintenanceDue(cfg, 100000, 99999, 100000));
     assert(!maintenanceDue(cfg, 100000, 0, 100001));
     assert(!maintenanceDue(cfg, 100000, 0, 99879));
+    // Dashboard mode ignores boots: a reboot is not viewer activity.
+    assert(!maintenanceDue(cfg, 100000, 90000, 0, 95000));
     cfg.updates.mode = UpdateMode.scheduled;
     assert(maintenanceDue(cfg, 100000, 0, 0));
     cfg.updates.mode = UpdateMode.manual;
     assert(!maintenanceDue(cfg, 100000, 0, 100000));
+    assert(!maintenanceDue(cfg, 100000, 0, 0, 95000), "manual never checks, even after a boot");
+
+    // Scheduled: daily, plus the first eligibility run after each boot.
+    cfg.updates.mode = UpdateMode.scheduled;
+    immutable day = 86_400;
+    immutable last = 1_000_000;
+    assert(!maintenanceDue(cfg, last + 7_200, last, 0), "inside the interval, no boot since: wait");
+    assert(maintenanceDue(cfg, last + 7_200, last, 0, last + 6_900), "booted after the last check: check now");
+    assert(!maintenanceDue(cfg, last + 1_800, last, 0, last + 1_500), "a reboot loop checks at most hourly");
+    assert(!maintenanceDue(cfg, last + 7_200, last, 0, last - 60), "booted before the last check: already checked");
+    assert(!maintenanceDue(cfg, last + 7_200, last, 0, last + 9_000), "a boot time in the future is ignored");
+    assert(!maintenanceDue(cfg, last + 7_200, last, 0, -1), "unknown boot time: interval only");
+    assert(maintenanceDue(cfg, last + day, last, 0), "daily check");
+    assert(maintenanceDue(cfg, last, 0, 0, last - 300), "never checked before: check after boot");
     assertThrown!Exception(validateRepository("example/hikari/../../other"));
     assertThrown!Exception(validateRepository("example/hikari?redirect=other"));
     assertThrown!Exception(downloadHttps("http://example.invalid", "unused", 10));
@@ -344,6 +364,8 @@ unittest {
     cfg.paths.state_dir = root;
     cfg.updates.repo = "example/hikari";
     cfg.updates.public_key = "test-key";
+    // Viewer activity only signals maintenance in the opt-in dashboard mode.
+    cfg.updates.mode = UpdateMode.on_dashboard_open;
     auto completed = new Semaphore;
     auto request = new DashboardUpdateRequest(cfg, () { completed.notify(); });
     foreach (_; 0 .. 20) request.completedRequest();
