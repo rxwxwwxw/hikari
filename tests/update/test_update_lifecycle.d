@@ -40,10 +40,16 @@ unittest {
     scope (exit) { if (exists(root)) rmdirRecurse(root); }
 
     // Generate Ed25519 test keypair via openssl
+    // Use the same selection as production, so a Mac whose PATH starts with
+    // LibreSSL still exercises real Ed25519 signing via Homebrew OpenSSL 3.
+    import platform.openssl : selectEd25519OpenSsl;
+    auto opensslSelection = selectEd25519OpenSsl();
+    assert(opensslSelection.ok, opensslSelection.error);
+    auto openssl = opensslSelection.executable;
     auto privKey = root ~ "/keys/priv.pem";
     auto pubKey = root ~ "/keys/pub.pem";
-    assert(execute(["openssl", "genpkey", "-algorithm", "Ed25519", "-out", privKey], null, Config.none, 4096).status == 0);
-    assert(execute(["openssl", "pkey", "-in", privKey, "-pubout", "-out", pubKey], null, Config.none, 4096).status == 0);
+    assert(execute([openssl, "genpkey", "-algorithm", "Ed25519", "-out", privKey], null, Config.none, 4096).status == 0);
+    assert(execute([openssl, "pkey", "-in", privKey, "-pubout", "-out", pubKey], null, Config.none, 4096).status == 0);
 
     // Seed existing v0.1.0 release & user config/state
     write(root ~ "/versions/0.1.0/hikari", "#!/bin/sh\necho 'hikari 0.1.0'\n");
@@ -75,7 +81,7 @@ unittest {
             {"os": "linux", "arch": "x86_64", "filename": "hikari-linux-x86_64.tar.gz", "sha256": "%s", "size_bytes": %u}
         ]
     }`(sha, sz));
-    assert(execute(["openssl", "pkeyutl", "-sign", "-inkey", privKey, "-rawin", "-in", manifestPath, "-out", sigPath], null, Config.none, 4096).status == 0);
+    assert(execute([openssl, "pkeyutl", "-sign", "-inkey", privKey, "-rawin", "-in", manifestPath, "-out", sigPath], null, Config.none, 4096).status == 0);
 
     HikariConfig cfg;
     cfg.updates.repo = "example/hikari";

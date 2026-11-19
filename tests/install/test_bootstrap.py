@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import hashlib
 import importlib.util
 import io
@@ -128,6 +129,82 @@ class ReadinessTests(unittest.TestCase):
             self.assertFalse(results[0][1])
             results, _ = readiness.check(config, '0.2.0', info['fqdn'], get=lambda url: b'[]')
             self.assertFalse(results[0][1])
+
+
+class OpenSslSelectionTests(unittest.TestCase):
+    """Mirrors tests/platform/test_openssl.d for the bootstrap/installer verifier."""
+    LIBRESSL = 'LibreSSL 3.3.6\n'
+    OPENSSL3 = 'OpenSSL 3.4.0 22 Oct 2024 (Library: OpenSSL 3.4.0 22 Oct 2024)\n'
+    HB_ARM = '/opt/homebrew/opt/openssl@3/bin/openssl'
+    HB_INTEL = '/usr/local/opt/openssl@3/bin/openssl'
+
+    def find(self, system, files, path_openssl=None):
+        """files: {path: version output}; path_openssl: (resolved path, output) for PATH lookup."""
+        outputs = dict(files)
+        if path_openssl:
+            outputs[path_openssl[0]] = path_openssl[1]
+        ran = []
+        def run_version(executable):
+            ran.append(executable)
+            if executable not in outputs:
+                raise FileNotFoundError(executable)
+            return outputs[executable]
+        result = bootstrap.verifier.find_openssl(
+            system=system, which=lambda name: path_openssl[0] if path_openssl else None,
+            isfile=lambda path: path in files, run_version=run_version)
+        return result, ran
+
+    def test_classification(self):
+        classify = bootstrap.verifier.classify_openssl
+        self.assertEqual(classify(self.LIBRESSL), (False, 'LibreSSL 3.3.6', 'libressl'))
+        self.assertTrue(classify(self.OPENSSL3)[0])
+        self.assertTrue(classify('OpenSSL 3.0.13 30 Jan 2024')[0])
+        self.assertFalse(classify('OpenSSL 1.1.1w  11 Sep 2023')[0])
+        self.assertFalse(classify('')[0])
+        self.assertEqual(classify('BoringSSL')[2], 'unknown')
+
+    def test_darwin_prefers_homebrew_over_libressl_path(self):
+        result, ran = self.find('Darwin', {self.HB_ARM: self.OPENSSL3}, ('/usr/bin/openssl', self.LIBRESSL))
+        self.assertEqual(result, self.HB_ARM)
+        self.assertEqual(ran, [self.HB_ARM])
+        result, ran = self.find('Darwin', {self.HB_INTEL: self.OPENSSL3}, ('/usr/bin/openssl', self.LIBRESSL))
+        self.assertEqual(result, self.HB_INTEL)
+        self.assertEqual(ran, [self.HB_INTEL])
+
+    def test_path_fallback_and_non_darwin_skip_probes(self):
+        result, _ = self.find('Darwin', {}, ('/usr/local/bin/openssl', self.OPENSSL3))
+        self.assertEqual(result, '/usr/local/bin/openssl')
+        # Linux never consults the Homebrew locations, even if they exist.
+        result, ran = self.find('Linux', {self.HB_ARM: self.OPENSSL3}, ('/usr/bin/openssl', self.OPENSSL3))
+        self.assertEqual(result, '/usr/bin/openssl')
+        self.assertEqual(ran, ['/usr/bin/openssl'])
+
+    def test_libressl_only_is_rejected_with_actionable_error(self):
+        with self.assertRaises(ValueError) as caught:
+            self.find('Darwin', {}, ('/usr/bin/openssl', self.LIBRESSL))
+        message = str(caught.exception)
+        self.assertIn('LibreSSL 3.3.6', message)
+        self.assertIn('cannot verify Ed25519', message)
+        self.assertIn('brew install openssl@3', message)
+        with self.assertRaises(ValueError) as caught:
+            self.find('Darwin', {})
+        self.assertIn('not found on PATH', str(caught.exception))
+
+    def test_verification_fails_closed_without_capable_openssl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('archive', 'manifest', 'signature', 'public_key'):
+                (root / name).write_bytes(b'x')
+            args = argparse.Namespace(archive=str(root / 'archive'), manifest=str(root / 'manifest'),
+                                      signature=str(root / 'signature'), public_key=str(root / 'public_key'),
+                                      repo='example/hikari', os='darwin', arch='arm64', extract_dir=None)
+            def refuse(*_args, **_kwargs):
+                raise ValueError('No Ed25519-capable OpenSSL found: /usr/bin/openssl is LibreSSL 3.3.6')
+            with patch.object(bootstrap.verifier, 'find_openssl', refuse), \
+                 patch.object(bootstrap.verifier.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'LibreSSL'):
+                    bootstrap.verifier.verify(args)
+                run.assert_not_called()
 
 
 if __name__ == '__main__': unittest.main()

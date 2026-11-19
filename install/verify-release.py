@@ -3,6 +3,9 @@
 import argparse
 import hashlib
 import json
+import os
+import platform
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
@@ -12,6 +15,68 @@ import zipfile
 import stat
 
 MAX_BYTES = 512 * 1024 * 1024
+
+# macOS /usr/bin/openssl is LibreSSL, which cannot verify Ed25519 with
+# `pkeyutl -rawin`, and sudo/launchd PATHs often put it first. Probe well-known
+# OpenSSL 3 locations before PATH (mirrors src/platform/openssl.d).
+DARWIN_OPENSSL_CANDIDATES = (
+    "/opt/homebrew/opt/openssl@3/bin/openssl",  # Homebrew, Apple Silicon
+    "/usr/local/opt/openssl@3/bin/openssl",     # Homebrew, Intel
+    "/opt/local/libexec/openssl3/bin/openssl",  # MacPorts openssl3
+)
+OPENSSL_INSTALL_HINT = ("Install OpenSSL 3 (macOS: `brew install openssl@3`; it is found at "
+                        "/opt/homebrew/opt/openssl@3 or /usr/local/opt/openssl@3 without changing PATH) "
+                        "and retry. Release signatures are never skipped.")
+
+
+def classify_openssl(version_output):
+    """Return (capable, first_line, flavor) for `openssl version` output."""
+    line = next((l.strip() for l in version_output.splitlines() if l.strip()), "")[:120]
+    if line.startswith("LibreSSL"):
+        return False, line, "libressl"
+    match = re.match(r"OpenSSL (\d+)\.", line)
+    if match:
+        return int(match.group(1)) >= 3, line, "openssl"
+    return False, line, "openssl" if line.startswith("OpenSSL ") else "unknown"
+
+
+def _openssl_version(executable):
+    result = subprocess.run([executable, "version"], capture_output=True, text=True, timeout=5, check=True)
+    return result.stdout
+
+
+def find_openssl(system=None, which=shutil.which, isfile=os.path.isfile, run_version=_openssl_version):
+    """Return an Ed25519-capable OpenSSL executable or raise an actionable ValueError."""
+    system = system if system is not None else platform.system()
+    candidates = list(DARWIN_OPENSSL_CANDIDATES) if system == "Darwin" else []
+    candidates.append("openssl")
+    rejected = []
+    for candidate in candidates:
+        if "/" in candidate:
+            if not isfile(candidate):
+                continue
+            executable = candidate
+        else:
+            executable = which(candidate)
+            if not executable:
+                rejected.append(f"{candidate} was not found on PATH")
+                continue
+        try:
+            output = run_version(executable)
+        except (OSError, subprocess.SubprocessError):
+            rejected.append(f"{executable} could not run")
+            continue
+        capable, line, flavor = classify_openssl(output)
+        if capable:
+            return executable
+        if flavor == "libressl":
+            rejected.append(f"{executable} is {line} (LibreSSL cannot verify Ed25519 signatures with pkeyutl -rawin)")
+        elif flavor == "openssl":
+            rejected.append(f"{executable} is {line} (OpenSSL 3.0 or newer is required)")
+        else:
+            rejected.append(f"{executable} reported an unrecognized version '{line}'")
+    detail = (": " + "; ".join(rejected)) if rejected else ""
+    raise ValueError(f"No Ed25519-capable OpenSSL found for release signature verification{detail}. {OPENSSL_INSTALL_HINT}")
 
 
 def verify(args):
@@ -39,7 +104,8 @@ def verify_snapshot(args):
     signature = Path(args.signature)
     if manifest.stat().st_size > 1024 * 1024 or signature.stat().st_size > 4096:
         raise ValueError("Manifest or signature exceeds size limit")
-    subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", args.public_key,
+    openssl = find_openssl()
+    subprocess.run([openssl, "pkeyutl", "-verify", "-pubin", "-inkey", args.public_key,
                     "-rawin", "-in", str(manifest), "-sigfile", str(signature)],
                    check=True, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     data = json.loads(manifest.read_text())
@@ -49,7 +115,6 @@ def verify_snapshot(args):
         raise ValueError("Manifest schema or pinned repository mismatch")
     version = data.get("version", "")
     # Directory names must be canonical numeric versions (optional safe prerelease).
-    import re
     if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("Invalid release version")
     candidates = [a for a in data.get("artifacts", []) if isinstance(a, dict) and a.get("os") == args.os and a.get("arch") == args.arch]

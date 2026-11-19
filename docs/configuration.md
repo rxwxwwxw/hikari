@@ -111,8 +111,9 @@ platform archive, verifies its signed size/hash, stages it, and performs the
 existing health-checked activation/rollback. The agent stays restricted; the
 privileged job reads the operator-owned configuration and accepts no commands,
 paths, or URLs from the activity request. Downloads use HTTPS only, bounded
-sizes/deadlines and retries. `curl` and an Ed25519-capable `openssl` must be
-available to the maintenance account.
+sizes/deadlines and retries. `curl` and OpenSSL 3.0+ must be available to the
+maintenance account; LibreSSL is rejected (see
+[OpenSSL for release signatures](install-macos.md#openssl-for-release-signatures)).
 
 `hikari update check` now fetches and verifies the latest stable release. It does
 not install it. Supplying `--manifest` and `--sig` retains offline verification.

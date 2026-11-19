@@ -11,7 +11,7 @@ bash hikari-install.sh --dry-run
 sudo bash hikari-install.sh --reload
 ```
 
-Python 3.9+ and Ed25519-capable OpenSSL are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
+Python 3.9+ and OpenSSL 3 (`brew install openssl@3`; macOS's own `/usr/bin/openssl` is LibreSSL and cannot verify the Ed25519 release signature) are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
 
 ## Prerequisites
 
@@ -65,9 +65,38 @@ builds, unit tests and disposable installer-account/permission checks passed in 
 Stage 3 remains gated on real tailnet/logout/reboot/sleep tests. Do not infer
 production readiness from a successful build or staged installer test.
 
-Python 3 and an OpenSSL build supporting Ed25519 are also required for archive
-installation verification; Node is required only for browser tests. Homebrew is
-never installed by hikari, and `sudo brew`/`brew services` are never used.
+Python 3 and OpenSSL 3 are also required for archive installation verification;
+Node is required only for browser tests. Homebrew is never installed by hikari,
+and `sudo brew`/`brew services` are never used.
+
+### OpenSSL for release signatures
+
+Installer, bootstrap and self-update verify the Ed25519 release signature with
+`openssl pkeyutl -verify -rawin`, which needs **OpenSSL 3.0 or newer**.
+`/usr/bin/openssl` on macOS is LibreSSL, which cannot do this, and launchd
+daemons (`io.hikari.agent`, `io.hikari.maintenance`) and `sudo` run with a minimal
+PATH where LibreSSL comes first. hikari therefore probes, in order:
+
+1. `/opt/homebrew/opt/openssl@3/bin/openssl` (Homebrew, Apple Silicon)
+2. `/usr/local/opt/openssl@3/bin/openssl` (Homebrew, Intel)
+3. `/opt/local/libexec/openssl3/bin/openssl` (MacPorts `openssl3`)
+4. `openssl` from PATH
+
+and uses the first one whose `openssl version` reports OpenSSL 3 or newer. No
+PATH change is needed. LibreSSL and OpenSSL 1.x are rejected with an explicit
+message, for example:
+
+```text
+No Ed25519-capable OpenSSL found for release signature verification:
+/usr/bin/openssl is LibreSSL 3.3.6 (LibreSSL cannot verify Ed25519 signatures
+with pkeyutl -rawin). Install OpenSSL 3 (macOS: `brew install openssl@3`) ...
+```
+
+In that case the update or installation fails closed: nothing is installed
+and the signature check is never skipped. `hikari doctor` reports which OpenSSL
+it will use in its `signature_verifier` check. The chosen binary is part of the
+update trust path, so keep the Homebrew prefix writable only by trusted
+administrators.
 
 ### Service identities and recovery
 

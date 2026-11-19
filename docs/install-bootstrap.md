@@ -16,7 +16,8 @@ MCowBQYDK2VwAyEAmg6idV2yVLLRlpsPxPs2XTYdWhixW85z6hLnKYyzcCU=
 
 - Tailscale enrolled, with MagicDNS and HTTPS certificates enabled. Hikari diagnoses missing access but does not change Tailscale, ACLs, or firewall settings.
 - Python **3.9 or newer** (`python3` on Unix, `python` on Windows).
-- OpenSSL supporting Ed25519 on PATH. macOS's bundled LibreSSL may not suffice; use an already installed compatible OpenSSL, such as Homebrew OpenSSL, and ensure its `bin` directory remains on PATH when invoking with sudo. On Windows, ensure both Python and OpenSSL are visible in the elevated PowerShell session.
+- **OpenSSL 3.0 or newer** (Ed25519 verification uses `openssl pkeyutl -verify -rawin`). macOS's `/usr/bin/openssl` is **LibreSSL and is rejected**. On macOS, install OpenSSL 3 (for example `brew install openssl@3`); the verifier looks in `/opt/homebrew/opt/openssl@3/bin`, `/usr/local/opt/openssl@3/bin` and `/opt/local/libexec/openssl3/bin` (MacPorts) **before** PATH, so it is found even under `sudo` or launchd, which reset PATH. Elsewhere, and as a fallback on macOS, `openssl` is taken from PATH. On Windows, ensure both Python and OpenSSL 3 are visible in the elevated PowerShell session.
+- If only LibreSSL or an older OpenSSL is found, the bootstrap stops **before downloading anything** with `No Ed25519-capable OpenSSL found for release signature verification: /usr/bin/openssl is LibreSSL … (LibreSSL cannot verify Ed25519 signatures with pkeyutl -rawin)` and an install hint. The signature check is never skipped or weakened.
 - Python must have a working CA certificate store. If a python.org macOS installation reports `CERTIFICATE_VERIFY_FAILED`, run its supplied `Install Certificates.command` or configure a trusted CA bundle; never disable TLS verification.
 - Administrator/root permission for service installation. Dry runs do not need elevation.
 

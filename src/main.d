@@ -851,6 +851,18 @@ private int cmdDoctor(string[] args) {
         if (rep.overall == "pass") rep.overall = "warn";
     }
 
+    // 8. Signature verifier (macOS /usr/bin/openssl is LibreSSL and cannot verify Ed25519)
+    {
+        import platform.openssl : selectEd25519OpenSsl;
+        auto ossl = selectEd25519OpenSsl();
+        if (ossl.ok) {
+            rep.checks ~= DoctorCheck("signature_verifier", "pass", "Ed25519-capable OpenSSL: " ~ ossl.executable ~ " (" ~ ossl.versionLine ~ ")", "");
+        } else {
+            rep.checks ~= DoctorCheck("signature_verifier", "warn", ossl.error, "Install OpenSSL 3 (macOS: brew install openssl@3); updates fail closed until then");
+            if (rep.overall == "pass") rep.overall = "warn";
+        }
+    }
+
     if (jsonOut) {
         stdout.write(toJsonText(serializeDoctorReport(rep), true));
         stdout.flush();
