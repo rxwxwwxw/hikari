@@ -179,6 +179,21 @@ class OpenSslSelectionTests(unittest.TestCase):
         self.assertEqual(result, '/usr/bin/openssl')
         self.assertEqual(ran, ['/usr/bin/openssl'])
 
+    def test_windows_finds_program_files_openssl_without_path(self):
+        git = r'C:\Program Files\Git\mingw64\bin\openssl.exe'
+        win64 = r'C:\Program Files\OpenSSL-Win64\bin\openssl.exe'
+        # Elevated shell / SYSTEM task: nothing on PATH, Git for Windows installed.
+        result, ran = self.find('Windows', {git: self.OPENSSL3})
+        self.assertEqual(result, git)
+        self.assertEqual(ran, [git])
+        result, ran = self.find('Windows', {win64: self.OPENSSL3})
+        self.assertEqual(result, win64)
+        # PATH remains the fallback, and other systems never probe Windows paths.
+        result, _ = self.find('Windows', {}, (r'C:\tools\openssl.exe', self.OPENSSL3))
+        self.assertEqual(result, r'C:\tools\openssl.exe')
+        result, ran = self.find('Linux', {git: self.OPENSSL3}, ('/usr/bin/openssl', self.OPENSSL3))
+        self.assertEqual(ran, ['/usr/bin/openssl'])
+
     def test_libressl_only_is_rejected_with_actionable_error(self):
         with self.assertRaises(ValueError) as caught:
             self.find('Darwin', {}, ('/usr/bin/openssl', self.LIBRESSL))

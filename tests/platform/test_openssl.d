@@ -10,6 +10,7 @@ private enum LIBRESSL = "LibreSSL 3.3.6\n";
 private enum OPENSSL3 = "OpenSSL 3.4.0 22 Oct 2024 (Library: OpenSSL 3.4.0 22 Oct 2024)\n";
 private enum HB_ARM = "/opt/homebrew/opt/openssl@3/bin/openssl";
 private enum HB_INTEL = "/usr/local/opt/openssl@3/bin/openssl";
+private enum GIT_WIN = `C:\Program Files\Git\mingw64\bin\openssl.exe`;
 
 // Fake filesystem + `openssl version` outputs; absent keys are "not installed".
 private OpenSslSelection selectWith(const string[] candidates, string[string] outputs,
@@ -41,15 +42,33 @@ unittest {
 }
 
 unittest {
-    // The bare PATH name is always the last resort; Darwin probes OpenSSL 3 locations first.
+    // The bare PATH name is always the last resort; Darwin and Windows probe
+    // OpenSSL 3 install locations first.
     auto candidates = defaultOpenSslCandidates();
     assert(candidates[$ - 1] == "openssl");
     version (OSX) {
         assert(candidates.countUntil(HB_ARM) == 0);
         assert(candidates.canFind(HB_INTEL));
+    } else version (Windows) {
+        assert(candidates.countUntil(GIT_WIN) == 0);
+        assert(candidates.canFind(`C:\Program Files\OpenSSL-Win64\bin\openssl.exe`));
+        foreach (c; candidates[0 .. $ - 1]) assert(c[0 .. 17] == `C:\Program Files\`);
     } else {
         assert(candidates == ["openssl"]);
     }
+}
+
+unittest {
+    // A backslash Windows path is a file probe: used when installed (no PATH needed,
+    // the SYSTEM maintenance case), skipped without running when absent.
+    string[] ran;
+    auto sel = selectWith([GIT_WIN, "openssl"], [GIT_WIN: OPENSSL3], ran);
+    assert(sel.ok && sel.executable == GIT_WIN);
+    assert(ran == [GIT_WIN]);
+    ran = null;
+    sel = selectWith([GIT_WIN, "openssl"], ["openssl": OPENSSL3], ran);
+    assert(sel.ok && sel.executable == "openssl");
+    assert(ran == ["openssl"]);
 }
 
 unittest {

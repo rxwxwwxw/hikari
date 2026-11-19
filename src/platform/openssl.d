@@ -3,8 +3,11 @@ module platform.openssl;
 // Locates an OpenSSL able to verify Ed25519 release signatures with
 // `pkeyutl -verify -rawin` (OpenSSL 3.0+). macOS ships LibreSSL as
 // /usr/bin/openssl, which cannot, and launchd daemons get a minimal PATH, so on
-// Darwin well-known OpenSSL 3 locations are probed before PATH. Selection only
-// picks the tool: callers must still fail closed when no candidate qualifies.
+// Darwin well-known OpenSSL 3 locations are probed before PATH. Windows has no
+// system OpenSSL and the SYSTEM maintenance task sees only the machine PATH, so
+// standard admin-owned install locations under Program Files are probed first.
+// Selection only picks the tool: callers must still fail closed when no
+// candidate qualifies.
 
 import std.algorithm : startsWith;
 import std.ascii : isDigit;
@@ -33,8 +36,9 @@ alias OpenSslVersionFn = string delegate(string executable);
 
 enum string OPENSSL_INSTALL_HINT =
     "Install OpenSSL 3 (macOS: `brew install openssl@3`; it is found at "
-    ~ "/opt/homebrew/opt/openssl@3 or /usr/local/opt/openssl@3 without changing PATH) "
-    ~ "and retry. Release signatures are never skipped.";
+    ~ "/opt/homebrew/opt/openssl@3 or /usr/local/opt/openssl@3 without changing PATH. "
+    ~ "Windows: Git for Windows or a Win64 OpenSSL in its default Program Files folder "
+    ~ "is found without changing PATH) and retry. Release signatures are never skipped.";
 
 // Probe order. The bare name resolves through PATH and is always last.
 string[] defaultOpenSslCandidates() pure nothrow @safe {
@@ -43,6 +47,15 @@ string[] defaultOpenSslCandidates() pure nothrow @safe {
             "/opt/homebrew/opt/openssl@3/bin/openssl", // Homebrew, Apple Silicon
             "/usr/local/opt/openssl@3/bin/openssl",    // Homebrew, Intel
             "/opt/local/libexec/openssl3/bin/openssl", // MacPorts openssl3
+            "openssl",
+        ];
+    } else version (Windows) {
+        // Default per-machine install folders only: writable by administrators,
+        // unlike user PATH entries, so SYSTEM never runs a user-planted binary.
+        return [
+            `C:\Program Files\Git\mingw64\bin\openssl.exe`, // Git for Windows
+            `C:\Program Files\OpenSSL-Win64\bin\openssl.exe`, // Shining Light Win64 OpenSSL
+            `C:\Program Files\OpenSSL\bin\openssl.exe`,       // FireDaemon and others
             "openssl",
         ];
     } else {
