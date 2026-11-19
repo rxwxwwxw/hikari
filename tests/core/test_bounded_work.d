@@ -216,6 +216,8 @@ unittest {
     auto coord = new RefreshCoordinator(fake, new TelemetryCacheStore(cfg, "hikari:refresh"));
     auto reg = new NodeRegistry(stateDir);
     auto disc = new TailnetDiscoveryService(cfg, reg);
+    // Finish persisting the fixture before requests race with temporary state cleanup.
+    assert(disc.getLocalTailscaleSnapshot().available);
     auto router = new HikariRouter(cfg, coord, disc, reg);
 
     HttpRequest req;

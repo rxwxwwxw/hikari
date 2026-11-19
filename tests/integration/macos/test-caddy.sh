@@ -42,4 +42,28 @@ assert str(root/"Web Assets") in serialized
 PY
 echo 'Pinned Caddy validated macOS spaced paths, prefixed routes and tailnet-only listener.'
 
+CERT_DIR="$ROOT/Application Support/hikari/certificates/cert.Fixture1"
+mkdir -p "$CERT_DIR"
+printf '%s\n' box.tail.ts.net > "$CERT_DIR/fqdn"
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=box.tail.ts.net' \
+  -keyout "$CERT_DIR/tls.key" -out "$CERT_DIR/tls.crt" >/dev/null 2>&1
+"$REPO_ROOT/bin/hikari" caddy render --config "$ROOT/config.json" --fqdn box.tail.ts.net \
+  --tailscale-ip 100.64.0.10 --tls-cert-dir "$CERT_DIR" --out "$ROOT/Caddyfile.managed"
+"$CADDY_BIN" validate --config "$ROOT/Caddyfile.managed" --adapter caddyfile
+"$CADDY_BIN" adapt --config "$ROOT/Caddyfile.managed" --adapter caddyfile > "$ROOT/adapted-managed.json"
+python3 - "$ROOT/adapted-managed.json" "$CERT_DIR" <<'PYTLS'
+import json, pathlib, sys
+config = json.loads(pathlib.Path(sys.argv[1]).read_text())
+cert_dir = pathlib.Path(sys.argv[2])
+files = config["apps"]["tls"]["certificates"]["load_files"]
+assert len(files) == 1 and files[0]["certificate"] == str(cert_dir / "tls.crt")
+assert files[0]["key"] == str(cert_dir / "tls.key")
+PYTLS
+if "$REPO_ROOT/bin/hikari" caddy render --config "$ROOT/config.json" --fqdn renamed.tail.ts.net \
+  --tailscale-ip 100.64.0.10 --tls-cert-dir "$CERT_DIR" --out "$ROOT/Caddyfile.managed" >/dev/null 2>&1; then
+  echo 'Managed certificate was rendered for a different MagicDNS hostname' >&2
+  exit 1
+fi
+echo 'Pinned Caddy validated managed certificate paths and rejected a changed MagicDNS hostname.'
+
 python3 "$REPO_ROOT/tests/install/test_signed_install.py" --caddy "$CADDY_BIN"

@@ -441,7 +441,44 @@ fi
 CADDY_DECISION="isolated"
 CADDY_DECISION_REASON=""
 INTEGRATE_CADDYFILE=""
-if [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrate" ]; then
+MACOS_CERT_STORE=""
+if [ "$TARGET_OS" = "macos" ] && [ "$SNIPPET_ONLY" -eq 0 ]; then
+  MACOS_CERT_PROVIDER=$(python3 - "$CONFIG_PATH" "$DRY_RUN" \
+    "$ROOT_PREFIX/Applications/Tailscale.app/Contents/Info.plist" <<'PYCERT'
+import json, plistlib, sys
+from pathlib import Path
+caddy = {}
+config, app = Path(sys.argv[1]), Path(sys.argv[3])
+try:
+    caddy = json.loads(config.read_text(encoding="utf-8-sig")).get("caddy")
+except FileNotFoundError:
+    pass
+except PermissionError:
+    if sys.argv[2] != "1":
+        raise
+    print("Existing configuration is unreadable; previewing the default macOS certificate provider.", file=sys.stderr)
+mode = "auto"
+if isinstance(caddy, dict):
+    mode = caddy.get("macos_certificates", mode)
+if mode not in ("auto", "native"):
+    sys.exit("caddy.macos_certificates must be auto or native")
+if mode == "auto" and app.is_file():
+    with app.open("rb") as stream:
+        if plistlib.load(stream).get("CFBundleIdentifier") == "io.tailscale.ipn.macsys":
+            print("gui")
+PYCERT
+  )
+  if [ "$MACOS_CERT_PROVIDER" = "gui" ]; then
+    MACOS_CERT_STORE="$REAL_ETC_HIKARI/certificates"
+  fi
+fi
+if [ -n "$MACOS_CERT_STORE" ]; then
+  if [ "$EFFECTIVE_CADDY_MODE" = "integrate" ]; then
+    echo "Standalone Tailscale certificate management requires isolated Caddy. Nothing was changed." >&2
+    exit 1
+  fi
+  CADDY_DECISION_REASON="standalone Tailscale app requires managed certificates"
+elif [ "$EFFECTIVE_CADDY_MODE" = "auto" ] || [ "$EFFECTIVE_CADDY_MODE" = "integrate" ]; then
   if [ -n "$ROOT_PREFIX" ] && [ -z "$EXISTING_CADDYFILE" ]; then
     CADDY_DECISION_REASON="existing-Caddy detection is disabled under --root (pass --existing-caddyfile to test integration)"
   else
@@ -558,19 +595,18 @@ install_private_caddy() {
   fi
 
   mkdir -p "$PRIVATE_BIN_DIR"
-  local tmp_tgz
-  tmp_tgz=$(mktemp)
-  trap 'rm -f "$tmp_tgz"' RETURN
-
   log "Downloading pinned Caddy v${CADDY_PINNED_VERSION} (${cos}_${carch}) to private directory..."
-  curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 "$url" -o "$tmp_tgz"
-  local actual_sha
-  actual_sha=$(compute_sha512 "$tmp_tgz")
-  if [ "$actual_sha" != "$expected_sha" ]; then
-    echo "Caddy checksum verification failed! expected=$expected_sha actual=$actual_sha" >&2
-    exit 1
-  fi
-  tar -xzf "$tmp_tgz" -C "$PRIVATE_BIN_DIR" caddy
+  (
+    tmp_tgz=$(mktemp)
+    trap 'rm -f "$tmp_tgz"' EXIT
+    curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 "$url" -o "$tmp_tgz"
+    actual_sha=$(compute_sha512 "$tmp_tgz")
+    if [ "$actual_sha" != "$expected_sha" ]; then
+      echo "Caddy checksum verification failed! expected=$expected_sha actual=$actual_sha" >&2
+      exit 1
+    fi
+    tar --no-same-owner -xzf "$tmp_tgz" -C "$PRIVATE_BIN_DIR" caddy
+  )
   chmod 0755 "$target"
   RESOLVED_CADDY_BIN="$target"
   CADDY_ORIGIN="private"
@@ -635,12 +671,13 @@ fi
 
 # Maintenance is installer-owned too; reject foreign job names before any writes.
 if [ "$TARGET_OS" = macos ]; then
-  MAINTENANCE_JOBS=(io.hikari.maintenance.plist)
+  MAINTENANCE_JOBS=(io.hikari.maintenance.plist io.hikari.certificates.plist)
 else
   MAINTENANCE_JOBS=(hikari-maintenance.service hikari-maintenance.timer hikari-maintenance.path)
 fi
 for maintenance_job in "${MAINTENANCE_JOBS[@]}"; do
-  if [ -e "$UNIT_DIR/$maintenance_job" ] && ! grep -q 'hikari-owned maintenance' "$UNIT_DIR/$maintenance_job"; then
+  if [ -L "$UNIT_DIR/$maintenance_job" ] ||
+    { [ -e "$UNIT_DIR/$maintenance_job" ] && ! grep -q 'hikari-owned maintenance' "$UNIT_DIR/$maintenance_job"; }; then
     echo "Refusing foreign maintenance job at $UNIT_DIR/$maintenance_job" >&2
     exit 1
   fi
@@ -667,6 +704,10 @@ else
 fi
 echo "  Ports:          tailnet=$TAILNET_PORT loopback=127.0.0.1:$LOOPBACK_PORT base_path=$BASE_PATH"
 echo "  Caddy binary:   ${RESOLVED_CADDY_BIN:-none} ($CADDY_ORIGIN)"
+if [ -n "$MACOS_CERT_STORE" ]; then
+  echo "  Certificates:   Tailscale app CLI, with an isolated root LaunchDaemon and a restricted Caddy-readable store"
+  echo "                  Tailscale HTTPS must be enabled; issuance can publish the MagicDNS name in certificate transparency logs."
+fi
 echo "  Tailscale FQDN: ${TS_FQDN:-<not yet detected>} (IP: ${TS_IP:-<none>})"
 echo "  Service mode:   $SYSTEMD_MODE"
 
@@ -1012,6 +1053,8 @@ EOF
     <string>/Library/Application Support/hikari/config.json</string>
     <string>${RESOLVED_CADDY_XML}</string>
     <string>/Library/Application Support/hikari/state/caddy</string>
+    <string>/opt/hikari/versions/current</string>
+    <string>${MACOS_CERT_STORE}</string>
   </array>
   <key>Umask</key>
   <integer>63</integer>
@@ -1029,6 +1072,41 @@ EOF
 </plist>
 EOF
     chmod 0644 "$UNIT_DIR/io.hikari.caddy.plist"
+  fi
+
+  CERT_JOB="$UNIT_DIR/io.hikari.certificates.plist"
+  if [ -n "$MACOS_CERT_STORE" ]; then
+    CERT_STORE="$ROOT_PREFIX$MACOS_CERT_STORE"
+    if [ -L "$CERT_STORE" ] || { [ -e "$CERT_STORE" ] && [ ! -d "$CERT_STORE" ]; }; then
+      echo "Refusing an unsafe macOS certificate store at $CERT_STORE" >&2
+      exit 1
+    fi
+    mkdir -p "$CERT_STORE"
+    if [ -z "$ROOT_PREFIX" ]; then
+      chown "root:$CADDY_SERVICE_USER" "$CERT_STORE"
+    fi
+    chmod 0750 "$CERT_STORE"
+    cat > "$CERT_JOB" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- hikari-owned maintenance -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.hikari.certificates</string>
+  <key>UserName</key><string>root</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>-c</string>
+    <string>if [ -f "\$1" ]; then exec /bin/bash "\$@"; fi</string>
+    <string>hikari-certificates</string>
+    <string>/opt/hikari/versions/current/install/macos-certificates.sh</string>
+    <string>$MACOS_CERT_STORE</string><string>$CADDY_SERVICE_USER</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>900</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+</dict></plist>
+EOF
+    chmod 0644 "$CERT_JOB"
   fi
 
   if [ -z "$ROOT_PREFIX" ]; then
@@ -1051,12 +1129,15 @@ EOF
     /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.recover.plist"
     /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.agent.plist"
     if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then /usr/bin/plutil -lint "$UNIT_DIR/io.hikari.caddy.plist"; fi
+    if [ -n "$MACOS_CERT_STORE" ]; then /usr/bin/plutil -lint "$CERT_JOB"; fi
   fi
   activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system/io.hikari.agent 2>/dev/null || true
     launchctl bootstrap system "$UNIT_DIR/io.hikari.agent.plist"
-    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
+    if [ -f "$CERT_JOB" ]; then launchctl bootout system/io.hikari.certificates 2>/dev/null || true; fi
+    if [ -n "$MACOS_CERT_STORE" ]; then launchctl bootstrap system "$CERT_JOB"; fi
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
       launchctl bootout system/io.hikari.caddy 2>/dev/null || true
       launchctl bootstrap system "$UNIT_DIR/io.hikari.caddy.plist"
     fi
@@ -1066,6 +1147,7 @@ EOF
   else
     log "Skipped launchctl activation (service-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"
   fi
+  if [ -z "$MACOS_CERT_STORE" ]; then rm -f "$CERT_JOB"; fi
 else
   cat > "$UNIT_DIR/hikari.service" <<EOF
 [Unit]
@@ -1181,6 +1263,7 @@ fi
 echo "  Install log:      $LOG_FILE"
 echo "  Recovery/status:  /opt/hikari/versions/current/hikari doctor"
 READINESS_ARGS=(--config "$CONFIG_PATH" --version "$APP_VERSION" --fqdn "$TS_FQDN")
+if [ -n "$MACOS_CERT_STORE" ]; then READINESS_ARGS+=(--certificate-store "$MACOS_CERT_STORE"); fi
 if [ "$INTEGRATED" -eq 1 ] && [ "$RELOAD_CADDY" -ne 1 ]; then
   READINESS_ARGS+=(--pending-reload)
 fi

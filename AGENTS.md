@@ -25,7 +25,7 @@ The dashboard must answer two questions:
 Each participating machine ordinarily runs:
 
 - **`hikari`**: one native D executable, with an idle loopback HTTP listener, an in-memory telemetry cache, a persistent hardware/known-node registry, and platform-specific collectors. It **does not periodically poll peers**.
-- **An HTTPS front end**: either an existing Caddy that hikari joined under §7.1, or an isolated `hikari-caddy` instance. Either way, hikari's site serves the single-file dashboard and proxies versioned API requests to the local D listener, listens **only on the machine's Tailscale address**, and uses Caddy's native Tailscale certificate integration.
+- **An HTTPS front end**: either an existing Caddy that hikari joined under §7.1, or an isolated `hikari-caddy` instance. Either way, hikari's site serves the single-file dashboard and proxies versioned API requests to the local D listener, and listens **only on the machine's Tailscale address**. Use Caddy's native Tailscale certificate integration or the standalone macOS app provider in §7.1.
 - **A maintenance policy**: by default, signed release checks run **after boot and once a day**; they may instead be deferred until dashboard activity, or made manual. Never silently enable periodic peer telemetry polling.
 
 Each machine is independently useful. There is **no central coordinator, database, message broker, hosted service, or account required by hikari**. Any machine with the dashboard can show the fleet. Tailscale itself, Caddy, and the OS service manager are required infrastructure; “no D package dependencies” does **not** mean literally zero external software.
@@ -376,6 +376,7 @@ Many machines already use Caddy, `tailscale serve`, and HTTPS on `:443`. The ins
 - Prefer an already installed, **compatible** Caddy binary in PATH without upgrading or changing its service; otherwise install an independently verified, pinned Caddy build under hikari's own binary directory.
 - Validate configuration before starting; fail with an actionable port-conflict message rather than taking over an existing listener.
 - MagicDNS and tailnet HTTPS certificates are prerequisites. Detect missing certificate permission for the dedicated service account and explain the required `tailscaled` configuration. **Do not silently restart `tailscaled`** or change its operator settings.
+- On macOS with the standalone Tailscale app, isolated Caddy may use certificates obtained through the signed app's bundled `tailscale cert` CLI. A short-lived system LaunchDaemon validates and atomically publishes each pair in a root-owned store readable by the isolated Caddy account. Retain a usable certificate after failed renewal. Keep certificate network activity bounded and documented, with an operator option to select native Caddy integration.
 - Account for boot ordering, disconnected Tailscale, IP changes, sleep/resume, and certificate renewal. Do not bind a public fallback socket when Tailscale is unavailable.
 - Tailscale certificate issuance may create externally visible certificate-transparency records for the MagicDNS name; document that privacy limitation.
 

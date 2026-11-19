@@ -95,6 +95,48 @@ PATH="$MOCK_BIN:$PATH" bash "$REPO_ROOT/install/install.sh" \
   --service-mode=skip >/dev/null
 grep -q '"mac_custom":"keep"' "$INST/Library/Application Support/hikari/config.json"
 
+echo "=== Testing standalone Tailscale certificate provider and native opt-out ==="
+APP_INFO="$INST/Applications/Tailscale.app/Contents/Info.plist"
+mkdir -p "$(dirname "$APP_INFO")"
+python3 - "$APP_INFO" <<'PYAPP'
+import plistlib, sys
+with open(sys.argv[1], "wb") as stream:
+    plistlib.dump({"CFBundleIdentifier": "io.tailscale.ipn.macsys"}, stream)
+PYAPP
+install_macos_fixture() {
+  PATH="$MOCK_BIN:$PATH" bash "$REPO_ROOT/install/install.sh" \
+    --target-os=macos --repair --root "$INST" --binary-source "$HIKARI_BIN" \
+    --caddy-bin "$MOCK_BIN/caddy" --tailscale-fixture "$TS_FIXTURE" --service-mode=skip "$@"
+}
+install_macos_fixture --dry-run | grep 'Tailscale app CLI' >/dev/null
+test ! -e "$INST/Library/LaunchDaemons/io.hikari.certificates.plist"
+if install_macos_fixture --caddy-mode=integrate >/dev/null 2>&1; then
+  echo 'Standalone app installation unexpectedly selected existing Caddy' >&2; exit 1
+fi
+install_macos_fixture >/dev/null
+python3 - "$INST" <<'PYCERT'
+import pathlib, plistlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+units = root / "Library/LaunchDaemons"
+job = plistlib.loads((units / "io.hikari.certificates.plist").read_bytes())
+caddy = plistlib.loads((units / "io.hikari.caddy.plist").read_bytes())
+store = "/Library/Application Support/hikari/certificates"
+assert job["UserName"] == "root" and job["RunAtLoad"] and job["StartInterval"] == 900
+assert job["ProgramArguments"][-2:] == [store, "_hikari_caddy"]
+assert caddy["ProgramArguments"][-1] == store
+assert stat.S_IMODE((root / store.lstrip("/")).stat().st_mode) == 0o750
+PYCERT
+python3 - "$INST/Library/Application Support/hikari/config.json" <<'PYOPT'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config["caddy"] = {"macos_certificates": "native"}
+path.write_text(json.dumps(config))
+PYOPT
+install_macos_fixture >/dev/null
+test ! -e "$INST/Library/LaunchDaemons/io.hikari.certificates.plist"
+grep -q '"mac_custom": "keep"' "$INST/Library/Application Support/hikari/config.json"
+
 echo "=== Testing validation failure leaves activation unchanged ==="
 cat > "$MOCK_BIN/reject-caddy" <<'REJECT'
 #!/bin/bash
@@ -111,7 +153,7 @@ if PATH="$MOCK_BIN:$PATH" bash "$REPO_ROOT/install/install.sh" \
 fi
 test "$(readlink "$INST/opt/hikari/versions/current")" = "$BEFORE_TARGET"
 test ! -e "$INST/opt/hikari/versions/.activation-previous"
-grep -q '"mac_custom":"keep"' "$INST/Library/Application Support/hikari/config.json"
+grep -q '"mac_custom": "keep"' "$INST/Library/Application Support/hikari/config.json"
 
 echo "=== Testing macOS --snippet-only ==="
 SNIP="$TMP_ROOT/mac-snip"
@@ -129,11 +171,22 @@ test ! -e "$SNIP/Library/Application Support/hikari/config.json"
 test ! -e "$SNIP/Library/Application Support/hikari/state"
 
 echo "=== Testing macOS uninstall & --purge ==="
+python3 - "$INST/Library/Application Support/hikari/config.json" <<'PYRESET'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config["caddy"]["macos_certificates"] = "auto"
+path.write_text(json.dumps(config))
+PYRESET
+install_macos_fixture >/dev/null
+test -f "$INST/Library/LaunchDaemons/io.hikari.certificates.plist"
 bash "$REPO_ROOT/install/uninstall.sh" --target-os=macos --root "$INST" --service-mode=skip >/dev/null
 test ! -e "$INST/opt/hikari"
 test ! -e "$INST/Library/LaunchDaemons/io.hikari.recover.plist"
 test ! -e "$INST/Library/LaunchDaemons/io.hikari.agent.plist"
 test ! -e "$INST/Library/LaunchDaemons/io.hikari.maintenance.plist"
+test ! -e "$INST/Library/LaunchDaemons/io.hikari.certificates.plist"
+test -d "$INST/Library/Application Support/hikari/certificates"
 test -f "$INST/Library/Application Support/hikari/config.json"
 
 bash "$REPO_ROOT/install/uninstall.sh" --target-os=macos --purge --root "$INST" --service-mode=skip >/dev/null

@@ -663,7 +663,8 @@ private int cmdCaddy(string[] args) {
             cfg.listen.loopback_port,
             cfg.listen.base_path,
             cfg.paths.state_dir,
-            cfg.paths.web_dir
+            cfg.paths.web_dir,
+            getFlagValue(args, "--tls-cert-dir", "")
         );
         writeOutput(outPath, text);
         return 0;
@@ -741,7 +742,8 @@ private int cmdDoctor(string[] args) {
         import platform.darwin_service : macosServiceChecks;
         auto url = cfg.tailscale_fixture.length == 0 && snap.available
             ? buildHttpsUrl(snap.selfNode.fqdn, cfg.listen.tailnet_port, cfg.listen.base_path, "/api/v1/info") : "";
-        auto checks = macosServiceChecks(url, snap.selfNode.fqdn);
+        auto checks = macosServiceChecks(url, snap.selfNode.fqdn,
+            cfg.caddy.macos_certificates == "auto" && cfg.caddy.mode != "snippet");
         rep.checks ~= checks;
         foreach (check; checks) if (check.status == "warn" && rep.overall == "pass") rep.overall = "warn";
     }
