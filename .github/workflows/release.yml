@@ -41,7 +41,10 @@ jobs:
 
       - name: Install LDC2 (macOS)
         if: matrix.os == 'darwin'
-        run: brew install ldc dub
+        run: |
+          brew install ldc dub openssl@3
+          # macOS's /usr/bin/openssl is LibreSSL, which lacks Ed25519 `pkeyutl -rawin`.
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
 
       - name: Build release binary and run tests
         run: |

@@ -2,13 +2,15 @@
 
 The release workflow publishes `hikari-install.sh` (Linux/macOS) and `hikari-install.ps1` (Windows). They are standalone entry points containing the release verifier and a pinned repository/public key. Obtain this initial installer through a trusted distribution channel; the signature check cannot establish trust in the program performing that check. Subsequent release payloads are verified before extraction or execution.
 
-The pinned repository is `rxwxwwxw/hikari`. The operator supplied this Ed25519 public key:
+The pinned repository is `rxwxwwxw/hikari`. Releases are signed with a dedicated Ed25519 release key (not an SSH or account key), whose public half is:
 
 ```text
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC0kzQjFnyxINJCpxsj04ZMS52SwTtpJFb9o4PQXP5pg
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAmg6idV2yVLLRlpsPxPs2XTYdWhixW85z6hLnKYyzcCU=
+-----END PUBLIC KEY-----
 ```
 
-`install/trust.json` stores the same public key as SubjectPublicKeyInfo PEM. No private key is included. Release CI requires `HIKARI_RELEASE_ED25519_KEY` to contain the matching PEM private signing key and fails publication if its public key differs. An OpenSSH private-key file is not interchangeable with this PEM signing format; configuring release credentials is an operator action. Never put private keys in the repository.
+`install/trust.json` stores this same SubjectPublicKeyInfo PEM. No private key is included. Release CI requires `HIKARI_RELEASE_ED25519_KEY` to contain the matching PEM private signing key and fails publication if its public key differs. An OpenSSH private-key file is not interchangeable with this PEM signing format; configuring release credentials is an operator action. Never put private keys in the repository.
 
 ## Prerequisites
 
