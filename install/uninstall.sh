@@ -118,6 +118,13 @@ if [ "$TARGET_OS" = "macos" ]; then
     fi
     remove_path "$UNIT_DIR/io.hikari.maintenance.plist"
   fi
+  if [ -f "$UNIT_DIR/io.hikari.certificates.plist" ] && [ ! -L "$UNIT_DIR/io.hikari.certificates.plist" ] &&
+    grep -q 'hikari-owned maintenance' "$UNIT_DIR/io.hikari.certificates.plist"; then
+    if [ "$DRY_RUN" -eq 0 ] && [ -z "$ROOT_PREFIX" ] && [ "$SYSTEMD_MODE" = auto ]; then
+      launchctl bootout system/io.hikari.certificates 2>/dev/null || true
+    fi
+    remove_path "$UNIT_DIR/io.hikari.certificates.plist"
+  fi
   remove_path "$UNIT_DIR/io.hikari.caddy.plist"
   remove_path "$OPT_HIKARI"
   remove_path "$ETC_HIKARI/Caddyfile"

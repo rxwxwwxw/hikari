@@ -109,6 +109,7 @@ struct PrivacyConfig {
 struct CaddyConfig {
     string mode = "auto";
     bool reload = false; // reload an existing Caddy after integrating (otherwise print the command)
+    string macos_certificates = "auto"; // standalone app CLI in auto, Caddy's native integration in native
 }
 
 struct PathsConfig {
@@ -177,6 +178,8 @@ void validateConfig(const ref HikariConfig cfg) {
     if (!["auto", "integrate", "isolated", "snippet"].canFind(cfg.caddy.mode)) {
         throw new Exception("caddy.mode must be one of auto, integrate, isolated, snippet; got: " ~ cfg.caddy.mode);
     }
+    if (!["auto", "native"].canFind(cfg.caddy.macos_certificates))
+        throw new Exception("caddy.macos_certificates must be auto or native");
     if (cfg.updates.check_interval_hours == 0 || cfg.updates.check_interval_hours > 8760)
         throw new Exception("updates.check_interval_hours must be between 1 and 8760");
     if (cfg.discovery.max_concurrent_probes == 0 || cfg.discovery.max_concurrent_probes > 32) {
@@ -313,6 +316,7 @@ HikariConfig parseConfigJson(string content) {
         if (pCaddy.type == JSONType.object) {
             cfg.caddy.mode = readStringField(*pCaddy, "mode", cfg.caddy.mode);
             cfg.caddy.reload = readBoolField(*pCaddy, "reload", cfg.caddy.reload);
+            cfg.caddy.macos_certificates = readStringField(*pCaddy, "macos_certificates", cfg.caddy.macos_certificates);
         }
     }
 
@@ -412,6 +416,7 @@ JSONValue configToJson(const ref HikariConfig cfg) {
     JSONValue caddy = JSONValue.emptyObject;
     caddy["mode"] = cfg.caddy.mode;
     caddy["reload"] = cfg.caddy.reload;
+    caddy["macos_certificates"] = cfg.caddy.macos_certificates;
     root["caddy"] = caddy;
 
     return root;

@@ -4,11 +4,12 @@ version (OSX):
 import core.model;
 import core.sys.posix.unistd : geteuid;
 import platform.command;
-import std.file : exists;
+import std.file : exists, readText;
 import std.algorithm : canFind;
+import std.string : strip;
 import tailnet.discovery : parseTailscaleStatusJson, parsePeerInfoPayload;
 
-DoctorCheck[] macosServiceChecks(string httpsInfoUrl = "", string fqdn = "") {
+DoctorCheck[] macosServiceChecks(string httpsInfoUrl, string fqdn, bool expectAppCertificate) {
     DoctorCheck[] checks;
     foreach (label; ["io.hikari.agent", "io.hikari.caddy", "io.hikari.recover"]) {
         auto result = runLocalCommand(["/bin/launchctl", "print", "system/" ~ label], 3000, 16384);
@@ -18,14 +19,36 @@ DoctorCheck[] macosServiceChecks(string httpsInfoUrl = "", string fqdn = "") {
     }
     auto executable = tailscaleExecutable();
     string variant;
-    if (executable.canFind("/Applications/Tailscale.app/")) {
+    bool standaloneApp = exists("/Applications/Tailscale.app/Contents/Library/SystemExtensions/io.tailscale.ipn.macsys.network-extension.systemextension");
+    if (standaloneApp)
+        variant = "Standalone Tailscale system-extension app";
+    else if (executable.canFind("/Applications/Tailscale.app/")) {
         if (exists("/Applications/Tailscale.app/Contents/_MASReceipt/receipt"))
             variant = "App Store Tailscale app (receipt present)";
-        else if (exists("/Applications/Tailscale.app/Contents/Library/SystemExtensions"))
-            variant = "Standalone Tailscale system-extension app";
         else variant = "Tailscale app (variant unconfirmed)";
     } else variant = "PATH/standalone CLI (verify installed daemon variant)";
     checks ~= DoctorCheck("macos_tailscale_variant", variant.canFind("unconfirmed") || variant.canFind("verify") ? "warn" : "pass", variant ~ ": " ~ executable, "");
+    if (exists("/Library/LaunchDaemons/io.hikari.certificates.plist")) {
+        string state;
+        try {
+            state = readText("/Library/Application Support/hikari/certificates/status").strip();
+        } catch (Exception) {}
+        string message;
+        switch (state) {
+            case "ready": message = "Tailscale app certificate validated and published"; break;
+            case "app_unavailable": message = "Could not verify the standalone Tailscale app"; break;
+            case "tailscale_unavailable": message = "The certificate job cannot read a running Tailscale identity"; break;
+            case "issuance_failed": message = "Tailscale could not issue or renew the certificate"; break;
+            case "invalid_certificate": message = "The issued certificate did not pass validation"; break;
+            case "": message = "Certificate job status is pending or unreadable"; break;
+            default: message = "Unknown certificate job status"; break;
+        }
+        checks ~= DoctorCheck("macos_app_certificate", state == "ready" ? "pass" : "warn", message,
+            state == "ready" ? "" : "Check MagicDNS and tailnet HTTPS, then inspect system/io.hikari.certificates with launchctl");
+    } else if (standaloneApp && expectAppCertificate) {
+        checks ~= DoctorCheck("macos_app_certificate", "warn", "The standalone Tailscale certificate job is not installed",
+            "Run the signed macOS installer to register the certificate job");
+    }
     foreach (account; ["_hikari", "_hikari_caddy"]) {
         if (geteuid() != 0) {
             checks ~= DoctorCheck(account ~ "_tailscale", "warn", "Service-account CLI access unverified",
@@ -42,7 +65,7 @@ DoctorCheck[] macosServiceChecks(string httpsInfoUrl = "", string fqdn = "") {
             ok ? "" : "Check the installed Tailscale variant and its supported daemon permissions; hikari will not modify Tailscale settings");
     }
     if (httpsInfoUrl.length) {
-        auto result = runLocalCommand(["/usr/bin/curl", "--fail", "--silent", "--show-error",
+        auto result = runLocalCommand(["/usr/bin/curl", "--disable", "--noproxy", "*", "--fail", "--silent", "--show-error",
             "--max-time", "5", httpsInfoUrl], 6000, 65536);
         bool ok = result.status == 0 && !result.outputTruncated
             && parsePeerInfoPayload(result.output, fqdn).ok;

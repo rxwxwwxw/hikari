@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,11 +30,14 @@ def event(kind, **values):
     (release / "hikari").write_text(f"#!{sys.executable}\n" + common + '''
 if sys.argv[2] == "validate":
     event("validate")
-    sys.exit(0)
+    candidate = pathlib.Path(sys.argv[sys.argv.index("--caddyfile") + 1]).read_text()
+    sys.exit("cert.Rejected" in candidate)
 value = (root / "source").read_text()
 event("render", value=value)
 if value == "offline":
     sys.exit(1)
+if "--tls-cert-dir" in sys.argv:
+    value += "\\ntls " + sys.argv[sys.argv.index("--tls-cert-dir") + 1]
 print(value)
 ''')
     caddy = root / "caddy"
@@ -105,3 +109,44 @@ while True:
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
+
+    store = root / "certificates"
+    first = store / "cert.FixtureA"
+    first.mkdir(parents=True)
+    subprocess.run(
+        ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-subj", "/CN=box.tail.ts.net", "-keyout", str(first / "tls.key"), "-out", str(first / "tls.crt")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=10)
+    for generation in ["cert.Rejected", "cert.FixtureB"]:
+        shutil.copytree(first, store / generation)
+
+    def publish(generation):
+        pending = store / "pending"
+        pending.symlink_to(generation)
+        pending.replace(store / "current")
+
+    events.write_text("")
+    publish(first.name)
+    environment["HIKARI_NETWORK_RECONCILE_S"] = "0"
+    with (root / "output").open("w+") as output:
+        child = subprocess.Popen(
+            ["/bin/bash", str(repo / "install/macos-caddy.sh"), str(root / "config.json"), str(caddy),
+             str(root / "managed-runtime"), str(release), str(store)],
+            env=environment, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            wait_for(lambda: len(observed("start")) == 1, "managed Caddy did not start", 5)
+            initial_pid = observed("start")[0]["pid"]
+            publish("cert.Rejected")
+            wait_for(lambda: len(observed("validate")) >= 2, "managed Caddy did not see rejected rotation")
+            assert alive(initial_pid) and len(observed("start")) == 1
+            publish("cert.FixtureB")
+            wait_for(lambda: len(observed("start")) == 2, "managed Caddy did not pick up renewal")
+            assert not alive(initial_pid) and "cert.FixtureB" in observed("start")[-1]["value"]
+            print("Managed certificate rotation retained the running Caddy on rejection and applied the next valid generation.")
+        finally:
+            child.terminate()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()

@@ -55,7 +55,8 @@ string renderCaddyfile(
     ushort loopbackPort,
     string basePath,
     string stateDir,
-    string webDir
+    string webDir,
+    string tlsCertDir = null
 ) {
     if (tailscaleIp.length == 0) {
         throw new Exception("Refusing to render Caddyfile without a Tailscale IP (never bind 0.0.0.0)");
@@ -84,6 +85,17 @@ string renderCaddyfile(
         .replace("__LOCAL_PORT__", to!string(loopbackPort))
         .replace("__WEB_DIR__", caddyToken(webDir))
         .replace("__WINDOWS_LOG_BLOCK__", windowsCaddyLogBlock(stateDir));
+    if (tlsCertDir.length) {
+        if (!rendered.canFind("__TLS_CERT_BLOCK__"))
+            throw new Exception("Caddy template does not support a managed certificate");
+        if (readText(tlsCertDir ~ "/fqdn") != fqdn ~ "\n")
+            throw new Exception("Managed certificate does not match current MagicDNS name");
+        rendered = rendered.replace("__TLS_CERT_BLOCK__", "\ttls "
+            ~ caddyToken(tlsCertDir ~ "/tls.crt") ~ " "
+            ~ caddyToken(tlsCertDir ~ "/tls.key") ~ "\n");
+    } else {
+        rendered = rendered.replace("__TLS_CERT_BLOCK__", "");
+    }
 
     if (bp != "/") {
         rendered = rendered.replace(

@@ -2,6 +2,11 @@
 
 This guide covers building, testing, and installing **hikari** on **Apple Silicon (`arm64`)** Macs using system-domain **launchd LaunchDaemons** (`/Library/LaunchDaemons/`) so monitoring remains active at the login window and after users log out. Intel macOS support is deferred for this release; Intel Macs running Linux use the Linux targets.
 
+Tailnet access requires a connected Tailscale client. Tailscale's
+[macOS GUI client runs in the login session](https://tailscale.com/docs/how-to/run-unattended).
+After a reboot or logout, hikari can only serve the tailnet dashboard once that
+client is connected again.
+
 ## Install a release
 
 Download `hikari-install.sh` from the [release page](https://github.com/rxwxwwxw/hikari/releases), then:
@@ -39,7 +44,7 @@ sudo ./install/install.sh
 - **LaunchDaemons, not LaunchAgents:** Services are installed as `io.hikari.agent` and `io.hikari.caddy` in `/Library/LaunchDaemons/` and managed with `launchctl bootstrap system`. No login session or `~/Library/LaunchAgents` is required.
 - **Homebrew & Caddy isolation:** `install.sh` detects `/opt/homebrew/bin/caddy` or `/usr/local/bin/caddy` read-only without running `sudo brew` or touching `brew services`. If Caddy is absent, it downloads and SHA-512 verifies the pinned `v2.11.9` binary into `/opt/hikari/bin/caddy` (or runs `brew install caddy` as `$SUDO_USER` only if `--caddy-source=system-package` is explicitly requested).
 - **Joining a Homebrew Caddy:** with `--caddy-mode=auto` (default), if `brew services` runs Caddy with a Caddyfile and every safety check passes, hikari joins it instead of running its own instance: one marked import line plus a hikari-owned site file, verified with `caddy adapt` and reversible byte for byte. It reloads that Caddy only with `--reload` (`caddy reload`); otherwise the installer prints the command. Use `--caddy-mode=isolated` to opt out. See [caddy-integration.md](caddy-integration.md).
-- **Tailscale macOS variants:** Verify that the installed Tailscale variant allows non-interactive daemon access to `tailscale status --json` and HTTPS certificates from the `LaunchDaemon` context.
+- **Standalone Tailscale app:** The installer detects the direct-download macOS app and selects isolated Caddy with a hikari-managed Tailscale certificate. The App Store variant requires separate service-context validation.
 - **Hardware cards:** Apple Silicon reports `hw.model`, `hw.perflevel0.physicalcpu` / `hw.perflevel1.physicalcpu` (P/E cores), and `hw.optional.*` ISA flags; unsupported live GPU utilization is honestly marked `unsupported`.
 
 ## Repair, Rollback, & Uninstall
@@ -128,9 +133,34 @@ The operator-owned file
 `/Library/Application Support/hikari/network-reconcile-seconds` controls the
 interval (zero means startup-only; otherwise at least 15 seconds). Repair preserves
 it. Restart `io.hikari.caddy` after editing it. With zero, unavailable startup
-identity is retried by launchd instead of an internal loop.
+identity is retried by launchd in native certificate mode. In standalone-app
+mode, the wrapper also checks for a newly published local certificate.
 
-Validate noninteractive access with the actual installed CLI, for example:
+### Certificates with the standalone Tailscale app
+
+On the direct-download Tailscale app, the short-lived root LaunchDaemon
+`io.hikari.certificates` verifies the app signature and invokes its bundled
+`tailscale cert`. It checks local eligibility at startup and every 15 minutes.
+It contacts the certificate service only when a certificate is missing, the
+MagicDNS name changes, or fewer than 14 days of validity remain. Failed issuance
+leaves the previous unexpired certificate available for the same hostname.
+
+The root-owned certificate store is
+`/Library/Application Support/hikari/certificates`. Only root can write it and
+only root and the Caddy service group can read its certificate pair. Renewals
+restart only the isolated Caddy process. `hikari doctor` reports certificate job
+status and verifies HTTPS independently.
+
+Run the signed installer when upgrading from a release without the certificate
+LaunchDaemon so it can register the new job. To opt into Caddy's native
+certificate integration, set `caddy.macos_certificates` to `"native"` in
+`config.json` and rerun the installer. Normal uninstall removes the job and
+retains the certificate store with the rest of the configuration. Purge removes
+the store.
+
+### Native Caddy certificate access
+
+For native Caddy certificate mode, validate noninteractive access with the actual installed CLI, for example:
 
 ```sh
 sudo -u _hikari /opt/homebrew/bin/tailscale status --json
