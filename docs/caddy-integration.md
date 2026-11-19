@@ -76,7 +76,7 @@ Three differences Caddy itself introduces when any site is added are treated as 
 
 hikari checks again after writing and restores the backup if anything differs.
 
-**Reloading:** with `--reload`, hikari reloads through your own systemd unit (`systemctl reload caddy`) or with `caddy reload`. If the reload fails, it restores the original files and reloads again. If your Caddy has `admin off` and there is no systemd unit, hikari will not restart your server; it prints the command to run instead. Without `--reload`, hikari prints the exact reload command.
+**Reloading:** with `--reload`, hikari reloads through your own systemd unit (`systemctl reload caddy`) or with `caddy reload`. If the reload fails, it restores the original files and reloads again. On Caddy 2.11 and newer, a reload that fails (for example because hikari's port is taken) stops Caddy's existing sites before it gives up, so they stay down for the moment until that restoring reload brings them back up. Caddy 2.9 kept serving the old config throughout. If your Caddy has `admin off` and there is no systemd unit, hikari will not restart your server; it prints the command to run instead. Without `--reload`, hikari prints the exact reload command.
 
 ## Tests
 

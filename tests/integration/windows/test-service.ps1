@@ -199,7 +199,9 @@ https://localhost:$CaddyPort {
         } finally { $blocker.Stop() }
         if ((Get-FileHash $UserCf).Hash -ne $origUserHash) { Fail "rollback after a failed reload did not restore the user Caddyfile" }
         if (Test-Path (Join-Path $UserDir "hikari.caddy")) { Fail "rollback left hikari.caddy behind" }
-        if ((Get-Http "http://127.0.0.1:$UserSitePort/").Body -notmatch "user site") { Fail "user site down after rollback" }
+        # Caddy 2.11+ stops its servers before a new config fails to start, so the
+        # user site is down until hikari's restoring reload has started them again.
+        Wait-Until { (Get-Http "http://127.0.0.1:$UserSitePort/").Body -match "user site" } 15 "user site back up after rollback"
 
         # 2. A successful join with reload: hikari's listener comes up inside the user's Caddy.
         $r = Invoke-Hikari ($join + @("--reload"))
