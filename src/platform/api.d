@@ -280,6 +280,9 @@ class FakePlatformBackend : PlatformBackend {
             b.power_watts = 11.4;
             b.time_remaining_s = 14200;
             b.health_pct = 91.2;
+            b.cycle_count = 287;
+            b.design_capacity_wh = 52.44;
+            b.full_charge_capacity_wh = 47.83;
             r.batteries = [b];
         }
         return r;

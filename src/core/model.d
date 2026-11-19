@@ -112,7 +112,14 @@ struct BatteryStatus {
     Nullable!double pct;
     Nullable!double power_watts;
     Nullable!long time_remaining_s;
+    // Full-charge capacity as a percentage of design capacity. May exceed 100
+    // on a new battery; null when either capacity is unknown or only relative.
     Nullable!double health_pct;
+    // Null when the battery or OS does not report it (Windows reports 0 for
+    // "unsupported", so 0 is never published as a real count).
+    Nullable!ulong cycle_count;
+    Nullable!double design_capacity_wh;
+    Nullable!double full_charge_capacity_wh;
 }
 
 struct ProcessStatus {
