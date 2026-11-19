@@ -301,6 +301,75 @@ string detectVirtualizationFromSystemStrings(string manufacturer, string model) 
     return "";
 }
 
+/// Facts from one battery's driver (IOCTL_BATTERY_QUERY_INFORMATION / _STATUS).
+/// Capacities are mWh unless `capabilities` has BATTERY_CAPACITY_RELATIVE.
+struct WinBatteryFacts {
+    uint capabilities;
+    uint designedCapacity;
+    uint fullChargedCapacity;
+    uint cycleCount;
+    bool haveStatus;
+    int rate; // mW; negative while discharging; int.min when unknown
+}
+
+/// Display name for a battery. Many laptops report an ACPI object name such as
+/// "BIF0_9" as the device name, which means nothing to a reader; then fall back
+/// to "<manufacturer> battery", or the generic name.
+string windowsBatteryDisplayName(string model, string manufacturer) pure @safe {
+    import std.ascii : isUpper, isDigit;
+    static bool looksLikeAcpiId(string s) {
+        if (s.length == 0 || s.length > 8) return false;
+        foreach (char c; s) if (!(isUpper(c) || isDigit(c) || c == '_')) return false;
+        return true;
+    }
+    auto m = model.strip();
+    auto mf = manufacturer.strip();
+    if (m.length > 0 && !looksLikeAcpiId(m)) return mf.length > 0 && !m.toLower().canFind(mf.toLower()) ? mf ~ " " ~ m : m;
+    if (mf.length > 0) return mf ~ " battery";
+    return "System Battery";
+}
+
+enum uint WIN_BATTERY_CAPACITY_RELATIVE = 0x40000000;
+enum uint WIN_BATTERY_UNKNOWN_CAPACITY = 0xFFFFFFFF;
+
+/// Adds health, capacity, cycle and power facts to `b`. The packs of several
+/// batteries are combined by summing capacities; cycle counts are only kept for
+/// a single battery, since a sum or average would not be a real count.
+void applyWindowsBatteryFacts(ref BatteryStatus b, const WinBatteryFacts[] packs) pure nothrow @safe {
+    import std.typecons : Nullable;
+    if (packs.length == 0) return;
+    ulong design = 0, full = 0;
+    bool capacitiesUsable = true;
+    long rateSum = 0;
+    bool rateKnown = true;
+    foreach (p; packs) {
+        // Relative units are not mWh; a ratio of them is not a trustworthy health figure.
+        if ((p.capabilities & WIN_BATTERY_CAPACITY_RELATIVE) != 0
+            || p.designedCapacity == 0 || p.designedCapacity == WIN_BATTERY_UNKNOWN_CAPACITY
+            || p.fullChargedCapacity == 0 || p.fullChargedCapacity == WIN_BATTERY_UNKNOWN_CAPACITY) {
+            capacitiesUsable = false;
+        } else {
+            design += p.designedCapacity;
+            full += p.fullChargedCapacity;
+        }
+        if (!p.haveStatus || p.rate == int.min || (p.capabilities & WIN_BATTERY_CAPACITY_RELATIVE) != 0) rateKnown = false;
+        else rateSum += p.rate;
+    }
+    if (capacitiesUsable && design > 0) {
+        b.design_capacity_wh = design / 1000.0;
+        b.full_charge_capacity_wh = full / 1000.0;
+        immutable h = 100.0 * full / design;
+        // Above ~150% the driver's design figure is implausible; publish nothing rather than nonsense.
+        if (h <= 150.0) b.health_pct = h;
+    }
+    // Windows documents 0 as "cycle count not supported".
+    if (packs.length == 1 && packs[0].cycleCount > 0) b.cycle_count = packs[0].cycleCount;
+    if (rateKnown && b.power_watts.isNull) {
+        // BATTERY_UNKNOWN_RATE (int.min) is excluded above, so 0 W is a real idle reading.
+        b.power_watts = (rateSum < 0 ? -rateSum : rateSum) / 1000.0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Win32 bindings (declared locally to avoid druntime version gating).
 // ---------------------------------------------------------------------------
@@ -337,6 +406,57 @@ version (Windows) {
 
     private immutable GUID H_GUID_DEVCLASS_DISPLAY = GUID(0x4d36e968, 0xe325, 0x11ce, [0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18]);
     private immutable GUID H_GUID_DEVCLASS_NET = GUID(0x4d36e972, 0xe325, 0x11ce, [0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18]);
+    // Battery device interface class (batclass.h).
+    private immutable GUID H_GUID_DEVCLASS_BATTERY = GUID(0x72631e54, 0x78a4, 0x11d0, [0xbc, 0xf7, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a]);
+    private enum uint H_DIGCF_DEVICEINTERFACE = 0x10;
+    // CTL_CODE(FILE_DEVICE_BATTERY = 0x29, function, METHOD_BUFFERED, FILE_READ_ACCESS)
+    private enum uint H_IOCTL_BATTERY_QUERY_TAG = 0x00294040;
+    private enum uint H_IOCTL_BATTERY_QUERY_INFORMATION = 0x00294044;
+    private enum uint H_IOCTL_BATTERY_QUERY_STATUS = 0x0029404C;
+    private enum int H_BATTERY_INFORMATION_LEVEL = 0; // BatteryInformation
+    private enum int H_BATTERY_DEVICE_NAME_LEVEL = 4; // BatteryDeviceName (model, not serial)
+    private enum int H_BATTERY_MANUFACTURER_LEVEL = 6; // BatteryManufactureName
+
+    private struct H_SP_DEVICE_INTERFACE_DATA {
+        uint cbSize;
+        GUID InterfaceClassGuid;
+        uint Flags;
+        size_t Reserved;
+    }
+
+    private struct H_BATTERY_QUERY_INFORMATION {
+        uint BatteryTag;
+        int InformationLevel;
+        int AtRate;
+    }
+
+    private struct H_BATTERY_INFORMATION {
+        uint Capabilities;
+        ubyte Technology;
+        ubyte[3] Reserved;
+        ubyte[4] Chemistry;
+        uint DesignedCapacity;
+        uint FullChargedCapacity;
+        uint DefaultAlert1;
+        uint DefaultAlert2;
+        uint CriticalBias;
+        uint CycleCount;
+    }
+
+    private struct H_BATTERY_WAIT_STATUS {
+        uint BatteryTag;
+        uint Timeout;
+        uint PowerState;
+        uint LowCapacity;
+        uint HighCapacity;
+    }
+
+    private struct H_BATTERY_STATUS {
+        uint PowerState;
+        uint Capacity;
+        uint Voltage;
+        int Rate;
+    }
 
     private struct H_RawSMBIOSData {
         ubyte Used20CallingMethod;
@@ -437,6 +557,10 @@ version (Windows) {
         BOOL SetupDiGetDeviceRegistryPropertyW(void* DeviceInfoSet, H_SP_DEVINFO_DATA* DeviceInfoData, uint Property,
             uint* PropertyRegDataType, ubyte* PropertyBuffer, uint PropertyBufferSize, uint* RequiredSize);
         BOOL SetupDiDestroyDeviceInfoList(void* DeviceInfoSet);
+        BOOL SetupDiEnumDeviceInterfaces(void* DeviceInfoSet, H_SP_DEVINFO_DATA* DeviceInfoData, const(GUID)* InterfaceClassGuid,
+            uint MemberIndex, H_SP_DEVICE_INTERFACE_DATA* DeviceInterfaceData);
+        BOOL SetupDiGetDeviceInterfaceDetailW(void* DeviceInfoSet, H_SP_DEVICE_INTERFACE_DATA* DeviceInterfaceData,
+            void* DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, uint* RequiredSize, H_SP_DEVINFO_DATA* DeviceInfoData);
         alias fn_RtlGetVersion = int function(H_RTL_OSVERSIONINFOW*);
     }
 
@@ -864,6 +988,14 @@ class WindowsPlatformBackend : PlatformBackend {
                 if (sps.ACLineStatus == 0 && sps.BatteryLifeTime != 0xFFFFFFFFu) {
                     b.time_remaining_s = cast(long) sps.BatteryLifeTime;
                 }
+                // Health, capacities, cycles and power come from the battery driver;
+                // without them the entry still reports charge state as before.
+                try {
+                    string model, maker;
+                    auto packs = queryBatteryPacks(model, maker);
+                    applyWindowsBatteryFacts(b, packs);
+                    if (packs.length > 0) b.name = sanitizeOsString(windowsBatteryDisplayName(model, maker), 64);
+                } catch (Exception) {}
                 r.batteries ~= b;
             }
         } else {
@@ -1156,6 +1288,82 @@ class WindowsPlatformBackend : PlatformBackend {
                 gpus ~= ga;
             }
             return gpus;
+        }
+
+        // Per-battery facts from the battery class driver. Documented IOCTLs on the
+        // battery device interface; no admin rights or WMI needed. Never queries
+        // the serial number or manufacture date.
+        private WinBatteryFacts[] queryBatteryPacks(out string modelName, out string manufacturer) {
+            WinBatteryFacts[] packs;
+            void* set = SetupDiGetClassDevsW(&H_GUID_DEVCLASS_BATTERY, null, null, H_DIGCF_PRESENT | H_DIGCF_DEVICEINTERFACE);
+            if (set is null || set == INVALID_HANDLE_VALUE) return packs;
+            scope (exit) SetupDiDestroyDeviceInfoList(set);
+            foreach (uint i; 0 .. 8) {
+                H_SP_DEVICE_INTERFACE_DATA did;
+                did.cbSize = H_SP_DEVICE_INTERFACE_DATA.sizeof;
+                if (!SetupDiEnumDeviceInterfaces(set, null, &H_GUID_DEVCLASS_BATTERY, i, &did)) break;
+                uint required = 0;
+                SetupDiGetDeviceInterfaceDetailW(set, &did, null, 0, &required, null);
+                if (required < 8 || required > 4096) continue;
+                auto detail = new ubyte[required];
+                // SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize: the fixed part's size (8 on 64-bit, 6 on 32-bit).
+                *cast(uint*) detail.ptr = size_t.sizeof == 8 ? 8 : 6;
+                if (!SetupDiGetDeviceInterfaceDetailW(set, &did, detail.ptr, required, &required, null)) continue;
+                auto pathW = cast(const(wchar)*)(detail.ptr + 4);
+
+                HANDLE h = CreateFileW(pathW, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+                if (h == INVALID_HANDLE_VALUE) continue;
+                scope (exit) CloseHandle(h);
+
+                DWORD got;
+                uint wait = 0, tag = 0;
+                if (!DeviceIoControl(h, H_IOCTL_BATTERY_QUERY_TAG, &wait, cast(DWORD) wait.sizeof, &tag, cast(DWORD) tag.sizeof, &got, null)
+                    || tag == 0) continue;
+
+                H_BATTERY_QUERY_INFORMATION q;
+                q.BatteryTag = tag;
+                q.InformationLevel = H_BATTERY_INFORMATION_LEVEL;
+                H_BATTERY_INFORMATION bi;
+                if (!DeviceIoControl(h, H_IOCTL_BATTERY_QUERY_INFORMATION, &q, cast(DWORD) q.sizeof, &bi, cast(DWORD) bi.sizeof, &got, null)
+                    || got < H_BATTERY_INFORMATION.sizeof) continue;
+
+                WinBatteryFacts f;
+                f.capabilities = bi.Capabilities;
+                f.designedCapacity = bi.DesignedCapacity;
+                f.fullChargedCapacity = bi.FullChargedCapacity;
+                f.cycleCount = bi.CycleCount;
+                f.rate = int.min;
+
+                H_BATTERY_WAIT_STATUS ws;
+                ws.BatteryTag = tag; // Timeout 0: answer immediately
+                H_BATTERY_STATUS bs;
+                if (DeviceIoControl(h, H_IOCTL_BATTERY_QUERY_STATUS, &ws, cast(DWORD) ws.sizeof, &bs, cast(DWORD) bs.sizeof, &got, null)
+                    && got >= H_BATTERY_STATUS.sizeof) {
+                    f.haveStatus = true;
+                    f.rate = bs.Rate;
+                }
+
+                string queryText(int level) {
+                    H_BATTERY_QUERY_INFORMATION tq = q;
+                    tq.InformationLevel = level;
+                    wchar[128] buf;
+                    DWORD n;
+                    if (!DeviceIoControl(h, H_IOCTL_BATTERY_QUERY_INFORMATION, &tq, cast(DWORD) tq.sizeof,
+                        buf.ptr, cast(DWORD)(buf.length * wchar.sizeof), &n, null) || n < 2) return "";
+                    size_t chars = n / 2;
+                    if (chars > buf.length) chars = buf.length;
+                    size_t len = 0;
+                    while (len < chars && buf[len] != 0) len++;
+                    try { return toUTF8(buf[0 .. len]).strip(); } catch (Exception) { return ""; }
+                }
+                if (modelName.length == 0) {
+                    modelName = queryText(H_BATTERY_DEVICE_NAME_LEVEL);
+                    manufacturer = queryText(H_BATTERY_MANUFACTURER_LEVEL);
+                }
+                packs ~= f;
+            }
+            return packs;
         }
 
         private HANDLE openDeviceNoAccess(string path) {

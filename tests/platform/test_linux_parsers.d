@@ -77,6 +77,8 @@ unittest {
     write(root ~ "/sys/class/power_supply/BAT0/energy_full", "40000000\n");
     write(root ~ "/sys/class/power_supply/BAT0/energy_full_design", "50000000\n");
     write(root ~ "/sys/class/power_supply/BAT0/power_now", "10000000\n");
+    write(root ~ "/sys/class/power_supply/BAT0/cycle_count", "312\n");
+    write(root ~ "/sys/class/power_supply/BAT1/cycle_count", "0\n"); // driver does not track cycles
 
     write(root ~ "/sys/class/power_supply/BAT1/type", "Battery\n");
     write(root ~ "/sys/class/power_supply/BAT1/status", "Charging\n");
@@ -146,8 +148,14 @@ unittest {
             assert(abs(b.pct.get - 75.0) < 0.01);
             assert(abs(b.health_pct.get - 80.0) < 0.01);
             assert(b.time_remaining_s.get == 10800); // 30Wh / 10W = 3h
+            assert(b.cycle_count.get == 312);
+            assert(abs(b.design_capacity_wh.get - 50.0) < 0.001);
+            assert(abs(b.full_charge_capacity_wh.get - 40.0) < 0.001);
         } else if (b.id == "BAT1") {
             assert(abs(b.pct.get - 50.0) < 0.01);
+            assert(b.cycle_count.isNull, "0 cycles from the driver means unknown, not a new battery");
+            // No design capacity and charge-based units: no health or Wh figures.
+            assert(b.health_pct.isNull && b.design_capacity_wh.isNull && b.full_charge_capacity_wh.isNull);
         }
     }
 

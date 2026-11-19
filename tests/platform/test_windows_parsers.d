@@ -205,3 +205,69 @@ version (Windows) unittest {
     auto rb = rollbackToPrevious(versions, state, (string _) => true, (string v) => v == "0.1.0");
     assert(rb.ok && readText(versions ~ `\current\hikari.exe`) == "old");
 }
+
+unittest {
+    // Battery health from IOCTL_BATTERY_QUERY_INFORMATION / _STATUS facts.
+    import core.model : BatteryStatus;
+    import std.math : abs;
+
+    // A real MSI laptop: 52,440 mWh design, 47,926 mWh full, cycles unsupported (0), idle on AC.
+    BatteryStatus b;
+    WinBatteryFacts msi = {capabilities: 0x80000000, designedCapacity: 52_440, fullChargedCapacity: 47_926,
+        cycleCount: 0, haveStatus: true, rate: 0};
+    applyWindowsBatteryFacts(b, [msi]);
+    assert(abs(b.health_pct.get - 91.392) < 0.01);
+    assert(abs(b.design_capacity_wh.get - 52.44) < 1e-9 && abs(b.full_charge_capacity_wh.get - 47.926) < 1e-9);
+    assert(b.cycle_count.isNull, "Windows reports 0 for 'cycle count not supported'");
+    assert(b.power_watts.get == 0.0, "a known zero rate is a real idle reading");
+
+    // Discharging at 11.4 W with a real cycle count.
+    BatteryStatus d;
+    WinBatteryFacts dis = msi;
+    dis.cycleCount = 287;
+    dis.rate = -11_400;
+    applyWindowsBatteryFacts(d, [dis]);
+    assert(d.cycle_count.get == 287 && abs(d.power_watts.get - 11.4) < 1e-9);
+
+    // Relative capacity units are not mWh: no health, capacities or power.
+    BatteryStatus rel;
+    WinBatteryFacts r = msi;
+    r.capabilities |= WIN_BATTERY_CAPACITY_RELATIVE;
+    r.rate = -500;
+    applyWindowsBatteryFacts(rel, [r]);
+    assert(rel.health_pct.isNull && rel.design_capacity_wh.isNull && rel.power_watts.isNull);
+
+    // Unknown capacity or rate, and an implausible design figure, publish nothing.
+    BatteryStatus unk;
+    WinBatteryFacts u = msi;
+    u.fullChargedCapacity = WIN_BATTERY_UNKNOWN_CAPACITY;
+    u.rate = int.min;
+    applyWindowsBatteryFacts(unk, [u]);
+    assert(unk.health_pct.isNull && unk.full_charge_capacity_wh.isNull && unk.power_watts.isNull);
+    BatteryStatus odd;
+    WinBatteryFacts o = msi;
+    o.designedCapacity = 10_000; // full charge would be 479% of design
+    applyWindowsBatteryFacts(odd, [o]);
+    assert(odd.health_pct.isNull && !odd.design_capacity_wh.isNull);
+
+    // Two packs: capacities summed, power summed, no combined cycle count.
+    BatteryStatus two;
+    WinBatteryFacts a = {designedCapacity: 40_000, fullChargedCapacity: 36_000, cycleCount: 100, haveStatus: true, rate: -5_000};
+    WinBatteryFacts c = {designedCapacity: 20_000, fullChargedCapacity: 12_000, cycleCount: 400, haveStatus: true, rate: -3_000};
+    applyWindowsBatteryFacts(two, [a, c]);
+    assert(abs(two.health_pct.get - 80.0) < 1e-9 && abs(two.design_capacity_wh.get - 60.0) < 1e-9);
+    assert(two.cycle_count.isNull && abs(two.power_watts.get - 8.0) < 1e-9);
+
+    // No battery driver facts: the entry is left exactly as GetSystemPowerStatus filled it.
+    BatteryStatus none;
+    applyWindowsBatteryFacts(none, []);
+    assert(none.health_pct.isNull && none.cycle_count.isNull && none.power_watts.isNull);
+
+    // Display names: ACPI object IDs are replaced; real model names are kept.
+    assert(windowsBatteryDisplayName("BIF0_9", "MSI") == "MSI battery");
+    assert(windowsBatteryDisplayName("BIF0_9", "") == "System Battery");
+    assert(windowsBatteryDisplayName("", "") == "System Battery");
+    assert(windowsBatteryDisplayName("DELL 7FHC0", "SMP") == "SMP DELL 7FHC0");
+    assert(windowsBatteryDisplayName("Surface Battery", "Microsoft") == "Microsoft Surface Battery");
+    assert(windowsBatteryDisplayName("LGC Battery LGC", "LGC") == "LGC Battery LGC");
+}

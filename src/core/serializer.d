@@ -208,6 +208,9 @@ JSONValue serializeStatusResponse(const ref StatusResponse resp) pure @safe {
         bj["power_watts"] = jsonNullableDouble(b.power_watts);
         bj["time_remaining_s"] = jsonNullableLong(b.time_remaining_s);
         bj["health_pct"] = jsonNullableDouble(b.health_pct);
+        bj["cycle_count"] = b.cycle_count.isNull ? JSONValue(null) : JSONValue(b.cycle_count.get);
+        bj["design_capacity_wh"] = jsonNullableDouble(b.design_capacity_wh);
+        bj["full_charge_capacity_wh"] = jsonNullableDouble(b.full_charge_capacity_wh);
         bats ~= bj;
     }
     j["batteries"] = JSONValue(bats);

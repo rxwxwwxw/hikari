@@ -928,7 +928,15 @@
         exWrap.appendChild(el("span", {
           className: "badge badge-muted",
           text: "Bat " + formatPct(b0.pct),
+          title: "Battery charge level",
         }));
+        if (b0.health_pct !== null && b0.health_pct !== undefined) {
+          exWrap.appendChild(el("span", {
+            className: "badge badge-muted",
+            text: "Health " + formatPct(b0.health_pct),
+            title: "Battery health: full-charge capacity as a share of design capacity",
+          }));
+        }
       }
       if (d && d.drift && d.drift.reboot_required === true) {
         exWrap.appendChild(el("span", { className: "badge badge-warn", text: "Reboot req" }));
@@ -1136,7 +1144,12 @@
           [b.name || b.id, `${formatPct(b.pct)} (${b.status})`],
           ["Power", b.power_watts !== null ? b.power_watts.toFixed(1) + " W" : "—"],
           ["Remaining", formatDuration(b.time_remaining_s)],
-          ["Health", formatPct(b.health_pct)],
+          ["Health", b.health_pct !== null && b.health_pct !== undefined
+            ? formatPct(b.health_pct) + " of design capacity" : "—"],
+          ["Capacity", (b.full_charge_capacity_wh !== null && b.full_charge_capacity_wh !== undefined
+            && b.design_capacity_wh !== null && b.design_capacity_wh !== undefined)
+            ? `${b.full_charge_capacity_wh.toFixed(1)} Wh of ${b.design_capacity_wh.toFixed(1)} Wh design` : "—"],
+          ["Cycle count", (b.cycle_count !== null && b.cycle_count !== undefined) ? String(b.cycle_count) : "—"],
         ])));
       }
       grid.appendChild(batCard);

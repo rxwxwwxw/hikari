@@ -674,6 +674,20 @@ class LinuxPlatformBackend : PlatformBackend {
 
                 if (energyFullUwh > 0 && energyDesignUwh > 0) {
                     b.health_pct = (energyFullUwh / energyDesignUwh) * 100.0;
+                    // Watt-hours only from energy_* (µWh); charge_* times the
+                    // instantaneous voltage_now is not a stable capacity figure.
+                    if (safeReadText(de.name ~ "/energy_full_design").length > 0) {
+                        b.design_capacity_wh = energyDesignUwh / 1_000_000.0;
+                        b.full_charge_capacity_wh = energyFullUwh / 1_000_000.0;
+                    }
+                }
+                // Many ACPI drivers report 0 when they do not track cycles; publish only real counts.
+                auto cyc = safeReadText(de.name ~ "/cycle_count");
+                if (cyc.length > 0) {
+                    try {
+                        auto c = to!ulong(cyc);
+                        if (c > 0) b.cycle_count = c;
+                    } catch (Exception) {}
                 }
                 if (powerUw > 0) {
                     b.power_watts = powerUw / 1_000_000.0;
