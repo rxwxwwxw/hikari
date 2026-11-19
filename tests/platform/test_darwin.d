@@ -58,7 +58,26 @@ unittest {
     assert(mounts.state == CapabilityState.ok);
     assert(mounts.mounts.canFind!(m => m.mount == "/"));
     auto gpu = backend.sampleGpus();
-    assert(gpu.state == CapabilityState.unsupported);
+    assert(gpu.state == CapabilityState.ok || gpu.state == CapabilityState.unsupported);
+    if (gpu.state == CapabilityState.ok) {
+        assert(gpu.gpus.length > 0);
+        foreach (g; gpu.gpus) {
+            assert(g.id.length > 0 && g.display_name.length > 0);
+            assert(g.utilization_pct.isNull || (g.utilization_pct.get >= 0.0 && g.utilization_pct.get <= 100.0));
+        }
+    }
+    auto hw = backend.scanHardware();
+    assert(hw.state == CapabilityState.ok);
+    assert(hw.inventory.cpu.display_name.length > 0);
+    assert(hw.inventory.cpu.isa.usable.length > 0);
+    assert(hw.inventory.system.model.length > 0);
+    if (hw.inventory.storage_devices.length > 0) {
+        bool anyRootMount = false;
+        foreach (sd; hw.inventory.storage_devices) {
+            if (sd.mounts.canFind("/")) anyRootMount = true;
+        }
+        assert(anyRootMount, "Expected physical storage device backing / to include '/' mount");
+    }
     auto batteries = backend.sampleBatteries();
     assert(batteries.state == CapabilityState.ok);
     foreach (b; batteries.batteries) {

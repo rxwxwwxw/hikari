@@ -71,7 +71,21 @@ PYPATCH
   if [ -z "$root" ] && [ "$mode" = auto ]; then
     chown root:wheel "$destination"
     launchctl bootout system/io.hikari.maintenance 2>/dev/null || true
-    launchctl bootstrap system "$destination"
+    for ((i = 0; i < 50; i++)); do
+      if ! launchctl print system/io.hikari.maintenance >/dev/null 2>&1; then break; fi
+      sleep 0.1
+    done
+    bootstrapped=0
+    for ((i = 0; i < 15; i++)); do
+      if launchctl bootstrap system "$destination" 2>/dev/null; then
+        bootstrapped=1
+        break
+      fi
+      sleep 0.2
+    done
+    if [ "$bootstrapped" -eq 0 ]; then
+      launchctl bootstrap system "$destination"
+    fi
   fi
 else
   timer="$root/etc/systemd/system/hikari-maintenance.timer"

@@ -152,7 +152,14 @@ bool restartLaunchdJob(string target, LaunchctlFn command = null) {
         return "";
     }
     auto before = command(["/bin/launchctl", "print", target], 3000, 16384);
-    if (before.status != 0 || before.outputTruncated) return false;
+    if (before.status != 0) {
+        if (before.outputTruncated) return false;
+        immutable plistPath = target == "system/io.hikari.agent"
+            ? "/Library/LaunchDaemons/io.hikari.agent.plist"
+            : "/Library/LaunchDaemons/io.hikari.caddy.plist";
+        if (!exists(plistPath)) return false;
+        return command(["/bin/launchctl", "bootstrap", "system", plistPath], 10000, 4096).status == 0;
+    }
     auto oldPid = pid(before.output);
     if (oldPid.length) {
         // SuccessfulExit=false jobs do not restart after hikari's graceful exit.

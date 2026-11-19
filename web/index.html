@@ -112,6 +112,7 @@
   }
 
   .btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+  .btn-sm { padding: 3px 8px; font-size: 12px; }
   .btn:focus-visible, input:focus-visible, select:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -529,6 +530,7 @@
     avx512vl: ["AVX-512VL", "Vector/SIMD", "AVX-512 128/256-bit masking"],
     avx512vnni: ["AVX-512 VNNI", "Vector/SIMD", "INT8 AI dot-product acceleration"],
     avx512bf16: ["AVX-512 BF16", "Vector/SIMD", "BFloat16 vector math"],
+    avx512cd: ["AVX-512CD", "Vector/SIMD", "AVX-512 conflict detection for vectorizing loops"],
     avx_vnni: ["AVX-VNNI", "Vector/SIMD", "256-bit INT8 dot-product acceleration"],
     aes: ["AES-NI", "Cryptography", "Hardware AES encryption/decryption"],
     pclmulqdq: ["PCLMULQDQ", "Cryptography", "Carry-less multiply for GCM/CRC"],
@@ -542,24 +544,55 @@
     adx: ["ADX", "Bit manipulation", "Multi-precision carry arithmetic"],
     popcnt: ["POPCNT", "Bit manipulation", "Population bit count"],
     lzcnt: ["LZCNT", "Bit manipulation", "Leading-zero bit count"],
+    movbe: ["MOVBE", "Bit manipulation", "Byte-swap move for endian conversions"],
     vmx: ["Intel VT-x", "Virtualization", "Intel hardware virtualization"],
     svm: ["AMD-V", "Virtualization", "AMD hardware virtualization"],
     fp: ["FP", "Vector/SIMD", "ARM64 floating-point unit"],
     asimd: ["NEON (ASIMD)", "Vector/SIMD", "ARM64 128-bit Advanced SIMD"],
+    fphp: ["FP16", "Vector/SIMD", "ARM64 scalar half-precision floating point"],
+    asimdhp: ["NEON FP16", "Vector/SIMD", "ARM64 vector half-precision floating point"],
     asimddp: ["DotProd", "Vector/SIMD", "ARM64 INT8 vector dot product"],
+    asimdrdm: ["RDMA (SQRDMLAH)", "Vector/SIMD", "ARMv8.1 rounding double multiply-accumulate SIMD instructions"],
+    asimdfhm: ["FHM (FP16 FMA)", "Vector/SIMD", "ARMv8.2 half-precision to single-precision fused multiply-add"],
+    frintts: ["FRINTTS", "Vector/SIMD", "ARMv8.5 floating-point to integer round-to-fixed-size instructions"],
+    fcma: ["FCMA", "Vector/SIMD", "Floating-point complex number multiply-add"],
     sve: ["SVE", "Vector/SIMD", "ARM64 Scalable Vector Extension"],
     sve2: ["SVE2", "Vector/SIMD", "ARM64 Scalable Vector Extension v2"],
+    sme: ["SME", "Vector/SIMD", "ARMv9 Scalable Matrix Extension"],
+    sme2: ["SME2", "Vector/SIMD", "ARMv9 Scalable Matrix Extension version 2"],
     bf16: ["BF16", "Vector/SIMD", "ARM64 BFloat16 arithmetic"],
     i8mm: ["I8MM", "Vector/SIMD", "ARM64 Int8 matrix multiplication"],
     pmull: ["PMULL", "Cryptography", "ARM64 polynomial multiply for GCM"],
     sha1: ["SHA1", "Cryptography", "ARM64 hardware SHA-1"],
     sha2: ["SHA256", "Cryptography", "ARM64 hardware SHA-256"],
     sha3: ["SHA3", "Cryptography", "ARM64 hardware SHA-3"],
+    sha512: ["SHA512", "Cryptography", "ARM64 hardware SHA-512 instructions"],
+    sm3: ["SM3", "Cryptography", "ARM64 hardware SM3 hash instructions"],
+    sm4: ["SM4", "Cryptography", "ARM64 hardware SM4 cipher instructions"],
+    dit: ["DIT", "Cryptography", "ARMv8.4 Data Independent Timing for constant-time cryptography"],
     crc32: ["CRC32", "Bit manipulation", "ARM64 hardware CRC32 checksum"],
+    flagm: ["FlagM", "Bit manipulation", "ARMv8.4 condition flag manipulation instructions (CFINV, RMIF, SETF)"],
+    flagm2: ["FlagM2", "Bit manipulation", "ARMv8.5 condition flag manipulation extensions (AXFLAG, XAFLAG)"],
+    vhe: ["ARM VHE", "Virtualization", "ARMv8.1 Virtualization Host Extensions (Apple Hypervisor)"],
     atomics: ["LSE Atomics", "Other", "ARM64 large system atomic primitives"],
+    lse2: ["LSE2 Atomics", "Other", "ARMv8.4 Large System Extensions v2 single-copy 16-byte atomic loads/stores"],
+    lrcpc: ["LRCPC", "Other", "ARMv8.3 Load-Acquire RCpc weaker release-consistency atomics"],
+    lrcpc2: ["LRCPC2", "Other", "ARMv8.4 Load-Acquire RCpc v2 immediate-offset addressing"],
+    dpb: ["DPB (DC CVAP)", "Other", "ARMv8.2 data cache clean to point of persistence"],
+    dpb2: ["DPB2 (DC CVADP)", "Other", "ARMv8.5 data cache clean to point of deep persistence"],
+    jscvt: ["JSCVT", "Other", "JavaScript double-to-int32 conversion instruction"],
+    bti: ["BTI", "Other", "Branch Target Identification control-flow security"],
+    paca: ["PAuth", "Other", "Pointer Authentication instructions"],
+    sb: ["SB", "Other", "ARMv8.5 Speculation Barrier instruction"],
+    ssbs: ["SSBS", "Other", "ARMv8.5 Speculative Store Bypass Safe control"],
+    csv2: ["CSV2", "Other", "Cache Speculation Variant 2 branch-target isolation"],
+    csv3: ["CSV3", "Other", "Cache Speculation Variant 3 fault-data isolation"],
+    mte: ["MTE", "Other", "ARMv8.5 Memory Tagging Extension"],
     rng: ["RNDR", "Cryptography", "ARM64 hardware random generator"],
     xsave: ["XSAVE", "Other", "Extended processor state save/restore"],
     osxsave: ["OSXSAVE", "Other", "OS-enabled XSAVE/XCR0 state"],
+    cmpxchg16b: ["CMPXCHG16B", "Other", "128-bit atomic compare-and-exchange"],
+    fsgsbase: ["FSGSBASE", "Other", "User-space fast FS/GS segment base access"],
   };
 
   const state = {
@@ -569,11 +602,14 @@
     selectedNodeId: null,
     activeTab: "overview",
     showVirtualNics: false,
+    showInactiveNet: false,
     isaFilter: "",
     pollIntervalMs: 60000,
     pollTimer: null,
     discoveryFollowupTimer: null,
     discoveryFollowups: 0,
+    coldRateTimer: null,
+    coldRateFollowups: 0,
     activeControllers: new Set(),
     hardwareRetryTimer: null,
     isPolling: false,
@@ -664,6 +700,8 @@
   function abortAllRequests() {
     clearTimeout(state.hardwareRetryTimer);
     state.hardwareRetryTimer = null;
+    clearTimeout(state.coldRateTimer);
+    state.coldRateTimer = null;
     for (const ac of state.activeControllers) {
       try { ac.abort(); } catch (_) {}
     }
@@ -729,26 +767,59 @@
     return { label: "Unreachable", cls: "badge-err", online: false };
   }
 
-  function maxMountPct(st) {
+  function maxMountInfo(st) {
     if (!st || !st.data || !Array.isArray(st.data.mounts) || st.data.mounts.length === 0) return null;
     let mx = null;
     for (const m of st.data.mounts) {
-      if (typeof m.pct === "number" && (mx === null || m.pct > mx)) mx = m.pct;
+      if (typeof m.pct === "number" && (mx === null || m.pct > mx.pct)) mx = m;
     }
     return mx;
   }
 
-  function totalNetRates(st) {
-    if (!st || !st.data || !Array.isArray(st.data.network)) return { rx: null, tx: null };
-    // Avoid summing overlapping physical and tailscale0 packets; prefer physical/wireless first
+  function maxMountPct(st) {
+    const mx = maxMountInfo(st);
+    return mx ? mx.pct : null;
+  }
+
+  function totalNetStats(st) {
+    if (!st || !st.data || !Array.isArray(st.data.network)) {
+      return { rx: null, tx: null, totalRx: null, totalTx: null };
+    }
+    // Avoid summing overlapping physical/wireless and tailnet packets; prefer physical/wireless first
     const nonTail = st.data.network.filter((n) => n.kind === "physical" || n.kind === "wireless");
     const list = nonTail.length > 0 ? nonTail : st.data.network;
-    let rx = null, tx = null;
+    let rx = null, tx = null, totalRx = null, totalTx = null;
     for (const n of list) {
       if (typeof n.rx_bytes_per_s === "number") rx = (rx || 0) + n.rx_bytes_per_s;
       if (typeof n.tx_bytes_per_s === "number") tx = (tx || 0) + n.tx_bytes_per_s;
+      if (typeof n.rx_bytes === "number") totalRx = (totalRx || 0) + n.rx_bytes;
+      if (typeof n.tx_bytes === "number") totalTx = (totalTx || 0) + n.tx_bytes;
     }
-    return { rx, tx };
+    return { rx, tx, totalRx, totalTx };
+  }
+
+  function formatGpuMem(g) {
+    if (!g) return "—";
+    if (g.vram_total_bytes !== null && g.vram_total_bytes !== undefined) {
+      return `${formatBytes(g.vram_used_bytes)} / ${formatBytes(g.vram_total_bytes)}`;
+    }
+    if (g.vram_used_bytes !== null && g.vram_used_bytes !== undefined) {
+      return `${formatBytes(g.vram_used_bytes)} in use (unified)`;
+    }
+    return "—";
+  }
+
+  function computeHwSummary(hw) {
+    if (!hw) return null;
+    const sys = hw.system || {};
+    const sysModel = (sys.product_family && sys.model && sys.product_family !== sys.model)
+      ? (sys.product_family + " (" + sys.model + ")")
+      : ([sys.manufacturer, sys.model].filter(Boolean).join(" ") || null);
+    return {
+      cpu: hw.cpu ? hw.cpu.display_name : null,
+      ram_bytes: hw.memory ? hw.memory.total_bytes : null,
+      system_model: sysModel,
+    };
   }
 
   function renderMeter(pct, tone) {
@@ -791,7 +862,7 @@
 
       if (search) {
         const hwSum = (st && st.data && st.data.hardware_summary) || n.last_known_hardware_summary;
-        const hay = [n.alias, n.name, n.fqdn, n.os, hwSum && hwSum.cpu].filter(Boolean).join(" ").toLowerCase();
+        const hay = [n.alias, n.name, n.fqdn, n.os, hwSum && hwSum.cpu, hwSum && hwSum.system_model].filter(Boolean).join(" ").toLowerCase();
         if (!hay.includes(search)) return false;
       }
       return true;
@@ -853,14 +924,19 @@
       const subParts = [];
       if (n.alias && n.name) subParts.push(n.name);
       if (n.fqdn) subParts.push(n.fqdn);
+      if (hwSum && hwSum.system_model) subParts.push(hwSum.system_model);
       if (hwSum && hwSum.cpu) subParts.push(hwSum.cpu);
       tdHost.appendChild(el("div", { className: "host-sub", text: subParts.join(" · ") || n.node_id }));
       tr.appendChild(tdHost);
 
       // OS/Arch
+      const osArchSub = [
+        (d && d.arch) || n.arch,
+        d && d.drift && d.drift.running_kernel,
+      ].filter(Boolean).join(" · ");
       tr.appendChild(el("td", null, [
         el("div", { text: (d && d.os) || n.os || "—" }),
-        el("div", { className: "host-sub", text: (d && d.arch) || n.arch || "" }),
+        el("div", { className: "host-sub", text: osArchSub }),
       ]));
 
       // Status & Freshness
@@ -881,8 +957,12 @@
 
       // CPU
       const cpuPct = d && d.cpu ? d.cpu.pct : null;
+      const loadSub = d && d.cpu && d.cpu.load_1m !== null && d.cpu.load_1m !== undefined
+        ? ("Load " + d.cpu.load_1m.toFixed(2)) : null;
+      const cpuText = cpuPct !== null && cpuPct !== undefined ? formatPct(cpuPct) : (d ? "Sampling…" : "—");
       const tdCpu = el("td", { className: "mono" }, [
-        el("div", { text: cpuPct !== null ? formatPct(cpuPct) : "—" }),
+        el("div", { text: cpuText }),
+        loadSub ? el("div", { className: "host-sub", text: loadSub }) : null,
         renderMeter(cpuPct),
       ]);
       tr.appendChild(tdCpu);
@@ -900,27 +980,33 @@
       tr.appendChild(tdRam);
 
       // Max Disk
-      const diskPct = maxMountPct(st);
+      const dm = maxMountInfo(st);
+      const diskSub = dm && dm.total_bytes
+        ? (dm.mount + " · " + formatBytes(dm.used_bytes) + " / " + formatBytes(dm.total_bytes)) : null;
       tr.appendChild(el("td", { className: "mono" }, [
-        el("div", { text: formatPct(diskPct) }),
-        renderMeter(diskPct),
+        el("div", { text: formatPct(dm ? dm.pct : null) }),
+        diskSub ? el("div", { className: "host-sub", text: diskSub }) : null,
+        renderMeter(dm ? dm.pct : null),
       ]));
 
       // Net Rate
-      const nr = totalNetRates(st);
+      const nr = totalNetStats(st);
+      const hasRates = nr.rx !== null || nr.tx !== null;
+      const netLine1 = hasRates ? ("↓ " + formatRate(nr.rx)) : (nr.totalRx !== null ? ("RX " + formatBytes(nr.totalRx)) : "↓ —");
+      const netLine2 = hasRates ? ("↑ " + formatRate(nr.tx)) : (nr.totalTx !== null ? ("TX " + formatBytes(nr.totalTx)) : "↑ —");
       tr.appendChild(el("td", { className: "mono" }, [
-        el("div", { text: "↓ " + formatRate(nr.rx) }),
-        el("div", { className: "host-sub", text: "↑ " + formatRate(nr.tx) }),
+        el("div", { text: netLine1 }),
+        el("div", { className: "host-sub", text: netLine2 }),
       ]));
 
-      // Extras (GPU, Battery, Reboot)
+      // Extras (GPU, Battery, Reboot, Updates)
       const tdEx = el("td");
       const exWrap = el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap" } });
       if (d && Array.isArray(d.gpus) && d.gpus.length > 0) {
         const g0 = d.gpus[0];
         exWrap.appendChild(el("span", {
           className: "badge badge-muted",
-          text: "GPU " + (g0.utilization_pct !== null ? formatPct(g0.utilization_pct) : g0.display_name),
+          text: "GPU " + (g0.utilization_pct !== null && g0.utilization_pct !== undefined ? formatPct(g0.utilization_pct) : g0.display_name),
         }));
       }
       if (d && Array.isArray(d.batteries) && d.batteries.length > 0) {
@@ -940,6 +1026,13 @@
       }
       if (d && d.drift && d.drift.reboot_required === true) {
         exWrap.appendChild(el("span", { className: "badge badge-warn", text: "Reboot req" }));
+      }
+      if (d && d.drift && typeof d.drift.pending_updates === "number" && d.drift.pending_updates > 0) {
+        exWrap.appendChild(el("span", {
+          className: "badge badge-info",
+          text: d.drift.pending_updates + (d.drift.pending_updates === 1 ? " update" : " updates"),
+          title: "Pending OS updates from local metadata",
+        }));
       }
       if (exWrap.childNodes.length === 0) exWrap.appendChild(el("span", { className: "dim", text: "—" }));
       tdEx.appendChild(exWrap);
@@ -990,6 +1083,15 @@
       const res = await fetchJsonBounded(url, 6000);
       if (res.status === 200 && res.json && res.json.app === "hikari") {
         state.hardwareByNode.set(nodeId, { loading: false, data: res.json, error: null });
+        const summary = computeHwSummary(res.json);
+        if (summary) {
+          node.last_known_hardware_summary = summary;
+          const stEntry = state.statusByNode.get(nodeId);
+          if (stEntry && stEntry.data && !stEntry.data.hardware_summary) {
+            stEntry.data.hardware_summary = summary;
+          }
+          renderFleet();
+        }
       } else if (res.status === 202) {
         state.hardwareByNode.set(nodeId, { loading: false, data: existing ? existing.data : null, error: "Scanning hardware (202 collecting)..." });
         if (attempt < 10 && document.visibilityState === "visible") {
@@ -1092,35 +1194,190 @@
       return;
     }
 
+    const hwSum = d.hardware_summary || node.last_known_hardware_summary;
+    const hwEntry = state.hardwareByNode.get(node.node_id);
+    const hwData = hwEntry ? hwEntry.data : null;
     const grid = el("div", { className: "card-grid" });
 
-    // Compute & Memory
-    const sysCard = el("div", { className: "card" }, [
+    // 1. System & Host Identity
+    const loadHwBtn = (!hwSum && !hwData) ? (() => {
+      const b = el("button", {
+        type: "button",
+        className: "btn btn-sm",
+        text: hwEntry && hwEntry.loading ? "Loading..." : "Load hardware inventory",
+      });
+      b.disabled = Boolean(hwEntry && hwEntry.loading);
+      b.addEventListener("click", () => ensureHardwareLoaded(node.node_id, false));
+      return b;
+    })() : null;
+
+    const sysModel = (hwSum && hwSum.system_model)
+      || (hwData && hwData.system && (hwData.system.product_family || hwData.system.model))
+      || "Not loaded";
+    const cpuModel = (hwSum && hwSum.cpu)
+      || (hwData && hwData.cpu && hwData.cpu.display_name)
+      || "Not loaded";
+
+    grid.appendChild(el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "System & Host Identity" }),
+        loadHwBtn,
+      ].filter(Boolean)),
+      renderKv([
+        ["Hostname", d.host],
+        ["MagicDNS FQDN", d.fqdn || node.fqdn || "None"],
+        ["OS / Arch", `${d.os} / ${d.arch}`],
+        ["OS / Kernel", d.drift && d.drift.running_kernel],
+        ["System model", sysModel],
+        ["Processor", cpuModel],
+        ["Uptime", formatDuration(d.uptime_s)],
+        ["Agent version", `v${d.agent_version || "?"} (schema v${d.schema_version ?? "?"})`],
+      ]),
+    ]));
+
+    // 2. Compute & Memory
+    const cpuPct = d.cpu ? d.cpu.pct : null;
+    const ramPct = d.memory ? d.memory.pct : null;
+    const freeRam = (d.memory && typeof d.memory.total_bytes === "number" && typeof d.memory.used_bytes === "number")
+      ? formatBytes(Math.max(0, d.memory.total_bytes - d.memory.used_bytes)) : null;
+
+    const compCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, [
         el("div", { className: "card-title", text: "Compute & Memory" }),
         el("span", { className: "dim", text: "Aggregate CPU 0–100%" }),
       ]),
+      el("div", { style: { marginBottom: "10px" } }, [
+        el("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12px" } }, [
+          el("span", { className: "muted", text: "CPU" }),
+          el("span", { className: "mono", text: (cpuPct !== null && cpuPct !== undefined) ? formatPct(cpuPct) : "Sampling baseline…" }),
+        ]),
+        renderMeter(cpuPct),
+        el("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12px", marginTop: "8px" } }, [
+          el("span", { className: "muted", text: "Memory" }),
+          el("span", { className: "mono", text: d.memory ? `${formatBytes(d.memory.used_bytes)} / ${formatBytes(d.memory.total_bytes)} (${formatPct(ramPct)})` : "—" }),
+        ]),
+        renderMeter(ramPct),
+      ]),
       renderKv([
-        ["CPU usage", d.cpu ? formatPct(d.cpu.pct) : "—"],
-        ["Load (1m)", d.cpu && d.cpu.load_1m !== null ? d.cpu.load_1m.toFixed(2) : "Unavailable"],
-        ["CPU temp", d.cpu && d.cpu.temp_c !== null ? d.cpu.temp_c.toFixed(1) + " °C" : "Unavailable"],
+        ["CPU usage", (cpuPct !== null && cpuPct !== undefined) ? formatPct(cpuPct) : "Sampling baseline (updates in ~10s)"],
+        ["Load (1m)", (d.cpu && d.cpu.load_1m !== null && d.cpu.load_1m !== undefined) ? d.cpu.load_1m.toFixed(2) : "Unavailable"],
+        ["CPU temp", (d.cpu && d.cpu.temp_c !== null && d.cpu.temp_c !== undefined) ? d.cpu.temp_c.toFixed(1) + " °C" : "Not exposed by OS"],
         ["RAM", d.memory ? `${formatBytes(d.memory.used_bytes)} / ${formatBytes(d.memory.total_bytes)} (${formatPct(d.memory.pct)})` : "—"],
+        freeRam ? ["RAM free", freeRam] : null,
         ["Swap", d.swap ? `${formatBytes(d.swap.used_bytes)} / ${formatBytes(d.swap.total_bytes)} (${formatPct(d.swap.pct)})` : "None / Unavailable"],
         d.commit ? ["Commit charge", `${formatBytes(d.commit.used_bytes)} / ${formatBytes(d.commit.limit_bytes)} (${formatPct(d.commit.pct)})`] : null,
-        ["Uptime", formatDuration(d.uptime_s)],
-        ["Boot ID", d.boot_id],
       ].filter(Boolean)),
     ]);
-    grid.appendChild(sysCard);
+    grid.appendChild(compCard);
 
-    // Group freshness table
+    // 3. Storage & Filesystems
+    const mounts = Array.isArray(d.mounts) ? d.mounts : [];
+    const storCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "Storage & Filesystems" }),
+        el("span", { className: "badge badge-muted", text: mounts.length + (mounts.length === 1 ? " mount" : " mounts") }),
+      ]),
+    ]);
+    if (mounts.length === 0) {
+      storCard.appendChild(el("div", { className: "muted", text: "No mounted filesystems reported." }));
+    } else {
+      for (const m of mounts) {
+        const freeStr = (typeof m.total_bytes === "number" && typeof m.used_bytes === "number")
+          ? (formatBytes(Math.max(0, m.total_bytes - m.used_bytes)) + " free") : null;
+        storCard.appendChild(el("div", { className: "sub-item" }, [
+          el("div", { style: { display: "flex", justifyContent: "space-between", gap: "8px" } }, [
+            el("strong", { className: "mono", text: m.mount }),
+            el("span", { className: "mono", text: `${formatBytes(m.used_bytes)} / ${formatBytes(m.total_bytes)} (${formatPct(m.pct)})` }),
+          ]),
+          el("div", { className: "host-sub", text: [m.fs, m.source, freeStr].filter(Boolean).join(" · ") }),
+          renderMeter(m.pct),
+        ]));
+      }
+    }
+    grid.appendChild(storCard);
+
+    // 4. Active Network & GPU
+    const netCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Active Network & GPU" })),
+    ]);
+    const allNets = Array.isArray(d.network) ? d.network : [];
+    let activeNets = allNets.filter((n) => (n.rx_bytes || 0) > 0 || (n.tx_bytes || 0) > 0 || n.link_up === true);
+    if (activeNets.length === 0) {
+      activeNets = allNets.filter((n) => n.kind === "physical" || n.kind === "wireless" || n.kind === "tailnet");
+    }
+    if (activeNets.length === 0) {
+      netCard.appendChild(el("div", { className: "muted", text: "No active network interfaces." }));
+    } else {
+      for (const n of activeNets) {
+        const hasRate = (n.rx_bytes_per_s !== null && n.rx_bytes_per_s !== undefined)
+          || (n.tx_bytes_per_s !== null && n.tx_bytes_per_s !== undefined);
+        const speedStr = n.link_speed_bps ? (n.link_speed_bps / 1000000).toFixed(0) + " Mbps" : null;
+        netCard.appendChild(el("div", { className: "sub-item" }, [
+          el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" } }, [
+            el("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } }, [
+              el("strong", { className: "mono", text: n.name }),
+              el("span", { className: "badge badge-muted", text: n.kind }),
+              speedStr ? el("span", { className: "host-sub", text: speedStr }) : null,
+            ].filter(Boolean)),
+            el("span", { className: "mono", text: hasRate ? `↓ ${formatRate(n.rx_bytes_per_s)} · ↑ ${formatRate(n.tx_bytes_per_s)}` : "Sampling rate…" }),
+          ]),
+          el("div", { className: "host-sub", text: `Total RX ${formatBytes(n.rx_bytes)} · TX ${formatBytes(n.tx_bytes)}` }),
+        ]));
+      }
+    }
+    if (Array.isArray(d.gpus) && d.gpus.length > 0) {
+      for (const g of d.gpus) {
+        netCard.appendChild(el("div", { className: "sub-item" }, [
+          el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" } }, [
+            el("div", { style: { display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" } }, [
+              el("strong", { text: g.display_name }),
+              g.vendor ? el("span", { className: "badge badge-muted", text: g.vendor }) : null,
+            ].filter(Boolean)),
+            el("span", { className: "mono", text: (g.utilization_pct !== null && g.utilization_pct !== undefined) ? ("GPU " + formatPct(g.utilization_pct)) : "—" }),
+          ]),
+          el("div", { className: "host-sub", text: "GPU Memory: " + formatGpuMem(g) }),
+          renderMeter(g.utilization_pct),
+        ]));
+      }
+    }
+    grid.appendChild(netCard);
+
+    // 5. Top Active Processes & OS Maintenance
+    const pmCard = el("div", { className: "card" }, [
+      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Processes & Maintenance" })),
+    ]);
+    const hasCpuRates = Array.isArray(d.top_cpu) && d.top_cpu.some((p) => p.cpu_pct !== null && p.cpu_pct !== undefined);
+    const procList = (hasCpuRates ? d.top_cpu : (Array.isArray(d.top_mem) && d.top_mem.length > 0 ? d.top_mem : d.top_cpu)) || [];
+    const top3 = procList.slice(0, 3);
+    if (top3.length === 0) {
+      pmCard.appendChild(el("div", { className: "muted", text: "No process samples yet." }));
+    } else {
+      for (const p of top3) {
+        pmCard.appendChild(el("div", { className: "sub-item", style: { display: "flex", justifyContent: "space-between", gap: "8px" } }, [
+          el("div", null, [
+            el("strong", { text: p.name }),
+            el("span", { className: "host-sub", text: ` (PID ${p.pid})` }),
+          ]),
+          el("div", { className: "mono", text: `${(p.cpu_pct !== null && p.cpu_pct !== undefined) ? formatPct(p.cpu_pct) : "Sampling…"} · ${formatBytes(p.rss_bytes)}` }),
+        ]));
+      }
+    }
+    const dr = d.drift || {};
+    pmCard.appendChild(el("div", { className: "sub-item" }, renderKv([
+      ["Installed OS / kernel", dr.installed_kernel],
+      ["Reboot required", (dr.reboot_required === null || dr.reboot_required === undefined) ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
+      ["Pending updates", (dr.pending_updates !== null && dr.pending_updates !== undefined) ? String(dr.pending_updates) : "Unknown"],
+      ["Metadata age", formatDuration(dr.package_cache_age_s)],
+    ])));
+    grid.appendChild(pmCard);
+
+    // 6. Probe Group Freshness
     const grpCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Probe Group Freshness" })),
     ]);
-    const grpRows = [];
     for (const [gname, gm] of Object.entries(d.groups || {})) {
       const cls = gm.status === "fresh" ? "badge-ok" : gm.status === "stale" ? "badge-warn" : gm.status === "error" ? "badge-err" : "badge-muted";
-      grpRows.push(el("div", { className: "sub-item", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" } }, [
+      grpCard.appendChild(el("div", { className: "sub-item", style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" } }, [
         el("div", null, [
           el("span", { className: "mono", text: gname }),
           gm.error ? el("div", { className: "host-sub", text: gm.error }) : null,
@@ -1131,7 +1388,6 @@
         ]),
       ]));
     }
-    for (const r of grpRows) grpCard.appendChild(r);
     grid.appendChild(grpCard);
 
     // Batteries if present
@@ -1182,6 +1438,8 @@
     if (!hwEntry.data) return;
 
     const hw = hwEntry.data;
+    const st = state.statusByNode.get(node.node_id);
+    const d = st && st.data ? st.data : null;
     const grid = el("div", { className: "card-grid" });
 
     // 1. CPU & ISA Card
@@ -1202,19 +1460,35 @@
       ...topBadges,
     ].filter(Boolean).join(" · ");
 
+    let cacheStr = "—";
+    if (cpu.cache_bytes) {
+      const cParts = [];
+      if (cpu.cache_bytes.l1d) cParts.push("L1d " + formatBytes(cpu.cache_bytes.l1d));
+      if (cpu.cache_bytes.l1i) cParts.push("L1i " + formatBytes(cpu.cache_bytes.l1i));
+      if (cpu.cache_bytes.l2) cParts.push("L2 " + formatBytes(cpu.cache_bytes.l2));
+      if (cpu.cache_bytes.l3) cParts.push("L3 " + formatBytes(cpu.cache_bytes.l3));
+      if (cParts.length > 0) cacheStr = cParts.join(" · ");
+    }
+    const usableCount = Array.isArray(isa.usable) ? isa.usable.length : 0;
+
     const cpuCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, [
         el("div", { className: "card-title", text: "CPU & Instruction Sets" }),
-        el("span", { className: "badge badge-muted", text: isa.detection || "unknown" }),
+        el("div", { style: { display: "flex", gap: "6px", flexWrap: "wrap" } }, [
+          el("span", { className: "badge badge-muted", text: usableCount + " usable ISA" }),
+          el("span", { className: "badge badge-muted", text: isa.detection || "unknown" }),
+        ]),
       ]),
       el("div", { className: "isa-summary", text: coreSummary || cpu.display_name || "CPU details" }),
       renderKv([
         ["Model", cpu.display_name],
+        cpu.microarchitecture ? ["Microarchitecture", cpu.microarchitecture] : null,
         ["Vendor", cpu.vendor],
         ["Sockets / Cores", `${cpu.sockets ?? "—"} socket · ${cpu.physical_cores ?? "—"}P / ${cpu.logical_cores ?? "—"}T`],
         (cpu.performance_cores !== null || cpu.efficiency_cores !== null)
           ? ["Hybrid layout", `${cpu.performance_cores ?? "?"}P + ${cpu.efficiency_cores ?? "?"}E`] : null,
-        ["L1 / L2 / L3", cpu.cache_bytes ? `${formatBytes(cpu.cache_bytes.l1d)} / ${formatBytes(cpu.cache_bytes.l2)} / ${formatBytes(cpu.cache_bytes.l3)}` : "—"],
+        ["Caches", cacheStr],
+        ["Usable ISA count", `${usableCount} extensions`],
       ].filter(Boolean)),
     ]);
 
@@ -1279,7 +1553,7 @@
         ["Virtualization", sys.virtualization || "Bare metal / none detected"],
         ["Board", [brd.manufacturer, brd.model, brd.revision].filter(Boolean).join(" ") || null],
         ["Firmware", [fw.type, fw.vendor, fw.version].filter(Boolean).join(" · ") || null],
-        ["BIOS/UEFI Date", fw.release_date],
+        ["Firmware Date", fw.release_date],
       ]),
     ]));
 
@@ -1292,9 +1566,12 @@
       ]),
       renderKv([
         ["Total installed", formatBytes(mem.total_bytes)],
+        d && d.memory ? ["Live RAM usage", `${formatBytes(d.memory.used_bytes)} / ${formatBytes(d.memory.total_bytes)} (${formatPct(d.memory.pct)})`] : null,
+        d && d.swap ? ["Swap", `${formatBytes(d.swap.used_bytes)} / ${formatBytes(d.swap.total_bytes)} (${formatPct(d.swap.pct)})`] : null,
         ["Technology", mem.technology],
-        ["Speed", mem.speed_mt_s ? mem.speed_mt_s + " MT/s" : null],
-      ]),
+        mem.speed_mt_s ? ["Speed", mem.speed_mt_s + " MT/s"] : null,
+        mem.module_enumeration === "unsupported" ? ["Module layout", "On-package / unified memory"] : null,
+      ].filter(Boolean)),
     ]);
     if (Array.isArray(mem.modules) && mem.modules.length > 0) {
       for (const m of mem.modules) {
@@ -1308,6 +1585,7 @@
 
     // 4. Graphics Adapters Card
     const gpus = hw.graphics_adapters || [];
+    const liveGpus = d && Array.isArray(d.gpus) ? d.gpus : [];
     const gpuCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Graphics Adapters" })),
     ]);
@@ -1315,17 +1593,26 @@
       gpuCard.appendChild(el("div", { className: "muted", text: "No graphics adapters enumerated." }));
     } else {
       for (const g of gpus) {
+        const liveGpu = liveGpus.find((lg) => (g.id && lg.id === g.id) || lg.display_name === g.display_name);
+        const staticVram = (g.memory_total_bytes !== null && g.memory_total_bytes !== undefined)
+          ? formatBytes(g.memory_total_bytes)
+          : (((g.vendor || "").includes("Apple") || (g.display_name || "").includes("Apple")) ? "Unified system memory" : null);
         gpuCard.appendChild(el("div", { className: "sub-item" }, renderKv([
           ["Model", g.display_name],
           ["Vendor / Driver", [g.vendor, g.driver].filter(Boolean).join(" · ") || null],
-          ["Static VRAM", formatBytes(g.memory_total_bytes)],
-        ])));
+          ["Static VRAM", staticVram],
+          liveGpu && liveGpu.utilization_pct !== null && liveGpu.utilization_pct !== undefined
+            ? ["Live utilization", formatPct(liveGpu.utilization_pct)] : null,
+          liveGpu && (liveGpu.vram_used_bytes !== null && liveGpu.vram_used_bytes !== undefined)
+            ? ["Live GPU memory", formatGpuMem(liveGpu)] : null,
+        ].filter(Boolean))));
       }
     }
     grid.appendChild(gpuCard);
 
     // 5. Network Adapters Card
     const nics = hw.network_adapters || [];
+    const liveNets = d && Array.isArray(d.network) ? d.network : [];
     const nicCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, [
         el("div", { className: "card-title", text: "Network Adapters" }),
@@ -1341,17 +1628,24 @@
       nicCard.appendChild(el("div", { className: "muted", text: "No physical/tailnet network adapters matching filter." }));
     } else {
       for (const na of filteredNics) {
+        const liveNet = liveNets.find((ln) => (na.interface && ln.name === na.interface) || (na.id && ln.id === na.id));
+        const linkParts = [];
+        if (liveNet && typeof liveNet.link_up === "boolean") linkParts.push(liveNet.link_up ? "Up" : "Down");
+        if (na.link_speed_bps) linkParts.push((na.link_speed_bps / 1000000).toFixed(0) + " Mbps");
         nicCard.appendChild(el("div", { className: "sub-item" }, renderKv([
           [na.interface || na.id, `${na.display_name} [${na.kind}]`],
           ["Driver / Bus", [na.driver, na.bus, na.vendor_id && na.device_id ? `${na.vendor_id}:${na.device_id}` : null].filter(Boolean).join(" · ") || null],
-          ["Link speed", na.link_speed_bps ? (na.link_speed_bps / 1000000).toFixed(0) + " Mbps" : null],
-        ])));
+          ["Link", linkParts.length > 0 ? linkParts.join(" · ") : null],
+          liveNet && (typeof liveNet.rx_bytes === "number" || typeof liveNet.tx_bytes === "number")
+            ? ["Traffic", `RX ${formatBytes(liveNet.rx_bytes)} · TX ${formatBytes(liveNet.tx_bytes)}`] : null,
+        ].filter(Boolean))));
       }
     }
     grid.appendChild(nicCard);
 
     // 6. Storage Devices Card
     const stors = hw.storage_devices || [];
+    const liveMounts = d && Array.isArray(d.mounts) ? d.mounts : [];
     const storCard = el("div", { className: "card" }, [
       el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Physical Storage Devices" })),
     ]);
@@ -1359,9 +1653,15 @@
       storCard.appendChild(el("div", { className: "muted", text: "No physical block devices enumerated." }));
     } else {
       for (const sd of stors) {
+        const mountText = Array.isArray(sd.mounts) && sd.mounts.length > 0
+          ? sd.mounts.map((mp) => {
+            const lm = liveMounts.find((m) => m.mount === mp);
+            return lm ? `${mp} (${formatPct(lm.pct)} of ${formatBytes(lm.total_bytes)})` : mp;
+          }).join(", ")
+          : "Unmounted / raw";
         storCard.appendChild(el("div", { className: "sub-item" }, renderKv([
           [sd.display_name || sd.id, `${formatBytes(sd.capacity_bytes)} (${sd.bus || "?"} · ${sd.media_type || "unknown"})`],
-          ["Mounted paths", Array.isArray(sd.mounts) && sd.mounts.length > 0 ? sd.mounts.join(", ") : "Unmounted / raw"],
+          ["Mounted paths", mountText],
         ])));
       }
     }
@@ -1382,29 +1682,67 @@
       el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Mounted Filesystems" })),
     ]);
     for (const m of d.mounts || []) {
+      const freeStr = (typeof m.total_bytes === "number" && typeof m.used_bytes === "number")
+        ? (formatBytes(Math.max(0, m.total_bytes - m.used_bytes)) + " free") : null;
       mountCard.appendChild(el("div", { className: "sub-item" }, [
         el("div", { style: { display: "flex", justifyContent: "space-between" } }, [
           el("strong", { className: "mono", text: m.mount }),
           el("span", { className: "mono", text: `${formatBytes(m.used_bytes)} / ${formatBytes(m.total_bytes)} (${formatPct(m.pct)})` }),
         ]),
-        el("div", { className: "host-sub", text: `${m.fs} · ${m.source}` }),
+        el("div", { className: "host-sub", text: [m.fs, m.source, freeStr].filter(Boolean).join(" · ") }),
         renderMeter(m.pct),
       ]));
     }
     grid.appendChild(mountCard);
 
     // Live Network Counters & Rates
+    const allNets = Array.isArray(d.network) ? d.network : [];
     const netCard = el("div", { className: "card" }, [
-      el("div", { className: "card-head" }, el("div", { className: "card-title", text: "Network Interfaces (Traffic)" })),
+      el("div", { className: "card-head" }, [
+        el("div", { className: "card-title", text: "Network Interfaces (Traffic)" }),
+        (() => {
+          const b = el("button", {
+            type: "button",
+            className: "btn btn-sm",
+            text: state.showInactiveNet ? "Hide inactive (0 B)" : ("Show all (" + allNets.length + ")"),
+          });
+          b.addEventListener("click", () => { state.showInactiveNet = !state.showInactiveNet; renderDetail(); });
+          return b;
+        })(),
+      ]),
     ]);
-    for (const n of d.network || []) {
-      netCard.appendChild(el("div", { className: "sub-item" }, [
-        el("div", { style: { display: "flex", justifyContent: "space-between" } }, [
-          el("strong", { className: "mono", text: `${n.name} (${n.kind})` }),
-          el("span", { className: "mono", text: `↓ ${formatRate(n.rx_bytes_per_s)}  ↑ ${formatRate(n.tx_bytes_per_s)}` }),
-        ]),
-        el("div", { className: "host-sub", text: `Total RX ${formatBytes(n.rx_bytes)} · TX ${formatBytes(n.tx_bytes)}` }),
-      ]));
+    const netRank = (k) => (k === "wireless" || k === "physical" || k === "tailnet") ? 0 : 1;
+    const visNets = (state.showInactiveNet ? allNets : allNets.filter((n) =>
+      (n.rx_bytes || 0) > 0 || (n.tx_bytes || 0) > 0 || n.kind === "physical" || n.kind === "wireless" || n.kind === "tailnet"
+    )).slice().sort((a, b) => {
+      const aAct = ((a.rx_bytes || 0) > 0 || (a.tx_bytes || 0) > 0) ? 0 : 1;
+      const bAct = ((b.rx_bytes || 0) > 0 || (b.tx_bytes || 0) > 0) ? 0 : 1;
+      if (aAct !== bAct) return aAct - bAct;
+      const ra = netRank(a.kind), rb = netRank(b.kind);
+      if (ra !== rb) return ra - rb;
+      return ((b.rx_bytes || 0) + (b.tx_bytes || 0)) - ((a.rx_bytes || 0) + (a.tx_bytes || 0));
+    });
+    if (visNets.length === 0) {
+      netCard.appendChild(el("div", { className: "muted", text: "No active network interfaces." }));
+    } else {
+      for (const n of visNets) {
+        const hasRate = (n.rx_bytes_per_s !== null && n.rx_bytes_per_s !== undefined)
+          || (n.tx_bytes_per_s !== null && n.tx_bytes_per_s !== undefined);
+        const linkParts = [
+          n.link_up === true ? "Up" : n.link_up === false ? "Down" : null,
+          n.link_speed_bps ? (n.link_speed_bps / 1000000).toFixed(0) + " Mbps" : null,
+        ].filter(Boolean);
+        netCard.appendChild(el("div", { className: "sub-item" }, [
+          el("div", { style: { display: "flex", justifyContent: "space-between", gap: "8px" } }, [
+            el("strong", { className: "mono", text: `${n.name} (${n.kind})` }),
+            el("span", { className: "mono", text: hasRate ? `↓ ${formatRate(n.rx_bytes_per_s)}  ↑ ${formatRate(n.tx_bytes_per_s)}` : "Sampling rate…" }),
+          ]),
+          el("div", {
+            className: "host-sub",
+            text: [`Total RX ${formatBytes(n.rx_bytes)} · TX ${formatBytes(n.tx_bytes)}`, ...linkParts].join(" · "),
+          }),
+        ]));
+      }
     }
     grid.appendChild(netCard);
 
@@ -1414,12 +1752,15 @@
         el("div", { className: "card-head" }, el("div", { className: "card-title", text: "GPU Telemetry" })),
       ]);
       for (const g of d.gpus) {
-        gpuCard.appendChild(el("div", { className: "sub-item" }, renderKv([
-          ["GPU", g.display_name],
-          ["Utilization", formatPct(g.utilization_pct)],
-          ["VRAM", `${formatBytes(g.vram_used_bytes)} / ${formatBytes(g.vram_total_bytes)}`],
-          ["Temp / Power", `${g.temp_c !== null ? g.temp_c.toFixed(0) + " °C" : "—"} · ${g.power_watts !== null ? g.power_watts.toFixed(1) + " W" : "—"}`],
-        ])));
+        gpuCard.appendChild(el("div", { className: "sub-item" }, [
+          renderKv([
+            ["GPU", g.display_name],
+            ["Utilization", formatPct(g.utilization_pct)],
+            ["VRAM", formatGpuMem(g)],
+            ["Temp / Power", `${(g.temp_c !== null && g.temp_c !== undefined) ? g.temp_c.toFixed(0) + " °C" : "—"} · ${(g.power_watts !== null && g.power_watts !== undefined) ? g.power_watts.toFixed(1) + " W" : "—"}`],
+          ]),
+          renderMeter(g.utilization_pct),
+        ]));
       }
       grid.appendChild(gpuCard);
     }
@@ -1451,8 +1792,15 @@
             el("strong", { text: p.name }),
             el("span", { className: "host-sub", text: ` (PID ${p.pid})` }),
           ]),
-          el("div", { className: "mono", text: `${formatPct(p.cpu_pct)} · ${formatBytes(p.rss_bytes)}` }),
+          el("div", { className: "mono", text: `${(p.cpu_pct !== null && p.cpu_pct !== undefined) ? formatPct(p.cpu_pct) : "Sampling…"} · ${formatBytes(p.rss_bytes)}` }),
         ]));
+      }
+      if (d.os === "darwin" && list.length <= 2) {
+        c.appendChild(el("div", {
+          className: "host-sub",
+          style: { marginTop: "8px" },
+          text: "Under least-privilege daemon operation (_hikari), macOS restricts per-process task metrics to processes owned by the service account.",
+        }));
       }
       return c;
     }
@@ -1547,6 +1895,7 @@
       });
 
       statusText.textContent = "Last updated " + new Date().toLocaleTimeString();
+      scheduleColdRateFollowup();
     } catch (err) {
       if (!err || err.name !== "AbortError") {
         statusText.textContent = "Refresh failed";
@@ -1554,6 +1903,33 @@
     } finally {
       state.isPolling = false;
     }
+  }
+
+  function scheduleColdRateFollowup() {
+    if (state.coldRateTimer) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    let needsCpuRate = false;
+    let needsProcRate = false;
+    for (const st of state.statusByNode.values()) {
+      if (!st || st.state !== "online" || !st.data) continue;
+      const d = st.data;
+      if (d.cpu && d.cpu.pct === null) needsCpuRate = true;
+      if (Array.isArray(d.top_cpu) && d.top_cpu.length > 0
+        && d.top_cpu.every((p) => p.cpu_pct === null || p.cpu_pct === undefined)) {
+        needsProcRate = true;
+      }
+    }
+    if (!needsCpuRate && !needsProcRate) {
+      state.coldRateFollowups = 0;
+      return;
+    }
+    if (state.coldRateFollowups >= 2) return;
+    state.coldRateFollowups++;
+    const delayMs = needsCpuRate ? 10500 : 20500;
+    state.coldRateTimer = setTimeout(() => {
+      state.coldRateTimer = null;
+      if (document.visibilityState === "visible") refreshAll(false);
+    }, delayMs);
   }
 
   // /api/v1/nodes returns immediately and validates peers in the background; while

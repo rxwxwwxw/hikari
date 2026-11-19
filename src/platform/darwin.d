@@ -410,6 +410,27 @@ class DarwinPlatformBackend : PlatformBackend {
             }
             scope (exit) freeifaddrs(head);
 
+            bool[string] tailnetIfs;
+            for (ifaddrs* cur = head; cur !is null; cur = cur.ifa_next) {
+                if (cur.ifa_addr is null || cur.ifa_name is null) continue;
+                auto fam = cur.ifa_addr.sa_family;
+                if (fam != 2 && fam != 30) continue;
+                auto ifName = sanitizeOsString(fromStringz(cur.ifa_name).idup, 64);
+                if (ifName.length == 0) continue;
+                const(ubyte)* raw = cast(const(ubyte)*) cur.ifa_addr;
+                if (fam == 2 && raw[0] >= 8) {
+                    if (raw[4] == 100 && (raw[5] & 0xC0) == 64) {
+                        tailnetIfs[ifName] = true;
+                    }
+                } else if (fam == 30 && raw[0] >= 24) {
+                    if (raw[8] == 0xfd && raw[9] == 0x7a && raw[10] == 0x11
+                        && raw[11] == 0x5c && raw[12] == 0xa1 && raw[13] == 0xe0) {
+                        tailnetIfs[ifName] = true;
+                    }
+                }
+            }
+            auto scKinds = nativeNetworkInterfaceKinds();
+
             int mediaSocket = socket(AF_INET, SOCK_DGRAM, 0);
             scope (exit) if (mediaSocket >= 0) close(mediaSocket);
             r.state = CapabilityState.ok;
@@ -425,8 +446,9 @@ class DarwinPlatformBackend : PlatformBackend {
                 RawNetworkInterface ni;
                 ni.id = ifIdx > 0 ? ("ifindex:" ~ to!string(ifIdx)) : ("name:" ~ ifName);
                 ni.name = ifName;
-                // utun interfaces can belong to any VPN; identity requires tailnet metadata.
-                if (ifName.startsWith("utun")) ni.kind = "virtual";
+                if ((ifName in tailnetIfs) !is null) ni.kind = "tailnet";
+                else if (ifName.startsWith("anpi")) ni.kind = "virtual";
+                else if (auto pk = ifName in scKinds) ni.kind = *pk;
                 else if (ifName.startsWith("en")) ni.kind = "physical";
                 else ni.kind = "virtual";
 
@@ -590,8 +612,11 @@ class DarwinPlatformBackend : PlatformBackend {
     }
 
     override RawGpuResult sampleGpus() {
-        // Public macOS APIs do not expose reliable cross-version live GPU utilization without private frameworks
-        return RawGpuResult(CapabilityState.unsupported, "", null);
+        version (OSX) {
+            return nativeSampleGpus();
+        } else {
+            return RawGpuResult(CapabilityState.unsupported, "darwin_only_backend", null);
+        }
     }
 
     override RawBatteryResult sampleBatteries() {
@@ -609,11 +634,22 @@ class DarwinPlatformBackend : PlatformBackend {
         RawMaintenanceResult r;
         version (OSX) {
             r.state = CapabilityState.ok;
-            r.drift.running_kernel = sysctlString("kern.osrelease");
-            if (r.drift.running_kernel.length == 0) {
+            auto osRelease = sysctlString("kern.osrelease");
+            if (osRelease.length == 0) {
                 r.state = CapabilityState.unavailable;
                 r.error = "local_kernel_metadata_unavailable";
+                return r;
             }
+            auto osProdVer = sysctlString("kern.osproductversion");
+            auto osBuild = sysctlString("kern.osversion");
+            if (osProdVer.length > 0 && osBuild.length > 0) {
+                r.drift.running_kernel = format!"macOS %s (%s) · Darwin %s"(osProdVer, osBuild, osRelease);
+            } else if (osProdVer.length > 0) {
+                r.drift.running_kernel = format!"macOS %s · Darwin %s"(osProdVer, osRelease);
+            } else {
+                r.drift.running_kernel = osRelease;
+            }
+            nativeSampleMaintenance(r.drift, osBuild);
             // Never invoke `softwareupdate -l` during passive telemetry
         } else {
             r.state = CapabilityState.unsupported;
@@ -636,6 +672,16 @@ class DarwinPlatformBackend : PlatformBackend {
                 || lowMod.startsWith("macpro") || lowMod.startsWith("macstudio"))
                 hw.system.form_factor = "desktop";
 
+            uint vmm = 0;
+            if (sysctlU32("kern.hv_vmm_present".ptr, vmm) && vmm != 0) {
+                hw.system.virtualization = "apple-hypervisor-guest";
+            } else {
+                uint hvs = 0;
+                if (sysctlU32("kern.hv_support".ptr, hvs) && hvs != 0) {
+                    hw.system.virtualization = "Bare metal (Apple Hypervisor)";
+                }
+            }
+
             // On Macs without PC-style motherboard info, expose Mac model identifier cleanly
             hw.board.manufacturer = "Apple Inc.";
             hw.board.model = modelId;
@@ -647,8 +693,23 @@ class DarwinPlatformBackend : PlatformBackend {
 
             hw.cpu.display_name = sysctlString("machdep.cpu.brand_string");
 
-            version (AArch64) hw.cpu.vendor = "Apple";
-            else {
+            version (AArch64) {
+                hw.cpu.vendor = "Apple";
+                uint cpufam = 0;
+                if (sysctlU32("hw.cpufamily".ptr, cpufam)) {
+                    switch (cpufam) {
+                        case 0x1b588bb3: hw.cpu.microarchitecture = "Firestorm + Icestorm (ARMv8.5-A)"; break;
+                        case 0xda33d83d: hw.cpu.microarchitecture = "Avalanche + Blizzard (ARMv8.6-A)"; break;
+                        case 0xfa33415e:
+                        case 0x8765edea:
+                        case 0x5f4dea93: hw.cpu.microarchitecture = "Everest + Sawtooth (ARMv8.6-A)"; break;
+                        case 0x6f5129ac:
+                        case 0x17d5b93a:
+                        case 0x72015832: hw.cpu.microarchitecture = "Apple M4 (ARMv9.2-A)"; break;
+                        default: break;
+                    }
+                }
+            } else {
                 auto bv = hw.cpu.display_name.toLower();
                 hw.cpu.vendor = bv.canFind("intel") ? "Intel" : "Apple";
             }
@@ -661,9 +722,20 @@ class DarwinPlatformBackend : PlatformBackend {
             if (sysctlU32("hw.perflevel1.physicalcpu".ptr, val32)) hw.cpu.efficiency_cores = val32;
 
             ulong csz = 0;
-            if (sysctlU64("hw.l1dcachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1d = csz;
-            if (sysctlU64("hw.l1icachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1i = csz;
-            if (sysctlU64("hw.l2cachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l2 = csz;
+            ulong p0L1d = 0, p0L1i = 0, p0L2 = 0, p1L2 = 0;
+            if (sysctlU64("hw.perflevel0.l1dcachesize".ptr, p0L1d) && p0L1d > 0) hw.cpu.cache_bytes.l1d = p0L1d;
+            else if (sysctlU64("hw.l1dcachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1d = csz;
+
+            if (sysctlU64("hw.perflevel0.l1icachesize".ptr, p0L1i) && p0L1i > 0) hw.cpu.cache_bytes.l1i = p0L1i;
+            else if (sysctlU64("hw.l1icachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l1i = csz;
+
+            if (sysctlU64("hw.perflevel0.l2cachesize".ptr, p0L2) && p0L2 > 0) {
+                sysctlU64("hw.perflevel1.l2cachesize".ptr, p1L2);
+                hw.cpu.cache_bytes.l2 = p0L2 + p1L2;
+            } else if (sysctlU64("hw.l2cachesize".ptr, csz) && csz > 0) {
+                hw.cpu.cache_bytes.l2 = csz;
+            }
+
             if (sysctlU64("hw.l3cachesize".ptr, csz) && csz > 0) hw.cpu.cache_bytes.l3 = csz;
 
             version (X86_64) {
@@ -681,10 +753,20 @@ class DarwinPlatformBackend : PlatformBackend {
                 foreach (ni; netRes.interfaces) {
                     NetworkAdapterHardware na;
                     na.id = ni.id;
-                    na.display_name = ni.name;
                     na.interface_name = ni.name;
-                    na.kind = ni.kind == "physical" ? "unknown" : ni.kind;
                     na.link_speed_bps = ni.link_speed_bps;
+                    if (ni.kind == "tailnet") {
+                        na.kind = "tailnet";
+                        na.display_name = "Tailscale Tunnel (" ~ ni.name ~ ")";
+                        na.driver = "utun";
+                        na.bus = "virtual";
+                    } else if (ni.kind == "wireless") {
+                        na.kind = "wifi";
+                        na.display_name = ni.name;
+                    } else {
+                        na.kind = ni.kind == "physical" ? "unknown" : ni.kind;
+                        na.display_name = ni.name;
+                    }
                     hw.network_adapters ~= na;
                 }
             }
@@ -695,7 +777,8 @@ class DarwinPlatformBackend : PlatformBackend {
             hw.capabilities["storage_devices"] = CapabilityState.unavailable;
             hw.capabilities["isa"] = hw.cpu.isa.usable.length > 0 ? CapabilityState.ok : CapabilityState.unavailable;
 
-            enrichNativeHardware(hw);
+            auto fsRes = sampleFilesystems();
+            enrichNativeHardware(hw, fsRes.state == CapabilityState.ok ? fsRes.mounts : null);
             hw.collection.status = GroupStatus.fresh;
             hw.collection.partial = true;
             r.state = CapabilityState.ok;
@@ -714,6 +797,7 @@ class DarwinPlatformBackend : PlatformBackend {
                 ["hw.optional.floatingpoint", "fp"],
                 ["hw.optional.neon", "asimd"],
                 ["hw.optional.AdvSIMD", "asimd"],
+                ["hw.optional.arm.AdvSIMD", "asimd"],
                 ["hw.optional.arm.FEAT_AES", "aes"],
                 ["hw.optional.arm.FEAT_PMULL", "pmull"],
                 ["hw.optional.arm.FEAT_SHA1", "sha1"],
@@ -721,8 +805,11 @@ class DarwinPlatformBackend : PlatformBackend {
                 ["hw.optional.arm.FEAT_SHA3", "sha3"],
                 ["hw.optional.arm.FEAT_SHA512", "sha512"],
                 ["hw.optional.armv8_crc32", "crc32"],
+                ["hw.optional.arm.FEAT_CRC32", "crc32"],
                 ["hw.optional.arm.FEAT_LSE", "atomics"],
+                ["hw.optional.armv8_1_atomics", "atomics"],
                 ["hw.optional.arm.FEAT_FP16", "fphp"],
+                ["hw.optional.neon_fp16", "fphp"],
                 ["hw.optional.arm.FEAT_DotProd", "asimddp"],
                 ["hw.optional.arm.FEAT_BF16", "bf16"],
                 ["hw.optional.arm.FEAT_I8MM", "i8mm"],
@@ -730,6 +817,26 @@ class DarwinPlatformBackend : PlatformBackend {
                 ["hw.optional.arm.FEAT_JSCVT", "jscvt"],
                 ["hw.optional.arm.FEAT_BTI", "bti"],
                 ["hw.optional.arm.FEAT_PAuth", "paca"],
+                ["hw.optional.arm.FEAT_RDM", "asimdrdm"],
+                ["hw.optional.arm.FEAT_FHM", "asimdfhm"],
+                ["hw.optional.armv8_2_fhm", "asimdfhm"],
+                ["hw.optional.arm.FEAT_FRINTTS", "frintts"],
+                ["hw.optional.arm.FEAT_SME", "sme"],
+                ["hw.optional.arm.FEAT_SME2", "sme2"],
+                ["hw.optional.arm.FEAT_DIT", "dit"],
+                ["hw.optional.arm.FEAT_FlagM", "flagm"],
+                ["hw.optional.arm.FEAT_FlagM2", "flagm2"],
+                ["hw.optional.arm.FEAT_LSE2", "lse2"],
+                ["hw.optional.arm.FEAT_LRCPC", "lrcpc"],
+                ["hw.optional.arm.FEAT_LRCPC2", "lrcpc2"],
+                ["hw.optional.arm.FEAT_DPB", "dpb"],
+                ["hw.optional.arm.FEAT_DPB2", "dpb2"],
+                ["hw.optional.arm.FEAT_SB", "sb"],
+                ["hw.optional.arm.FEAT_SSBS", "ssbs"],
+                ["hw.optional.arm.FEAT_CSV2", "csv2"],
+                ["hw.optional.arm.FEAT_CSV3", "csv3"],
+                ["hw.optional.arm.FEAT_MTE", "mte"],
+                ["kern.hv_support", "vhe"],
             ];
             string[] feats;
             foreach (pair; sysctlMap) {

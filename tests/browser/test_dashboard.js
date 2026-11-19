@@ -376,6 +376,16 @@ async function runTests() {
   // Verify NO hardware requests occurred during fleet overview
   assert(!fetchCalls.some((u) => u.includes("/hardware")), "Overview load must NEVER trigger /api/v1/hardware fetches");
 
+  // Verify enriched Overview tab renders System, Storage, and Processes & Maintenance from /status without /hardware
+  const detailBody = document.getElementById("detail-body");
+  assert(detailBody.textContent.includes("System & Host Identity"), "Overview must render System & Host Identity card");
+  assert(detailBody.textContent.includes("workstation-linux"), "Overview must render hostname");
+  assert(detailBody.textContent.includes("Storage & Filesystems"), "Overview must render Storage & Filesystems card");
+  assert(detailBody.textContent.includes("btrfs"), "Overview must render filesystem type");
+  assert(detailBody.textContent.includes("Processes & Maintenance"), "Overview must render Processes & Maintenance card");
+  assert(detailBody.textContent.includes("7.3.5"), "Overview must render installed kernel/OS drift");
+  assert.strictEqual(detailBody.findAllByTag("svg").length, 0, "XSS <svg> in process name must not be parsed as HTML");
+
   // Verify XSS payloads were escaped (no <img>, <script>, or <svg> elements created)
   const tbody = document.getElementById("fleet-tbody");
   assert.strictEqual(tbody.findAllByTag("img").length, 0, "XSS <img> must not be parsed as HTML");

@@ -323,8 +323,8 @@ print(c.get("tailnet_port",9100), c.get("loopback_port",19100), c.get("base_path
 ' "$ETC_HIKARI/config.json")
 fi
 
-if [ -f "$VERSIONS_DIR/.activation-previous" ]; then
-  echo "Interrupted activation pending; run hikari update recover before installing or repairing." >&2
+if [ -f "$VERSIONS_DIR/.activation-previous" ] && [ "$REPAIR" -eq 0 ]; then
+  echo "Interrupted activation pending; run hikari update recover or install.sh --repair." >&2
   exit 1
 fi
 
@@ -950,6 +950,54 @@ if [ "$TARGET_OS" = "macos" ] && [ -z "$ROOT_PREFIX" ]; then
 fi
 mkdir -p "$VERSIONS_DIR" "$ETC_HIKARI" "$VAR_HIKARI/caddy" "$UNIT_DIR" "$LOG_DIR"
 
+if [ "$REPAIR" -eq 1 ] && [ -f "$VERSIONS_DIR/.activation-previous" ]; then
+  UNCONFIRMED_CUR=$(python3 - "$VERSIONS_DIR" "$APP_VERSION" <<'PYRECOVER'
+import os, pathlib, re, shutil, sys, uuid
+
+versions = pathlib.Path(sys.argv[1]).resolve(strict=True)
+app_version = sys.argv[2]
+pending = versions / ".activation-previous"
+prev = pending.read_text(encoding="utf-8").strip()
+if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?", prev):
+    sys.exit("Invalid interrupted activation version in .activation-previous")
+prev_dir = versions / prev
+if not (prev_dir / "hikari").is_file() or not os.access(prev_dir / "hikari", os.X_OK):
+    sys.exit(f"Prior release executable missing for interrupted activation: {prev_dir / 'hikari'}")
+
+current = versions / "current"
+unconfirmed_target = ""
+if current.is_symlink():
+    try:
+        resolved = current.resolve(strict=True)
+        if resolved.parent == versions:
+            unconfirmed_target = resolved.name
+    except OSError:
+        pass
+
+tmp = versions / (".pointer-" + uuid.uuid4().hex)
+try:
+    tmp.symlink_to(prev_dir)
+    os.replace(tmp, current)
+finally:
+    tmp.unlink(missing_ok=True)
+pending.unlink(missing_ok=True)
+
+if unconfirmed_target == app_version and app_version != prev:
+    app_dir = versions / app_version
+    if app_dir.is_dir() and not app_dir.is_symlink():
+        shutil.rmtree(app_dir)
+
+fd = os.open(versions, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+print(prev)
+PYRECOVER
+  )
+  log "Recovered interrupted unconfirmed activation back to $UNCONFIRMED_CUR before repairing $APP_VERSION"
+fi
+
 # 7. Install versioned release directory
 REL_DIR="$VERSIONS_DIR/$APP_VERSION"
 STAGING_DIR="$VERSIONS_DIR/.install-tmp-$APP_VERSION"
@@ -1164,6 +1212,33 @@ fi
 
 # 10. Generate system-domain service definitions (systemd on Linux, LaunchDaemons on macOS)
 if [ "$TARGET_OS" = "macos" ]; then
+  wait_launchd_unloaded() {
+    local label="$1"
+    local i
+    for ((i = 0; i < 50; i++)); do
+      if ! launchctl print "system/$label" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    return 0
+  }
+
+  reload_launchd_job() {
+    local label="$1"
+    local plist="$2"
+    launchctl bootout "system/$label" 2>/dev/null || true
+    wait_launchd_unloaded "$label"
+    local i
+    for ((i = 0; i < 15; i++)); do
+      if launchctl bootstrap system "$plist" 2>/dev/null; then
+        return 0
+      fi
+      sleep 0.2
+    done
+    launchctl bootstrap system "$plist"
+  }
+
   mkdir -p "$PRIVATE_BIN_DIR"
   cp "$REL_DIR/install/macos-recover.sh" "$PRIVATE_BIN_DIR/macos-recover.sh.next"
   chmod 0755 "$PRIVATE_BIN_DIR/macos-recover.sh.next"
@@ -1237,6 +1312,7 @@ EOF
     # Switched to the existing Caddy: free the tailnet port before any reload.
     if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
       launchctl bootout system/io.hikari.caddy 2>/dev/null || true
+      wait_launchd_unloaded "io.hikari.caddy"
     fi
     rm -f "$UNIT_DIR/io.hikari.caddy.plist"
     log "Removed the isolated hikari-caddy LaunchDaemon (switched to the existing Caddy)"
@@ -1351,16 +1427,17 @@ EOF
   fi
   activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && command -v launchctl >/dev/null 2>&1; then
-    launchctl bootout system/io.hikari.agent 2>/dev/null || true
-    launchctl bootstrap system "$UNIT_DIR/io.hikari.agent.plist"
-    if [ -f "$CERT_JOB" ]; then launchctl bootout system/io.hikari.certificates 2>/dev/null || true; fi
-    if [ -n "$MACOS_CERT_STORE" ]; then launchctl bootstrap system "$CERT_JOB"; fi
-    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
-      launchctl bootout system/io.hikari.caddy 2>/dev/null || true
-      launchctl bootstrap system "$UNIT_DIR/io.hikari.caddy.plist"
+    reload_launchd_job "io.hikari.agent" "$UNIT_DIR/io.hikari.agent.plist"
+    if [ -n "$MACOS_CERT_STORE" ]; then
+      reload_launchd_job "io.hikari.certificates" "$CERT_JOB"
+    elif [ -f "$CERT_JOB" ]; then
+      launchctl bootout system/io.hikari.certificates 2>/dev/null || true
+      wait_launchd_unloaded "io.hikari.certificates"
     fi
-    launchctl bootout system/io.hikari.recover 2>/dev/null || true
-    launchctl bootstrap system "$UNIT_DIR/io.hikari.recover.plist"
+    if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ]; then
+      reload_launchd_job "io.hikari.caddy" "$UNIT_DIR/io.hikari.caddy.plist"
+    fi
+    reload_launchd_job "io.hikari.recover" "$UNIT_DIR/io.hikari.recover.plist"
     log "Loaded system-domain LaunchDaemons via launchctl"
   else
     log "Skipped launchctl activation (service-mode=$SYSTEMD_MODE root='$ROOT_PREFIX')"

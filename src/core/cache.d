@@ -120,7 +120,9 @@ class TelemetryCacheStore {
         HardwareSummary hs;
         hs.cpu = hw.cpu.display_name;
         hs.ram_bytes = hw.memory.total_bytes;
-        if (hw.system.model.length > 0 && hw.system.manufacturer.length > 0) {
+        if (hw.system.product_family.length > 0 && hw.system.model.length > 0 && hw.system.product_family != hw.system.model) {
+            hs.system_model = hw.system.product_family ~ " (" ~ hw.system.model ~ ")";
+        } else if (hw.system.model.length > 0 && hw.system.manufacturer.length > 0) {
             hs.system_model = hw.system.manufacturer ~ " " ~ hw.system.model;
         } else if (hw.system.model.length > 0) {
             hs.system_model = hw.system.model;
