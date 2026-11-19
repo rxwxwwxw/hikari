@@ -139,6 +139,15 @@ unittest {
     auto snip = renderCaddySnippet("caddy/snippet.caddy.tmpl", 19100, "/", "/opt/hikari/web");
     assert(snip.canFind("handle_path /hikari/*"));
 
+    // Responses are compressed in every rendering (template, built-in fallback, snippet, integrated site).
+    assert(cf.canFind("encode zstd gzip") && macCf.canFind("encode zstd gzip") && snip.canFind("encode zstd gzip"));
+    assert(renderCaddyfile("", "box.tail.ts.net", 9100, "100.64.0.10", 19100, "/", "/state", "/web").canFind("encode zstd gzip"));
+    assert(renderCaddySnippet("", 19100, "/", "/web").canFind("encode zstd gzip"));
+    {
+        import http.caddy : renderIntegratedSite;
+        assert(renderIntegratedSite("box.tail.ts.net", 9100, "100.64.0.10", 19100, "/", "/web").canFind("\tencode zstd gzip\n"));
+    }
+
     auto stateDir = tempDir() ~ "/hikari-test-http";
     if (exists(stateDir)) rmdirRecurse(stateDir);
     mkdirRecurse(stateDir);

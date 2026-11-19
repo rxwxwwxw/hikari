@@ -414,9 +414,9 @@
       <label class="muted" for="interval-select">Refresh:</label>
       <select id="interval-select" class="select" aria-label="Auto-refresh interval">
         <option value="5000">5s</option>
-        <option value="15000" selected>15s</option>
+        <option value="15000">15s</option>
         <option value="30000">30s</option>
-        <option value="60000">60s</option>
+        <option value="60000" selected>60s</option>
         <option value="0">Off</option>
       </select>
       <button type="button" id="refresh-now-btn" class="btn btn-primary">Refresh now</button>
@@ -570,7 +570,7 @@
     activeTab: "overview",
     showVirtualNics: false,
     isaFilter: "",
-    pollIntervalMs: 15000,
+    pollIntervalMs: 60000,
     pollTimer: null,
     discoveryFollowupTimer: null,
     discoveryFollowups: 0,
