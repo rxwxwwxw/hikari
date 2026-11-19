@@ -252,3 +252,37 @@ unittest {
     auto missing = executeBounded(["hikari-definitely-not-a-command"], 1000, 1024);
     assert(!missing.started);
 }
+
+unittest {
+    // Concurrent callers (parallel peer probes) must not leak pipe handles into
+    // each other's children. On Windows a slow child spawned while a quick
+    // call's pipe was open used to inherit its write end, so the quick call's
+    // reader missed EOF, returned without output, and its FILE was then closed
+    // under the still-running reader: a 0xc0000409 fail-fast of the agent.
+    import core.atomic : atomicOp;
+    import std.conv : to;
+    version (Windows) {
+        auto slow = ["ping", "-n", "3", "127.0.0.1"];
+        string[] quick(int n) { return ["cmd", "/c", "echo hikari-" ~ to!string(n)]; }
+    } else {
+        auto slow = ["sleep", "2"];
+        string[] quick(int n) { return ["sh", "-c", "echo hikari-" ~ to!string(n)]; }
+    }
+    shared int failures = 0;
+    Thread[] threads;
+    foreach (s; 0 .. 2) {
+        threads ~= new Thread({ executeBounded(slow, 10_000, 1024); });
+    }
+    foreach (w; 0 .. 3) {
+        threads ~= new Thread({
+            foreach (i; 0 .. 8) {
+                auto want = "hikari-" ~ to!string(i);
+                auto r = executeBounded(quick(i), 5000, 1024);
+                if (!r.started || r.timedOut || r.truncated || !r.output.canFind(want)) atomicOp!"+="(failures, 1);
+            }
+        });
+    }
+    foreach (t; threads) t.start();
+    foreach (t; threads) t.join();
+    assert(failures == 0, "concurrent executeBounded calls lost output (pipe handles leaked between children)");
+}
