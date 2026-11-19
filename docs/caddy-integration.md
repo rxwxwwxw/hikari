@@ -69,7 +69,7 @@ Before writing, hikari runs `caddy adapt` (pure: no network, no servers, no stor
 - one server listening on `<tailscale-ip>:<port>`;
 - TLS policies that name only your Tailscale FQDN.
 
-Three differences Caddy itself introduces when any site is added are treated as equivalent. Each was found by running the corpus against real Caddy 2.9.1 and is covered by a unit test:
+Three differences Caddy itself introduces when any site is added are treated as equivalent. Each was found by running the corpus against real Caddy 2.9.1, still holds on the pinned 2.11.9, and is covered by a unit test:
 - **Handle group names:** `handle` groups are numbered across the whole config, so adding a site can rename `group0` to `group2` in your servers. They are compared modulo a consistent per-server renaming.
 - **Config path in `file_server`:** Caddy puts the config file's own path in `file_server`'s hide list, and the candidate file has a different name. That path is mapped back to the real one before comparing.
 - **Default TLS policies:** once hikari's Tailscale policy exists, Caddy also emits default-behaviour policies for your sites (e.g. `{"subjects":["example.com"]}`, or `{}` for host-less sites). These are accepted only if they are identical to the original default and name only hosts your config already serves.
