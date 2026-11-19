@@ -11,11 +11,12 @@ Download `hikari-install.ps1` from the [release page](https://github.com/rxwxwwx
 .\hikari-install.ps1 -Reload
 ```
 
-Python 3.9+ and Ed25519-capable OpenSSL are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
+Python 3.9+ and OpenSSL 3 (Git for Windows' copy is found automatically; see [Prerequisites](#prerequisites)) are required. See [bootstrap prerequisites, trust, and options](install-bootstrap.md). No compiler or checkout is needed. Existing compatible Caddy services are reused by default through a verified import and hikari-owned site; reload is explicitly authorized above. Unsafe integration falls back to isolated Caddy. The final report distinguishes **Ready** from **Installed; setup incomplete**.
 
 ## Prerequisites
 
 - **Tailscale for Windows**, enrolled in your tailnet, with MagicDNS and HTTPS certificates enabled. Turning on Tailscale's **Run unattended** option is recommended so `tailscaled` is not tied to one interactive user (see [Service accounts](#service-accounts-and-tailscale-access)).
+- **OpenSSL 3** for Ed25519 release signatures (install, bootstrap and self-update). Windows has none built in. **Git for Windows** already includes one, and a Win64 OpenSSL installed in its default folder also works. hikari looks in `C:\Program Files\Git\mingw64\bin\`, `C:\Program Files\OpenSSL-Win64\bin\` and `C:\Program Files\OpenSSL\bin\` before `PATH`. These folders are writable only by administrators, which matters because the update task runs as SYSTEM and sees only the machine `PATH`. Do not add Git's `mingw64\bin` to the system `PATH` just for this. `hikari doctor` reports which OpenSSL it selected (`signature_verifier`). Without one, updates fail closed.
 - **Caddy** is optional. If no `caddy.exe` is on `PATH`, a pinned Caddy v2.9.1 is downloaded into `C:\ProgramData\hikari\bin\` and checked against its SHA-512. A compatible existing Caddy service is reused through the verified integration; it is never restarted and reload requires explicit authorization.
 - To build from source: **LDC2 (`ldc2`) and DUB (`dub`)** with the Microsoft Visual C++ Build Tools.
 

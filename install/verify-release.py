@@ -24,9 +24,18 @@ DARWIN_OPENSSL_CANDIDATES = (
     "/usr/local/opt/openssl@3/bin/openssl",     # Homebrew, Intel
     "/opt/local/libexec/openssl3/bin/openssl",  # MacPorts openssl3
 )
+# Windows has no system OpenSSL, and an elevated shell or the SYSTEM maintenance
+# task may not see a user's PATH. Default per-machine folders are admin-owned.
+WINDOWS_OPENSSL_CANDIDATES = (
+    r"C:\Program Files\Git\mingw64\bin\openssl.exe",  # Git for Windows
+    r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",  # Shining Light Win64 OpenSSL
+    r"C:\Program Files\OpenSSL\bin\openssl.exe",  # FireDaemon and others
+)
 OPENSSL_INSTALL_HINT = ("Install OpenSSL 3 (macOS: `brew install openssl@3`; it is found at "
-                        "/opt/homebrew/opt/openssl@3 or /usr/local/opt/openssl@3 without changing PATH) "
-                        "and retry. Release signatures are never skipped.")
+                        "/opt/homebrew/opt/openssl@3 or /usr/local/opt/openssl@3 without changing PATH. "
+                        "Windows: Git for Windows or a Win64 OpenSSL in its default Program Files folder "
+                        "is found without changing PATH) and retry. Release signatures are never skipped.")
+_PROBED_CANDIDATES = {"Darwin": DARWIN_OPENSSL_CANDIDATES, "Windows": WINDOWS_OPENSSL_CANDIDATES}
 
 
 def classify_openssl(version_output):
@@ -48,11 +57,11 @@ def _openssl_version(executable):
 def find_openssl(system=None, which=shutil.which, isfile=os.path.isfile, run_version=_openssl_version):
     """Return an Ed25519-capable OpenSSL executable or raise an actionable ValueError."""
     system = system if system is not None else platform.system()
-    candidates = list(DARWIN_OPENSSL_CANDIDATES) if system == "Darwin" else []
+    candidates = list(_PROBED_CANDIDATES.get(system, ()))
     candidates.append("openssl")
     rejected = []
     for candidate in candidates:
-        if "/" in candidate:
+        if "/" in candidate or "\\" in candidate:
             if not isfile(candidate):
                 continue
             executable = candidate
