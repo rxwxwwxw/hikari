@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -79,8 +78,8 @@ def main(argv=None):
         raise ValueError('Bootstrap trust is not configured: obtain an independently trusted installer with a pinned release key')
     if args.version != 'latest' and not re.fullmatch(r'v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', args.version):
         raise ValueError('Expected latest or a release version such as 0.2.0')
-    if not shutil.which('openssl'):
-        raise ValueError('OpenSSL with Ed25519 support is required; install it and rerun this command')
+    # Fails before any download when only LibreSSL (or nothing) is available.
+    verifier.find_openssl()
     release = 'latest/download' if args.version == 'latest' else 'download/v' + args.version.removeprefix('v')
     base = f'https://github.com/{repo}/releases/{release}'
     filename = f'hikari-{system}-{arch}' + ('.zip' if system == 'windows' else '.tar.gz')

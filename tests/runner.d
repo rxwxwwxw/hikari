@@ -14,6 +14,7 @@ import tests.platform.test_cross_platform;
 import tests.platform.test_darwin;
 import tests.platform.test_windows_parsers;
 import tests.platform.test_winservice;
+import tests.platform.test_openssl;
 import tests.caddyfile.test_caddyfile;
 import tests.http.test_http_tailnet;
 import tests.update.test_update_lifecycle;

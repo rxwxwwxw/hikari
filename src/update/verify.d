@@ -7,6 +7,7 @@ import std.digest.sha : sha256Of, toHexString;
 import std.file : exists, getSize, read, tempDir, write, remove, mkdirRecurse, rmdirRecurse;
 import std.uuid : randomUUID;
 import platform.command : runLocalCommand;
+import platform.openssl : OpenSslSelection, selectEd25519OpenSsl;
 import std.format : format;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.process : Config, execute;
@@ -141,7 +142,16 @@ private void removeDirectoryQuietly(string p) nothrow {
     try { rmdirRecurse(p); } catch (Exception) {}
 }
 
+// Verifies with the first Ed25519-capable OpenSSL (see platform.openssl). Throws
+// with an actionable message when none exists (e.g. only macOS LibreSSL), so the
+// update fails closed with a cause rather than as a vague signature mismatch.
 bool verifySignatureWithOpenSsl(string manifestPath, string sigPath, string publicKeyPemOrPath) {
+    return verifySignatureUsing(selectEd25519OpenSsl(), manifestPath, sigPath, publicKeyPemOrPath);
+}
+
+bool verifySignatureUsing(const OpenSslSelection openssl, string manifestPath, string sigPath,
+    string publicKeyPemOrPath) {
+    if (!openssl.ok) throw new Exception(openssl.error);
     if (!exists(manifestPath) || !exists(sigPath) || publicKeyPemOrPath.strip().length == 0) return false;
     string keyPath = publicKeyPemOrPath.strip();
     bool createdTempKey = false;
@@ -167,7 +177,7 @@ bool verifySignatureWithOpenSsl(string manifestPath, string sigPath, string publ
 
     try {
         auto res = runLocalCommand([
-            "openssl", "pkeyutl", "-verify",
+            openssl.executable, "pkeyutl", "-verify",
             "-pubin", "-inkey", keyPath,
             "-rawin", "-in", manifestPath,
             "-sigfile", sigPath,
