@@ -6,6 +6,7 @@ __WINDOWS_LOG_BLOCK__}
 
 https://__MAGIC_DNS_FQDN__:__PORT__ {
 	bind __TAILSCALE_IP__
+	encode zstd gzip
 
 	handle __BASE_PATH_API__ {
 		reverse_proxy 127.0.0.1:__LOCAL_PORT__

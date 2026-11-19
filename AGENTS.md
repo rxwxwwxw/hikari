@@ -350,7 +350,7 @@ Show `last seen`, `last successful telemetry`, and last sampled timestamps separ
 
 - On page load, fetch local `/api/v1/nodes`, render known hosts immediately, then request peer `/api/v1/status` endpoints with bounded concurrency and `Promise.allSettled`-style independent failure handling.
 - Only poll while `document.visibilityState === 'visible'`; pause on hide and abort outstanding requests on hide/navigation/page close. Do not install a service worker or background sync mechanism.
-- Default refresh interval **15 s** while visible, user-configurable and switchable off. Each successful response is still subject to the server's TTL; client refresh does not force an expensive probe.
+- Default refresh interval **60 s** while visible, user-configurable and switchable off. Each successful response is still subject to the server's TTL; client refresh does not force an expensive probe.
 - Fetch full `/api/v1/hardware` **only when a hardware drawer/card is opened** (or when explicitly requested); cache it in the page session. Persist only a minimal, sanitized last-known hardware **summary** in the node registry.
 - If a node becomes unreachable, render cached information with an obvious offline/staleness label. No infinite spinner and no single peer that can delay the whole page.
 - Show collection errors and unsupported capabilities without breaking the layout. Never assume every machine exposes temperature, GPU telemetry, battery health, or per-DIMM details.
@@ -390,6 +390,7 @@ Illustrative isolated config (render placeholders; test against the Caddy versio
 
 https://__MAGIC_DNS_FQDN__:__PORT__ {
     bind __TAILSCALE_IP__
+    encode zstd gzip
 
     handle /api/v1/* {
         reverse_proxy 127.0.0.1:__LOCAL_PORT__

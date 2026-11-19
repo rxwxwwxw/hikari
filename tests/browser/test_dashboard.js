@@ -110,7 +110,7 @@ function buildDom() {
   ];
   for (const id of ids) {
     const el = new MockElement(id === "fleet-tbody" ? "tbody" : "div");
-    if (id === "interval-select") el.value = "15000";
+    if (id === "interval-select") el.value = "60000";
     if (id === "status-filter") el.value = "all";
     if (id === "sort-select") el.value = "name";
     byId.set(id, el);

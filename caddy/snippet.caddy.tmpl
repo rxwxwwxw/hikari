@@ -5,6 +5,8 @@
 # hikari does not modify or reload your existing Caddy configuration or service.
 
 handle_path __BASE_PATH_PREFIX__/* {
+	encode zstd gzip
+
 	handle /api/v1/* {
 		reverse_proxy 127.0.0.1:__LOCAL_PORT__
 	}

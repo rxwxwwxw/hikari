@@ -65,7 +65,7 @@ string renderCaddyfile(
     }
     string tmpl = exists(tmplPath)
         ? readText(tmplPath)
-        : "{\n\tadmin off\n\tauto_https disable_redirects\n\tstorage file_system __STATE_DIR__/caddy\n__WINDOWS_LOG_BLOCK__}\n\nhttps://__MAGIC_DNS_FQDN__:__PORT__ {\n\tbind __TAILSCALE_IP__\n\n\thandle __BASE_PATH_API__ {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
+        : "{\n\tadmin off\n\tauto_https disable_redirects\n\tstorage file_system __STATE_DIR__/caddy\n__WINDOWS_LOG_BLOCK__}\n\nhttps://__MAGIC_DNS_FQDN__:__PORT__ {\n\tbind __TAILSCALE_IP__\n\tencode zstd gzip\n\n\thandle __BASE_PATH_API__ {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
 
     auto bp = checkedBasePath(basePath);
     fqdn = checkedMagicDnsName(fqdn);
@@ -107,6 +107,7 @@ string renderIntegratedSite(string fqdn, ushort tailnetPort, string tailscaleIp,
     string s = SITE_FILE_HEADER ~ "\n";
     s ~= "https://" ~ fqdn ~ ":" ~ to!string(tailnetPort) ~ " {\n";
     s ~= "\tbind " ~ tailscaleIp ~ "\n";
+    s ~= "\tencode zstd gzip\n";
     s ~= "\ttls {\n\t\tget_certificate tailscale\n\t}\n\n";
     s ~= "\thandle " ~ apiPattern ~ " {\n\t\treverse_proxy 127.0.0.1:" ~ to!string(loopbackPort) ~ "\n\t}\n\n";
     if (bp == "/") s ~= "\thandle {\n";
@@ -142,7 +143,7 @@ string renderCaddySnippet(
 ) {
     string tmpl = exists(tmplPath)
         ? readText(tmplPath)
-        : "handle_path __BASE_PATH_PREFIX__/* {\n\thandle /api/v1/* {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
+        : "handle_path __BASE_PATH_PREFIX__/* {\n\tencode zstd gzip\n\n\thandle /api/v1/* {\n\t\treverse_proxy 127.0.0.1:__LOCAL_PORT__\n\t}\n\n\thandle {\n\t\troot * __WEB_DIR__\n\t\tfile_server\n\t}\n}\n";
 
     auto bp = checkedBasePath(basePath);
     string prefix = (bp == "/") ? "/hikari" : bp;
