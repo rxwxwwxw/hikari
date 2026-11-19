@@ -647,7 +647,7 @@ for maintenance_job in "${MAINTENANCE_JOBS[@]}"; do
 done
 
 echo "=== hikari ($TARGET_OS) Install Plan ==="
-echo "  Install a short-lived privileged maintenance job: local eligibility every 5 min; network only when update policy permits."
+echo "  Install a short-lived privileged maintenance job: local eligibility every 5 min; checks GitHub for signed releases after boot and daily by default (updates.mode)."
 echo "  Distro/OS:      id=$DISTRO_ID like='$DISTRO_ID_LIKE' pkg=$PKG_FAMILY arch=$ARCH"
 echo "  Target root:    ${ROOT_PREFIX:-/}"
 echo "  Release dir:    $VERSIONS_DIR"
@@ -809,7 +809,7 @@ if [ ! -f "$CONFIG_PATH" ]; then
   },
   "updates": {
     "repo": "${TRUST_REPO:-OWNER/REPO}",
-    "mode": "on_dashboard_open",
+    "mode": "scheduled",
     "auto_install_verified": true,
     "check_interval_hours": 24,
     "public_key": "${TRUST_PUBKEY}",

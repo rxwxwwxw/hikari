@@ -26,7 +26,7 @@ Each participating machine ordinarily runs:
 
 - **`hikari`**: one native D executable, with an idle loopback HTTP listener, an in-memory telemetry cache, a persistent hardware/known-node registry, and platform-specific collectors. It **does not periodically poll peers**.
 - **An HTTPS front end**: either an existing Caddy that hikari joined under §7.1, or an isolated `hikari-caddy` instance. Either way, hikari's site serves the single-file dashboard and proxies versioned API requests to the local D listener, listens **only on the machine's Tailscale address**, and uses Caddy's native Tailscale certificate integration.
-- **An optional maintenance policy**: release checks/updates are **deferred until dashboard activity by default**, or may be explicitly enabled on a schedule. Never silently enable periodic peer telemetry polling.
+- **A maintenance policy**: by default, signed release checks run **after boot and once a day**; they may instead be deferred until dashboard activity, or made manual. Never silently enable periodic peer telemetry polling.
 
 Each machine is independently useful. There is **no central coordinator, database, message broker, hosted service, or account required by hikari**. Any machine with the dashboard can show the fleet. Tailscale itself, Caddy, and the OS service manager are required infrastructure; “no D package dependencies” does **not** mean literally zero external software.
 
@@ -535,7 +535,7 @@ Illustrative `config.json` (config file schema to be tested and versioned):
     "max_stale_seconds": {"fast": 60, "processes": 120, "device_dynamic": 600, "filesystems": 1200, "tailnet": 3600, "maintenance": 604800, "hardware": 2592000}
   },
   "discovery": {"enabled_on_dashboard_open": true, "max_concurrent_probes": 4},
-  "updates": {"repo": "OWNER/REPO", "mode": "on_dashboard_open", "auto_install_verified": true, "check_interval_hours": 24},
+  "updates": {"repo": "OWNER/REPO", "mode": "scheduled", "auto_install_verified": true, "check_interval_hours": 24},
   "privacy": {"expose_serials": false, "expose_mac_addresses": false}
 }
 ```
@@ -562,16 +562,16 @@ hikari version                              # agent + schema versions
 
 ## 11. Updater and maintenance network policy
 
-### 11.1 Network-quiet default
+### 11.1 Update check policy
 
-**Default `updates.mode = on_dashboard_open`:** no autonomous GitHub checks when all dashboards are closed. When a dashboard becomes active, the agent may check a verified upstream release **if its cached check is due**. Apply randomized jitter so multiple nodes do not all hit GitHub at once. Update work is asynchronous, never blocks telemetry requests, and must not restart the agent mid-response.
+**Default `updates.mode = scheduled`:** the privileged maintenance job checks the pinned repository for a verified release **after each boot and then once per `check_interval_hours`** (default 24 h), whether or not a dashboard is open. Apply randomized jitter so multiple nodes do not all hit GitHub at once. A machine that keeps rebooting checks at most hourly; waking from sleep is not a boot. Update work is asynchronous, never blocks telemetry requests, and must not restart the agent mid-response. This default **trades strict network quietness for unattended freshness**: one small, bounded GitHub request per node per day (plus one per boot) while no one is looking. It is limited to release metadata and never involves peer telemetry, discovery or high-frequency probes.
 
 Other explicit modes:
 
+- `on_dashboard_open`: no autonomous GitHub checks while all dashboards are closed; when a dashboard becomes active, check a verified upstream release **if its cached check is due**. Use it when network quietness matters more than freshness.
 - `manual`: never contact GitHub or install an update unless the operator invokes a CLI update.
-- `scheduled`: check at a configurable bounded interval (default 24 h, with jitter) even without a dashboard. This mode **intentionally sacrifices strict network quietness** for unattended freshness.
 
-**Tradeoff:** `on_dashboard_open` cannot install updates on a computer that is never contacted. Document this honestly. “No idle connections” refers to **hikari-initiated connections**; the Tailscale daemon, OS updates, and certificate handling have separate network behavior outside hikari's complete control.
+**Tradeoffs:** `scheduled` makes a daily outbound HTTPS request to GitHub from every node. `on_dashboard_open` cannot install updates on a computer that is never contacted. Document both honestly. “No idle connections” refers to **hikari-initiated connections**; the Tailscale daemon, OS updates, and certificate handling have separate network behavior outside hikari's complete control.
 
 ### 11.2 Signed, transactional release updates
 
@@ -711,7 +711,7 @@ No feature is complete merely because it compiles or returns plausible JSON. Add
 
 Measure on representative Linux, macOS (Intel and Apple Silicon where available), and Windows hosts:
 
-- With **no dashboard open** and default quiet update policy, hikari initiates **no peer HTTP discovery/status traffic** and performs **no periodic high-frequency probes**. Record any allowed maintenance/certificate exceptions.
+- With **no dashboard open**, hikari initiates **no peer HTTP discovery/status traffic** and performs **no periodic high-frequency probes**; its only autonomous outbound traffic is the boot/daily signed-release check (none in `on_dashboard_open` or `manual` mode). Record any allowed maintenance/certificate exceptions.
 - Two status requests within a group's TTL do **not** cause two OS collections. Repeated hardware-card opens within the seven-day TTL do not re-enumerate hardware.
 - Idle wakeups, CPU use, RSS, disk writes and sockets are measured over a meaningful interval; document results and regressions rather than declaring universal hard millisecond budgets.
 - On a fleet containing sleeping/offline machines, the responsive dashboard renders reachable results independently and remains interactive within its own bounded request timeouts.

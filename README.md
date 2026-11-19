@@ -8,7 +8,7 @@ Written in D (compiled with `ldc2`) with zero external D package dependencies an
 
 ## Key Features (Stage 1: Linux)
 
-- **Quiet when nobody is looking:** On-demand per-group TTL caching (`fast` 10s, `processes` 20s, `device_dynamic` 60s, `filesystems` 120s, `maintenance` 12h, `hardware` 7d) with single-flight coalescing, stale-while-refresh, and `202 collecting` / `503` error states.
+- **Quiet when nobody is looking:** On-demand per-group TTL caching (`fast` 10s, `processes` 20s, `device_dynamic` 60s, `filesystems` 120s, `maintenance` 12h, `hardware` 7d) with single-flight coalescing, stale-while-refresh, and `202 collecting` / `503` error states. The only autonomous outbound traffic is a signed-release check after boot and once a day (`updates.mode`; switch to `on_dashboard_open` or `manual` for full quiet).
 - **First-class hardware inventory:** Lazy `/api/v1/hardware` endpoint with human-readable CPU, motherboard, firmware, RAM, NIC, storage, and GPU cards, plus **x86-64 `CPUID + OSXSAVE/XCR0`** and **ARM64 `HWCAP`** usable ISA extension detection with an offline glossary.
 - **Tailscale HTTPS:** Reuses a compatible existing Caddy service through verified, reversible integration by default, or runs an isolated `hikari-caddy`. Hikari routes bind only to the Tailscale IP; `tailscale serve` is never changed.
 - **Loopback-only D agent:** `hikari` binds strictly to `127.0.0.1:19100` (or `::1`), rejects non-loopback configuration, enforces Origin/Host validation (no `Access-Control-Allow-Origin: *`), and redacts serials/MACs by default.

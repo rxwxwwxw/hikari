@@ -140,10 +140,21 @@ string createMaintenanceDirectory(string parent) {
     return path;
 }
 
-bool maintenanceDue(const ref HikariConfig cfg, long now, long lastAttempt, long activity) {
+/// A machine that keeps rebooting checks for releases at most this often.
+enum long STARTUP_CHECK_MIN_GAP_S = 3600;
+
+/// `bootTime` is the wall-clock second the machine booted (sleep does not
+/// count as a boot), or <= 0 when unknown. In `scheduled` mode the first
+/// eligibility run after a boot checks even inside the interval, so a machine
+/// that is mostly off still updates when it is turned on.
+bool maintenanceDue(const ref HikariConfig cfg, long now, long lastAttempt, long activity, long bootTime = -1) {
     if (!cfg.updates.isTrustConfigured() || cfg.updates.mode == UpdateMode.manual) return false;
     auto interval = cast(long) cfg.updates.check_interval_hours * 3600;
-    if (lastAttempt > 0 && now >= lastAttempt && now - lastAttempt < interval) return false;
+    if (lastAttempt > 0 && now >= lastAttempt && now - lastAttempt < interval) {
+        immutable firstSinceBoot = bootTime > 0 && bootTime <= now && lastAttempt < bootTime;
+        if (cfg.updates.mode != UpdateMode.scheduled || !firstSinceBoot
+            || now - lastAttempt < STARTUP_CHECK_MIN_GAP_S) return false;
+    }
     if (cfg.updates.mode == UpdateMode.scheduled) return true;
     // Activity requests expire: a machine never updates days after its last viewer.
     return activity > lastAttempt && activity <= now && now - activity <= 120;
@@ -157,6 +168,8 @@ private long readTimestamp(string path) {
 
 struct MaintenanceHooks {
     long delegate() now;
+    long delegate() bootTime; // wall-clock boot second; default derived from the boot clock
+
     void delegate() jitter;
     DownloadFn download;
     ServiceRestartFn restart;
@@ -178,9 +191,19 @@ int maintainRelease(HikariConfig cfg, string targetOs, string targetArch, Mainte
         if (!recovery.ok) throw new Exception(recovery.message);
     }
     auto now = hooks.now is null ? Clock.currTime.toUnixTime() : hooks.now();
+    long bootTime = -1;
+    if (hooks.bootTime !is null) {
+        bootTime = hooks.bootTime();
+    } else {
+        // Boot clocks include suspend (CLOCK_BOOTTIME, mach_continuous_time,
+        // GetTickCount64), so waking from sleep is not mistaken for a boot.
+        import platform.clock : continuousBootNanoseconds;
+        auto upNs = continuousBootNanoseconds();
+        if (upNs >= 0) bootTime = Clock.currTime.toUnixTime() - upNs / 1_000_000_000L;
+    }
     auto attemptPath = controlDir ~ "/last-attempt";
     if (!maintenanceDue(cfg, now, readTimestamp(attemptPath),
-        readTimestamp(cfg.paths.state_dir ~ "/update-request"))) return 0;
+        readTimestamp(cfg.paths.state_dir ~ "/update-request"), bootTime)) return 0;
     // Bound retries across failures and process restarts, using privileged state.
     write(attemptPath ~ ".tmp", to!string(now));
     rename(attemptPath ~ ".tmp", attemptPath);

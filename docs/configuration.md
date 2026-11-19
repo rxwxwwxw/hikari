@@ -43,7 +43,7 @@ Configuration lives at `/etc/hikari/config.json` on Linux. User settings and unk
   },
   "updates": {
     "repo": "OWNER/REPO",
-    "mode": "on_dashboard_open",
+    "mode": "scheduled",
     "auto_install_verified": true,
     "check_interval_hours": 24,
     "public_key": "",
@@ -70,9 +70,11 @@ Configuration lives at `/etc/hikari/config.json` on Linux. User settings and unk
 - **`caddy.reload`:** `false` by default. When `true`, the installer reloads a joined Caddy after changing it (rolling back if the reload fails); otherwise it prints the reload command.
 - **`collection.ttl_seconds` & `max_stale_seconds`:** Request-driven freshness windows (never background polling intervals). When age is between `ttl` and `max_stale`, hikari returns the stale snapshot immediately labeled `stale` while refreshing once in the background.
 - **`updates.mode`:**
-  - `on_dashboard_open` (default): quiet when dashboards are closed; checks verified releases only when active and due.
+  - `scheduled` (default): checks for a verified release after each boot and then every `check_interval_hours` (24 by default), with jitter, whether or not a dashboard is open. A machine that keeps rebooting checks at most hourly; waking from sleep does not count as a boot. This makes one small outbound HTTPS request to GitHub per node per day (plus one per boot).
+  - `on_dashboard_open`: quiet when dashboards are closed; checks verified releases only when a dashboard is active and a check is due. A machine nobody views never updates.
   - `manual`: never contacts GitHub automatically; updates only via `hikari update apply`.
-  - `scheduled`: checks at `check_interval_hours` (with jitter) even when no dashboard is open.
+
+  Installers write the mode into `config.json` only when they create it, and never change it afterwards. Installs made with 0.1.1 or earlier therefore keep `on_dashboard_open` until you change it.
 - **`updates.repo` & `updates.public_key`:** Updates remain **disabled (fail closed)** until `repo` is changed from the `OWNER/REPO` placeholder and a trusted Ed25519 public key is pinned.
 - **`privacy`:** Serial numbers and MAC addresses are omitted by default (`false`).
 
@@ -100,7 +102,8 @@ In `on_dashboard_open` mode, a successfully served nodes/status response records
 activity at most once per check interval plus a two-minute dispatch allowance. The maintenance job only accepts recent
 activity (two minutes), adds up to sixty seconds of jitter, and verifies the
 signed manifest before trusting its contents. `scheduled` mode uses the same
-interval without requiring dashboard activity. Attempts, including failures,
+interval without requiring dashboard activity, and additionally checks on the
+first eligibility run after each boot (at most hourly). Attempts, including failures,
 are limited across restarts by protected state under `versions/.maintenance`.
 The default release-discovery channel is `stable`; other channels currently need
 explicit signed local inputs with `update apply`.
