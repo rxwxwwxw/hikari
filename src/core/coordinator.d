@@ -84,30 +84,66 @@ class RefreshCoordinator {
     private Condition cond;
     private long lastGcMonoNs = 0;
 
+    private struct ProbeWorker {
+        Condition workerCond;
+        Thread thread;
+        bool started = false;
+        bool pending = false;
+        ulong launchGen = 0;
+    }
+    private ProbeWorker[7] workers;
+
+    private static size_t probeGroupIndex(ProbeGroup g) pure nothrow @safe @nogc {
+        final switch (g) {
+            case ProbeGroup.fast: return 0;
+            case ProbeGroup.processes: return 1;
+            case ProbeGroup.device_dynamic: return 2;
+            case ProbeGroup.filesystems: return 3;
+            case ProbeGroup.tailnet: return 4;
+            case ProbeGroup.maintenance: return 5;
+            case ProbeGroup.hardware: return 6;
+        }
+    }
+
     this(PlatformBackend backend, TelemetryCacheStore store, ClockSource clocks = ClockSource.system()) {
         this.backend = backend;
         this.store = store;
         this.clocks = clocks;
         this.mtx = new Mutex();
         this.cond = new Condition(this.mtx);
+        foreach (ref w; this.workers) {
+            w.workerCond = new Condition(this.mtx);
+        }
 
         // Populate initial cheap OS identity so /info always has host/os/arch without running telemetry probes
         try {
-            this.store.cachedIdentity = backend.identity();
+            auto id = backend.identity();
+            this.store.setIdentity(id);
         } catch (Exception) {
-            this.store.cachedIdentity = PlatformIdentity("unknown", "unknown", "unknown", "", Nullable!long.init);
+            auto fallback = PlatformIdentity("unknown", "unknown", "unknown", "", Nullable!long.init);
+            this.store.setIdentity(fallback);
         }
     }
 
     void updateFqdn(string fqdn) {
         synchronized (mtx) {
-            store.fqdn = fqdn;
+            store.setFqdn(fqdn);
         }
     }
 
     InfoResponse getInfo() {
         synchronized (mtx) {
             return store.buildInfoResponse(clocks.wallTs());
+        }
+    }
+
+    bool getInfoJson(char[] jsonBuf, out size_t jsonLen) {
+        synchronized (mtx) {
+            auto ir = store.buildInfoResponse(clocks.wallTs());
+            auto w = JsonBufferWriter(jsonBuf);
+            writeInfoResponseJson(w, ir);
+            jsonLen = w.pos;
+            return !w.overflow;
         }
     }
 
@@ -122,107 +158,150 @@ class RefreshCoordinator {
         }
     }
 
-    StatusEndpointResult getStatus(bool forceRefresh = false) {
-        static immutable ProbeGroup[] statusGroups = [
-            ProbeGroup.fast,
-            ProbeGroup.processes,
-            ProbeGroup.device_dynamic,
-            ProbeGroup.filesystems,
-            ProbeGroup.maintenance,
-        ];
+    bool getHealthJson(char[] jsonBuf, out size_t jsonLen) {
+        synchronized (mtx) {
+            HealthResponse hr;
+            hr.node_id = store.nodeId;
+            hr.server_ts = clocks.wallTs();
+            auto f = store.groups[ProbeGroup.fast];
+            hr.status = (f.consecutiveFailures > 0 && !f.hasSuccess) ? "degraded" : "ok";
+            auto w = JsonBufferWriter(jsonBuf);
+            writeHealthResponseJson(w, hr);
+            jsonLen = w.pos;
+            return !w.overflow;
+        }
+    }
 
+    private StatusEndpointResult prepareStatusLocked(bool forceRefresh, out long outNowMono, out long outNowWall) {
         long nowMono = clocks.monoNs();
         long nowWall = clocks.wallTs();
 
         bool needColdWait = false;
-        bool[ProbeGroup] waitForRefresh;
-        ulong[ProbeGroup] targetGen;
+        bool[5] waitForRefresh = false;
+        ulong[5] targetGen = 0;
 
-        synchronized (mtx) {
-            foreach (g; statusGroups) {
-                reapTimedOutLocked(g, nowMono);
-                bool fresh = !forceRefresh && store.isFresh(g, nowMono, nowWall);
-                if (fresh) continue;
+        foreach (i, g; STATUS_PROBE_GROUPS) {
+            reapTimedOutLocked(g, nowMono);
+            bool fresh = !forceRefresh && store.isFresh(g, nowMono, nowWall);
+            if (fresh) continue;
 
-                bool usable = !forceRefresh && store.isUsableStale(g, nowMono, nowWall);
-                auto e = store.groups[g];
+            bool usable = !forceRefresh && store.isUsableStale(g, nowMono, nowWall);
+            auto e = store.groups[g];
 
-                if (!usable) {
-                    if (g == ProbeGroup.fast || forceRefresh) {
-                        needColdWait = true;
-                        waitForRefresh[g] = true;
-                        targetGen[g] = e.generation + 1;
-                    } else if (!e.unsupported && e.consecutiveFailures == 0) {
-                        needColdWait = true;
-                        waitForRefresh[g] = true;
-                        targetGen[g] = e.generation + 1;
-                    }
-                }
-
-                if (canStartLocked(e, nowMono, forceRefresh)) {
-                    startGroupRefreshLocked(g, nowMono);
+            if (!usable) {
+                if (g == ProbeGroup.fast || forceRefresh) {
+                    needColdWait = true;
+                    waitForRefresh[i] = true;
+                    targetGen[i] = e.generation + 1;
+                } else if (!e.unsupported && e.consecutiveFailures == 0) {
+                    needColdWait = true;
+                    waitForRefresh[i] = true;
+                    targetGen[i] = e.generation + 1;
                 }
             }
 
-            if (needColdWait) {
-                long deadlineMono = nowMono + cast(long) store.config.collection.cold_wait_ms * 1_000_000L;
-                while (true) {
-                    nowMono = clocks.monoNs();
-                    nowWall = clocks.wallTs();
-
-                    foreach (g; statusGroups) reapTimedOutLocked(g, nowMono);
-
-                    bool allStartedColdDone = true;
-                    foreach (g; statusGroups) {
-                        auto e = store.groups[g];
-                        if ((g in waitForRefresh) && e.inFlight && e.generation < targetGen[g]) {
-                            allStartedColdDone = false;
-                            break;
-                        }
-                    }
-
-                    if (allStartedColdDone) break;
-
-                    long remNs = deadlineMono - nowMono;
-                    if (remNs <= 0) break;
-
-                    long waitMs = remNs / 1_000_000L;
-                    if (waitMs < 1) waitMs = 1;
-                    if (waitMs > 50) waitMs = 50;
-                    cond.wait(msecs(waitMs));
-                }
+            if (canStartLocked(e, nowMono, forceRefresh)) {
+                startGroupRefreshLocked(g, nowMono);
             }
+        }
 
-            nowMono = clocks.monoNs();
-            nowWall = clocks.wallTs();
+        if (needColdWait) {
+            long deadlineMono = nowMono + cast(long) store.config.collection.cold_wait_ms * 1_000_000L;
+            while (true) {
+                nowMono = clocks.monoNs();
+                nowWall = clocks.wallTs();
 
-            auto fastEntry = store.groups[ProbeGroup.fast];
-            bool fastUsable = store.isUsableStale(ProbeGroup.fast, nowMono, nowWall);
+                foreach (g; STATUS_PROBE_GROUPS) reapTimedOutLocked(g, nowMono);
 
-            if (!fastUsable) {
-                if (fastEntry.inFlight) {
-                    StatusEndpointResult res;
-                    res.kind = EndpointOutcomeKind.collecting;
-                    res.httpStatus = 202;
-                    res.retryAfterS = 1;
-                    return res;
+                bool allStartedColdDone = true;
+                foreach (i, g; STATUS_PROBE_GROUPS) {
+                    auto e = store.groups[g];
+                    if (waitForRefresh[i] && e.inFlight && e.generation < targetGen[i]) {
+                        allStartedColdDone = false;
+                        break;
+                    }
                 }
+
+                if (allStartedColdDone) break;
+
+                long remNs = deadlineMono - nowMono;
+                if (remNs <= 0) break;
+
+                long waitMs = remNs / 1_000_000L;
+                if (waitMs < 1) waitMs = 1;
+                if (waitMs > 50) waitMs = 50;
+                cond.wait(msecs(waitMs));
+            }
+        }
+
+        outNowMono = clocks.monoNs();
+        outNowWall = clocks.wallTs();
+
+        auto fastEntry = store.groups[ProbeGroup.fast];
+        bool fastUsable = store.isUsableStale(ProbeGroup.fast, outNowMono, outNowWall);
+
+        if (!fastUsable) {
+            if (fastEntry.inFlight) {
                 StatusEndpointResult res;
-                res.kind = EndpointOutcomeKind.error;
-                res.httpStatus = 503;
-                res.errorCode = fastEntry.lastError.length > 0 ? fastEntry.lastError : "fast_probe_unavailable";
-                res.errorMessage = "Core telemetry probes failed with no usable cached snapshot";
-                auto snap = store.snapshotStatusResponse(nowMono, nowWall);
-                res.groups = snap.groups;
+                res.kind = EndpointOutcomeKind.collecting;
+                res.httpStatus = 202;
+                res.retryAfterS = 1;
                 return res;
             }
-
-            // If fast is usable, check if all cold groups are still waiting vs ready
-            // Note: fast is ready, so a hung slow probe (filesystems/device_dynamic) never blocks fast CPU status!
             StatusEndpointResult res;
-            res.kind = EndpointOutcomeKind.ok;
-            res.httpStatus = 200;
-            res.payload = store.snapshotStatusResponse(nowMono, nowWall);
+            res.kind = EndpointOutcomeKind.error;
+            res.httpStatus = 503;
+            res.errorCode = fastEntry.lastError.length > 0 ? fastEntry.lastError : "fast_probe_unavailable";
+            res.errorMessage = "Core telemetry probes failed with no usable cached snapshot";
+            return res;
+        }
+
+        StatusEndpointResult res;
+        res.kind = EndpointOutcomeKind.ok;
+        res.httpStatus = 200;
+        return res;
+    }
+
+    StatusEndpointResult getStatus(bool forceRefresh = false) {
+        synchronized (mtx) {
+            long nowMono = 0, nowWall = 0;
+            auto res = prepareStatusLocked(forceRefresh, nowMono, nowWall);
+            if (res.kind == EndpointOutcomeKind.ok) {
+                res.payload = store.snapshotStatusResponse(nowMono, nowWall);
+            } else if (res.kind == EndpointOutcomeKind.error) {
+                auto snap = store.snapshotStatusResponse(nowMono, nowWall);
+                res.groups = snap.groups;
+            }
+            return res;
+        }
+    }
+
+    StatusEndpointResult getStatusJson(char[] jsonBuf, out size_t jsonLen, bool forceRefresh = false) {
+        synchronized (mtx) {
+            long nowMono = 0, nowWall = 0;
+            auto res = prepareStatusLocked(forceRefresh, nowMono, nowWall);
+            auto w = JsonBufferWriter(jsonBuf);
+            final switch (res.kind) {
+                case EndpointOutcomeKind.ok: {
+                    StatusResponse snap;
+                    store.snapshotStatusInto(snap, nowMono, nowWall);
+                    writeStatusResponseJson(w, snap);
+                    break;
+                }
+                case EndpointOutcomeKind.collecting: {
+                    CollectingResponse cr;
+                    cr.retry_after_s = res.retryAfterS;
+                    writeCollectingResponseJson(w, cr);
+                    break;
+                }
+                case EndpointOutcomeKind.error: {
+                    StatusResponse snap;
+                    store.snapshotStatusInto(snap, nowMono, nowWall);
+                    writeErrorResponseFixedGroupsJson(w, res.errorCode, res.errorMessage, snap.fixed_groups);
+                    break;
+                }
+            }
+            jsonLen = w.overflow ? size_t.max : w.pos;
             return res;
         }
     }
@@ -326,11 +405,38 @@ class RefreshCoordinator {
         e.workerGeneration = launchGen;
         store.groups[g] = e;
 
-        auto worker = new Thread({
-            runProbe(g, launchGen);
+        size_t idx = probeGroupIndex(g);
+        workers[idx].launchGen = launchGen;
+        workers[idx].pending = true;
+        if (!workers[idx].started) {
+            workers[idx].started = true;
+            spawnProbeWorkerThread(g, idx);
+        } else {
+            workers[idx].workerCond.notify();
+        }
+    }
+
+    private void spawnProbeWorkerThread(ProbeGroup g, size_t idx) {
+        auto t = new Thread({
+            probeWorkerLoop(g, idx);
         });
-        worker.isDaemon = true;
-        worker.start();
+        t.isDaemon = true;
+        workers[idx].thread = t;
+        t.start();
+    }
+
+    private void probeWorkerLoop(ProbeGroup g, size_t idx) {
+        while (true) {
+            ulong gen;
+            synchronized (mtx) {
+                while (!workers[idx].pending) {
+                    workers[idx].workerCond.wait();
+                }
+                workers[idx].pending = false;
+                gen = workers[idx].launchGen;
+            }
+            runProbe(g, gen);
+        }
     }
 
     private void clearWorkerAlive(ProbeGroup g, ulong expectedGen) {
@@ -417,7 +523,7 @@ class RefreshCoordinator {
             if (e.generation != expectedGen) return; // timed out / superseded
             if (consumeSystemResume()) store.rateState.resetAll();
 
-            store.cachedIdentity = id;
+            store.setIdentity(id);
             store.cachedCpu.pct = store.rateState.computeAggregateCpuPct(id.boot_id, cpu.total_ticks, cpu.idle_ticks, doneMono, doneBoot);
             store.cachedCpu.load_1m = cpu.load_1m;
             store.cachedCpu.temp_c = cpu.temp_c;
@@ -457,7 +563,7 @@ class RefreshCoordinator {
             }
 
             if (net.state == CapabilityState.ok) {
-                store.cachedNetwork = store.rateState.computeNetworkRates(id.boot_id, net.interfaces, doneMono, doneBoot);
+                store.setNetwork(store.rateState.computeNetworkRates(id.boot_id, net.interfaces, doneMono, doneBoot));
             }
 
             markGroupSuccessLocked(ProbeGroup.fast, doneMono, doneWall);
@@ -486,25 +592,11 @@ class RefreshCoordinator {
             if (consumeSystemResume()) store.rateState.resetAll();
 
             auto rates = store.rateState.computeProcessRates(id.boot_id, pr, doneMono, doneBoot);
-
-            auto byCpu = rates.dup;
-            sort!((a, b) {
-                double ac = a.cpu_pct.isNull ? -1.0 : a.cpu_pct.get;
-                double bc = b.cpu_pct.isNull ? -1.0 : b.cpu_pct.get;
-                if (ac != bc) return ac > bc;
-                ulong ar = a.rss_bytes.isNull ? 0 : a.rss_bytes.get;
-                ulong br = b.rss_bytes.isNull ? 0 : b.rss_bytes.get;
-                return ar > br;
-            })(byCpu);
-            store.cachedTopCpu = byCpu.length > 5 ? byCpu[0 .. 5].dup : byCpu;
-
-            auto byMem = rates.dup;
-            sort!((a, b) {
-                ulong ar = a.rss_bytes.isNull ? 0 : a.rss_bytes.get;
-                ulong br = b.rss_bytes.isNull ? 0 : b.rss_bytes.get;
-                return ar > br;
-            })(byMem);
-            store.cachedTopMem = byMem.length > 5 ? byMem[0 .. 5].dup : byMem;
+            ProcessStatus[] topCpu;
+            ProcessStatus[] topMem;
+            store.rateState.selectTopProcesses(rates, topCpu, topMem);
+            store.setTopCpu(topCpu);
+            store.setTopMem(topMem);
 
             markGroupSuccessLocked(ProbeGroup.processes, doneMono, doneWall);
         }
@@ -526,7 +618,7 @@ class RefreshCoordinator {
 
         synchronized (mtx) {
             if (store.groups[ProbeGroup.filesystems].generation != expectedGen) return;
-            store.cachedMounts = fs.mounts.dup;
+            store.setMounts(fs.mounts);
             markGroupSuccessLocked(ProbeGroup.filesystems, doneMono, doneWall);
         }
     }
@@ -550,8 +642,8 @@ class RefreshCoordinator {
 
         synchronized (mtx) {
             if (store.groups[ProbeGroup.device_dynamic].generation != expectedGen) return;
-            store.cachedGpus = gpus.state == CapabilityState.ok ? gpus.gpus.dup : [];
-            store.cachedBatteries = bats.state == CapabilityState.ok ? bats.batteries.dup : [];
+            store.setGpus(gpus.state == CapabilityState.ok ? gpus.gpus : null);
+            store.setBatteries(bats.state == CapabilityState.ok ? bats.batteries : null);
 
             if (gpus.state == CapabilityState.error && bats.batteries.length == 0) {
                 // Record error explicitly instead of pretending unsupported or 0%
@@ -622,7 +714,7 @@ class RefreshCoordinator {
 
         synchronized (mtx) {
             if (store.groups[ProbeGroup.maintenance].generation != expectedGen) return;
-            store.cachedDrift = mr.drift;
+            store.setDrift(mr.drift);
             markGroupSuccessLocked(ProbeGroup.maintenance, doneMono, doneWall);
         }
     }

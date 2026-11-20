@@ -1,12 +1,12 @@
 module tailnet.registry;
 
 import core.config : normalizeBasePath;
+import core.limits : MAX_FLEET_NODES;
 import core.model;
-import core.serializer : jsonNull, jsonNullableBool, jsonNullableLong, jsonStringOrNull, parseHardwareSummary, sanitizeOsString, serializeHardwareSummary, serializeNodesResponse;
-import std.algorithm : startsWith;
+import core.serializer : parseHardwareSummary, sanitizeOsString, serializeNodesResponse;
 import std.file : exists, mkdirRecurse, readText, rename, write;
 import std.format : format;
-import std.json : JSONOptions, JSONType, JSONValue, parseJSON;
+import std.json : JSONOptions, JSONType, parseJSON;
 import std.path : dirName;
 import std.typecons : Nullable;
 
@@ -17,17 +17,133 @@ string buildHttpsUrl(string fqdn, ushort port, string basePath, string suffix) p
     return format!"https://%s:%u%s%s"(fqdn, port, prefix, suffix);
 }
 
+private struct NodesHashSink {
+    ulong h1 = 14695981039346656037UL;
+    ulong h2 = 5381UL;
+    size_t byteLen = 0;
+
+    @nogc nothrow pure @safe:
+
+    void putChar(char c) {
+        ubyte b = cast(ubyte) c;
+        h1 ^= b;
+        h1 *= 1099511628211UL;
+        h2 = ((h2 << 5) + h2) ^ (b + 0x9e3779b97f4a7c15UL);
+        h2 *= 0xbf58476d1ce4e5b9UL;
+        byteLen++;
+    }
+
+    void putRaw(const(char)[] s) {
+        foreach (char c; s) putChar(c);
+    }
+
+    void putUlongVal(ulong u) {
+        foreach (i; 0 .. 8) {
+            putChar(cast(char)((u >> (i * 8)) & 0xFF));
+        }
+    }
+
+    void putStrField(const(char)[] s) {
+        putUlongVal(cast(ulong) s.length);
+        putRaw(s);
+    }
+
+    void putBoolField(bool b) {
+        putChar(b ? '1' : '0');
+    }
+
+    void putNullableBoolField(Nullable!bool v) {
+        if (v.isNull) putChar('N');
+        else putChar(v.get ? 'T' : 'F');
+    }
+
+    void putNullableLongField(Nullable!long v) {
+        if (v.isNull) putChar('N');
+        else {
+            putChar('L');
+            putUlongVal(cast(ulong) v.get);
+        }
+    }
+
+    void putNullableUlongField(Nullable!ulong v) {
+        if (v.isNull) putChar('N');
+        else {
+            putChar('U');
+            putUlongVal(v.get);
+        }
+    }
+
+    bool opEquals(const ref NodesHashSink other) const {
+        return h1 == other.h1 && h2 == other.h2 && byteLen == other.byteLen;
+    }
+}
+
+private NodesHashSink computeNodesDigest(const NodeRecord[] list, bool withTimestamps) @nogc nothrow pure @safe {
+    NodesHashSink s;
+    s.putUlongVal(cast(ulong) list.length);
+    foreach (const ref n; list) {
+        s.putStrField(n.node_id);
+        s.putStrField(n.tailscale_node_id);
+        s.putStrField(n.name);
+        s.putStrField(n.alias_name);
+        s.putStrField(n.fqdn);
+        s.putStrField(n.status_url);
+        s.putStrField(n.hardware_url);
+        s.putStrField(n.info_url);
+        s.putUlongVal(n.tailnet_port);
+        s.putStrField(n.base_path.length ? n.base_path : "/");
+        s.putStrField(n.os);
+        s.putStrField(n.arch);
+        s.putBoolField(n.is_self);
+        s.putNullableBoolField(n.tailscale_online);
+        s.putStrField(n.discovery_state);
+        if (withTimestamps) {
+            s.putNullableLongField(n.last_seen_ts);
+            s.putNullableLongField(n.last_success_ts);
+        } else {
+            s.putNullableLongField(Nullable!long.init);
+            s.putNullableLongField(Nullable!long.init);
+        }
+        if (n.last_known_hardware_summary.isNull) {
+            s.putChar('N');
+        } else {
+            auto hs = n.last_known_hardware_summary.get;
+            s.putChar('H');
+            s.putStrField(hs.cpu);
+            s.putNullableUlongField(hs.ram_bytes);
+            s.putStrField(hs.system_model);
+        }
+        s.putBoolField(n.hidden);
+    }
+    return s;
+}
+
 class NodeRegistry {
     string filePath;
     NodeRecord[] nodes;
+    private string[MAX_FLEET_NODES] knownFqdnsBuf;
+    private size_t knownFqdnsCount = 0;
+
+    private void rebuildKnownFqdns() @nogc nothrow @safe {
+        size_t count = 0;
+        foreach (const ref n; nodes) {
+            if (n.fqdn.length > 0) {
+                if (count >= MAX_FLEET_NODES) break;
+                knownFqdnsBuf[count++] = n.fqdn;
+            }
+        }
+        knownFqdnsCount = count;
+    }
 
     this(string stateDir) {
         this.filePath = stateDir ~ "/nodes.json";
+        this.nodes.reserve(MAX_FLEET_NODES);
         load();
     }
 
     void load() {
         nodes = null;
+        nodes.reserve(MAX_FLEET_NODES);
         persistedKnown = false;
         if (!exists(filePath)) return;
         try {
@@ -36,6 +152,7 @@ class NodeRegistry {
             auto pNodes = "nodes" in j.object;
             if (pNodes is null || pNodes.type != JSONType.array) return;
             foreach (el; pNodes.array) {
+                if (nodes.length >= MAX_FLEET_NODES) break;
                 if (el.type != JSONType.object) continue;
                 NodeRecord nr;
                 if (auto p = "node_id" in el.object) if (p.type == JSONType.string) nr.node_id = p.str.idup;
@@ -67,9 +184,11 @@ class NodeRegistry {
             }
             long genAt = 0;
             if (auto g = "generated_at" in j.object) if (g.type == JSONType.integer) genAt = g.integer;
+            rebuildKnownFqdns();
             notePersisted(genAt);
         } catch (Exception) {
             nodes = null;
+            knownFqdnsCount = 0;
             persistedKnown = false;
         }
     }
@@ -80,26 +199,13 @@ class NodeRegistry {
     enum long TIMESTAMP_PERSIST_INTERVAL_S = 3600;
 
     private bool persistedKnown = false;
-    private string persistedStable;   // nodes JSON without contact timestamps
-    private string persistedFull;     // nodes JSON as last written/loaded
+    private NodesHashSink persistedStableHash; // digest without contact timestamps
+    private NodesHashSink persistedFullHash;   // digest as last written/loaded
     private long persistedAtWall = 0;
 
-    private static JSONValue nodesJson(const NodeRecord[] list, bool withTimestamps) {
-        NodesResponse resp;
-        foreach (const ref src; list) {
-            NodeRecord n = src;
-            if (!withTimestamps) {
-                n.last_seen_ts.nullify();
-                n.last_success_ts.nullify();
-            }
-            resp.nodes ~= n;
-        }
-        return serializeNodesResponse(resp)["nodes"];
-    }
-
-    private void notePersisted(long atWall) {
-        persistedStable = nodesJson(nodes, false).toString();
-        persistedFull = nodesJson(nodes, true).toString();
+    private void notePersisted(long atWall) @nogc nothrow pure @safe {
+        persistedStableHash = computeNodesDigest(nodes, false);
+        persistedFullHash = computeNodesDigest(nodes, true);
         persistedAtWall = atWall;
         persistedKnown = true;
     }
@@ -108,11 +214,11 @@ class NodeRegistry {
     /// timestamps are older on disk than TIMESTAMP_PERSIST_INTERVAL_S. Returns true
     /// if the file was written.
     bool saveIfChanged(long generatedAt) {
-        auto stable = nodesJson(nodes, false).toString();
-        auto full = nodesJson(nodes, true).toString();
+        auto stable = computeNodesDigest(nodes, false);
+        auto full = computeNodesDigest(nodes, true);
         if (persistedKnown) {
-            if (full == persistedFull) return false;
-            if (stable == persistedStable && generatedAt - persistedAtWall < TIMESTAMP_PERSIST_INTERVAL_S
+            if (full == persistedFullHash) return false;
+            if (stable == persistedStableHash && generatedAt - persistedAtWall < TIMESTAMP_PERSIST_INTERVAL_S
                 && generatedAt >= persistedAtWall) {
                 return false;
             }
@@ -128,7 +234,10 @@ class NodeRegistry {
             auto tmp = filePath ~ ".tmp";
             write(tmp, newText);
             rename(tmp, filePath);
-            notePersisted(generatedAt);
+            persistedStableHash = stable;
+            persistedFullHash = full;
+            persistedAtWall = generatedAt;
+            persistedKnown = true;
             return true;
         } catch (Exception) {
             return false;
@@ -152,6 +261,22 @@ class NodeRegistry {
         return size_t.max;
     }
 
+    private size_t findEvictionCandidateLocked() const pure nothrow @safe {
+        size_t bestIdx = size_t.max;
+        long oldestTs = long.max;
+        foreach (i, const ref n; nodes) {
+            if (n.is_self) continue;
+            if (n.discovery_state == "confirmed") continue;
+            long ts = !n.last_success_ts.isNull ? n.last_success_ts.get
+                : (!n.last_seen_ts.isNull ? n.last_seen_ts.get : long.min);
+            if (bestIdx == size_t.max || ts < oldestTs) {
+                oldestTs = ts;
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    }
+
     void upsertConfirmedNode(const ref NodeRecord incoming) {
         size_t idx = findIndex(incoming.node_id, incoming.tailscale_node_id, incoming.fqdn);
         if (idx == size_t.max) {
@@ -163,12 +288,21 @@ class NodeRegistry {
                 if (copy.hardware_url.length == 0) copy.hardware_url = buildHttpsUrl(copy.fqdn, p, bp, "/api/v1/hardware");
                 if (copy.info_url.length == 0) copy.info_url = buildHttpsUrl(copy.fqdn, p, bp, "/api/v1/info");
             }
+            if (nodes.length >= MAX_FLEET_NODES) {
+                auto evictIdx = findEvictionCandidateLocked();
+                if (evictIdx == size_t.max) return;
+                nodes[evictIdx] = copy;
+                rebuildKnownFqdns();
+                return;
+            }
             nodes ~= copy;
+            rebuildKnownFqdns();
             return;
         }
 
         // Preserve operator-owned fields: alias_name, tailnet_port, base_path, hidden
         auto existing = nodes[idx];
+        auto prevFqdn = existing.fqdn;
         existing.node_id = incoming.node_id;
         if (incoming.tailscale_node_id.length > 0) existing.tailscale_node_id = incoming.tailscale_node_id;
         if (incoming.name.length > 0) existing.name = incoming.name;
@@ -183,8 +317,9 @@ class NodeRegistry {
         if (!incoming.last_known_hardware_summary.isNull) {
             existing.last_known_hardware_summary = incoming.last_known_hardware_summary;
         }
-        // Recompute URLs using operator-preserved port/base_path and updated FQDN
-        if (existing.fqdn.length > 0) {
+        // Recompute URLs only when FQDN changed or any URL is missing
+        if (existing.fqdn.length > 0 && (existing.fqdn != prevFqdn
+            || existing.status_url.length == 0 || existing.hardware_url.length == 0 || existing.info_url.length == 0)) {
             ushort port = existing.tailnet_port > 0 ? existing.tailnet_port : 9100;
             auto bp = existing.base_path.length > 0 ? existing.base_path : "/";
             existing.status_url = buildHttpsUrl(existing.fqdn, port, bp, "/api/v1/status");
@@ -192,6 +327,7 @@ class NodeRegistry {
             existing.info_url = buildHttpsUrl(existing.fqdn, port, bp, "/api/v1/info");
         }
         nodes[idx] = existing;
+        if (existing.fqdn != prevFqdn) rebuildKnownFqdns();
     }
 
     void updateTailscalePresence(string tailscaleNodeId, string fqdn, string hostName, Nullable!bool online) {
@@ -206,6 +342,7 @@ class NodeRegistry {
             nodes[idx].status_url = buildHttpsUrl(fqdn, port, bp, "/api/v1/status");
             nodes[idx].hardware_url = buildHttpsUrl(fqdn, port, bp, "/api/v1/hardware");
             nodes[idx].info_url = buildHttpsUrl(fqdn, port, bp, "/api/v1/info");
+            rebuildKnownFqdns();
         }
     }
 
@@ -249,6 +386,10 @@ class NodeRegistry {
             }
         }
         return false;
+    }
+
+    const(string)[] knownFqdnsSlice() const @nogc nothrow @safe {
+        return knownFqdnsBuf[0 .. knownFqdnsCount];
     }
 
     string[] knownFqdns() const pure @safe {

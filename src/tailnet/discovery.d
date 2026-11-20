@@ -2,8 +2,9 @@ module tailnet.discovery;
 
 import core.config;
 import core.coordinator : ClockSource;
+import core.limits : MAX_FLEET_NODES;
 import core.model;
-import core.serializer : parseHardwareSummary, sanitizeOsString;
+import core.serializer : JsonBufferWriter, parseHardwareSummary, sanitizeOsString, writeNodesResponseJson;
 import core.sync.mutex;
 import core.thread;
 import std.algorithm : canFind, endsWith, startsWith;
@@ -223,6 +224,7 @@ class TailnetDiscoveryService {
     private Nullable!long lastDiscoveryStartWall;
     private Nullable!long lastDiscoveryFinishWall;
     private long[string] nonHikariUntilMono; // keyed by fqdn
+    private NodeRecord[MAX_FLEET_NODES] nodesRespBuf;
 
     this(
         HikariConfig cfg,
@@ -420,14 +422,18 @@ class TailnetDiscoveryService {
             }
         }
         if (start) {
-            auto t = new Thread({
-                scope (exit) endBackgroundSnapshot();
-                try { getLocalTailscaleSnapshot(false); } catch (Exception) {}
-            });
-            t.isDaemon = true;
-            t.start();
+            spawnBackgroundSnapshotThread();
         }
         return snap;
+    }
+
+    private void spawnBackgroundSnapshotThread() {
+        auto t = new Thread({
+            scope (exit) endBackgroundSnapshot();
+            try { getLocalTailscaleSnapshot(false); } catch (Exception) {}
+        });
+        t.isDaemon = true;
+        t.start();
     }
 
     private void endBackgroundSnapshot() {
@@ -614,6 +620,20 @@ class TailnetDiscoveryService {
         return resp;
     }
 
+    private NodesResponse buildResponseIntoLocked(long nowWall) nothrow @safe {
+        NodesResponse resp;
+        resp.generated_at = nowWall;
+        size_t count = 0;
+        foreach (const ref n; registry.nodes) {
+            if (!n.hidden) {
+                if (count >= MAX_FLEET_NODES) break;
+                nodesRespBuf[count++] = n;
+            }
+        }
+        resp.nodes = nodesRespBuf[0 .. count];
+        return resp;
+    }
+
     /// Synchronous list (+ optional synchronous peer validation). Used by the CLI
     /// (`hikari nodes list|discover`) where blocking is expected.
     NodesResponse listAndDiscoverNodes(
@@ -636,6 +656,20 @@ class TailnetDiscoveryService {
     /// peers. Returns the registry immediately and, when `allowDiscovery` is set
     /// and a run is due (tailnet TTL since the last one, or FORCED_DISCOVERY_MIN_INTERVAL_S
     /// when `forced`), validates peers on a single background thread.
+    private void spawnDiscoveryThread(bool forced) {
+        auto t = new Thread({
+            scope (exit) endDiscoveryRun();
+            try {
+                auto s2 = getLocalTailscaleSnapshot(forced);
+                long w = clocks.wallTs();
+                validatePeers(s2, w);
+                synchronized (mtx) registry.saveIfChanged(w);
+            } catch (Exception) {}
+        });
+        t.isDaemon = true;
+        t.start();
+    }
+
     NodesResponse listNodesAndScheduleDiscovery(string selfNodeId, InfoResponse selfInfo, bool allowDiscovery, bool forced) {
         long nowWall = clocks.wallTs();
         long nowMono = clocks.monoNs();
@@ -667,19 +701,57 @@ class TailnetDiscoveryService {
         }
 
         if (startDiscovery) {
-            auto t = new Thread({
-                scope (exit) endDiscoveryRun();
-                try {
-                    auto s2 = getLocalTailscaleSnapshot(forced);
-                    long w = clocks.wallTs();
-                    validatePeers(s2, w);
-                    synchronized (mtx) registry.saveIfChanged(w);
-                } catch (Exception) {}
-            });
-            t.isDaemon = true;
-            t.start();
+            spawnDiscoveryThread(forced);
         }
         return resp;
+    }
+
+    bool listNodesAndScheduleDiscoveryJson(
+        string selfNodeId,
+        InfoResponse selfInfo,
+        bool allowDiscovery,
+        bool forced,
+        char[] jsonBuf,
+        out size_t jsonLen
+    ) {
+        long nowWall = clocks.wallTs();
+        long nowMono = clocks.monoNs();
+        auto snap = peekLocalTailscaleSnapshot();
+
+        bool startDiscovery = false;
+        bool ok = false;
+        synchronized (mtx) {
+            upsertSelfAndPresenceLocked(snap, selfNodeId, selfInfo, nowWall);
+            if (allowDiscovery && !discoveryRunning) {
+                long sinceS = hasDiscoveryRun ? (nowMono - lastDiscoveryStartMonoNs) / 1_000_000_000L : long.max;
+                long minGap = forced ? FORCED_DISCOVERY_MIN_INTERVAL_S : config.collection.ttl_seconds.tailnet;
+                if (sinceS < 0 || sinceS >= minGap) {
+                    startDiscovery = true;
+                    discoveryRunning = true;
+                    hasDiscoveryRun = true;
+                    lastDiscoveryStartMonoNs = nowMono;
+                    lastDiscoveryStartWall = nowWall;
+                }
+            }
+            registry.saveIfChanged(nowWall);
+            auto resp = buildResponseIntoLocked(nowWall);
+            DiscoveryMeta dm;
+            dm.running = discoveryRunning;
+            dm.last_started_at = lastDiscoveryStartWall;
+            dm.last_finished_at = lastDiscoveryFinishWall;
+            dm.tailscale_available = snap.available;
+            resp.discovery = dm;
+
+            auto w = JsonBufferWriter(jsonBuf);
+            writeNodesResponseJson(w, resp);
+            jsonLen = w.overflow ? size_t.max : w.pos;
+            ok = !w.overflow;
+        }
+
+        if (startDiscovery) {
+            spawnDiscoveryThread(forced);
+        }
+        return ok;
     }
 
     /// Blocks until a background discovery run (if any) completes. Tests only.

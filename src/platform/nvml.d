@@ -1,6 +1,8 @@
 module platform.nvml;
 
+import core.limits : MAX_GPUS;
 import core.model;
+import core.tracker : FixedString;
 import std.conv : to;
 import std.string : fromStringz;
 import std.typecons : Nullable;
@@ -64,6 +66,10 @@ class NvmlLoader {
     private fn_nvmlDeviceGetMemoryInfo pGetMem;
     private fn_nvmlDeviceGetTemperature pGetTemp;
     private fn_nvmlDeviceGetPowerUsage pGetPower;
+
+    private GpuDynamicStatus[MAX_GPUS] gpuBuf;
+    private FixedString!64[MAX_GPUS] gpuIdBufs;
+    private FixedString!160[MAX_GPUS] gpuNameBufs;
 
     ~this() {
         unload();
@@ -161,29 +167,51 @@ class NvmlLoader {
         }
 
         res.state = CapabilityState.ok;
+        size_t outCount = 0;
         foreach (i; 0 .. count) {
+            if (outCount >= MAX_GPUS) break;
             void* dev = null;
             if (pGetHandle(i, &dev) != NVML_SUCCESS || dev is null) continue;
 
             GpuDynamicStatus g;
-            g.id = "nvml:" ~ to!string(i);
+            char[16] idxStr;
+            idxStr[0 .. 5] = "nvml:";
+            size_t idxPos = 5;
+            if (i < 10) {
+                idxStr[idxPos++] = cast(char)('0' + i);
+            } else {
+                idxStr[idxPos++] = cast(char)('0' + (i / 10) % 10);
+                idxStr[idxPos++] = cast(char)('0' + (i % 10));
+            }
+            gpuIdBufs[outCount].set(idxStr[0 .. idxPos]);
+            g.id = gpuIdBufs[outCount].slice();
             g.vendor = "NVIDIA";
             g.capability = CapabilityState.ok;
 
+            gpuNameBufs[outCount].clear();
             if (pGetName !is null) {
                 char[128] buf;
                 if (pGetName(dev, buf.ptr, cast(uint) buf.length) == NVML_SUCCESS) {
                     buf[$ - 1] = '\0';
-                    g.display_name = fromStringz(buf.ptr).idup;
+                    gpuNameBufs[outCount].set(fromStringz(buf.ptr));
                 }
             }
-            if (g.display_name.length == 0) g.display_name = "NVIDIA GPU " ~ to!string(i);
+            if (gpuNameBufs[outCount].len == 0) {
+                gpuNameBufs[outCount].set("NVIDIA GPU");
+            }
+            g.display_name = gpuNameBufs[outCount].slice();
 
             if (pGetPciInfo !is null) {
                 NvmlPciInfo pci;
                 if (pGetPciInfo(dev, &pci) == NVML_SUCCESS) {
-                    auto bid = fromStringz(pci.busId.ptr).idup;
-                    if (bid.length > 0) g.id = "pci:" ~ bid;
+                    auto bid = fromStringz(pci.busId.ptr);
+                    if (bid.length > 0 && bid.length <= 60) {
+                        char[64] pciBuf;
+                        pciBuf[0 .. 4] = "pci:";
+                        pciBuf[4 .. 4 + bid.length] = bid[];
+                        gpuIdBufs[outCount].set(pciBuf[0 .. 4 + bid.length]);
+                        g.id = gpuIdBufs[outCount].slice();
+                    }
                 }
             }
 
@@ -213,9 +241,10 @@ class NvmlLoader {
                 }
             }
 
-            res.gpus ~= g;
+            gpuBuf[outCount++] = g;
         }
 
+        res.gpus = gpuBuf[0 .. outCount];
         if (res.gpus.length == 0) res.state = CapabilityState.unsupported;
         return res;
     }

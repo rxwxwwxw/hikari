@@ -709,3 +709,637 @@ string toJsonText(JSONValue v, bool pretty = false) {
     if (pretty) return v.toPrettyString(JSONOptions.doNotEscapeSlashes) ~ "\n";
     return v.toString(JSONOptions.doNotEscapeSlashes);
 }
+
+// ---------------------------------------------------------------------------
+// Zero-allocation direct-buffer JSON writer (steady-state hot path)
+// ---------------------------------------------------------------------------
+
+struct JsonBufferWriter {
+    char[] buf;
+    size_t pos = 0;
+    bool overflow = false;
+
+    this(char[] backing) @nogc nothrow pure @safe {
+        buf = backing;
+    }
+
+    @nogc nothrow @safe:
+
+    const(char)[] written() const return {
+        return overflow ? null : buf[0 .. pos];
+    }
+
+    void putRaw(const(char)[] s) pure {
+        if (overflow) return;
+        if (pos + s.length > buf.length) {
+            overflow = true;
+            return;
+        }
+        if (s.length > 0) {
+            buf[pos .. pos + s.length] = s[];
+            pos += s.length;
+        }
+    }
+
+    void putChar(char c) pure {
+        if (overflow) return;
+        if (pos + 1 > buf.length) {
+            overflow = true;
+            return;
+        }
+        buf[pos++] = c;
+    }
+
+    void putKey(const(char)[] key) pure {
+        putChar('"');
+        putRaw(key);
+        putRaw(`":`);
+    }
+
+    void putJsonString(const(char)[] s) pure {
+        static immutable char[16] hex = "0123456789abcdef";
+        putChar('"');
+        foreach (char c; s) {
+            ubyte b = cast(ubyte) c;
+            if (b == '"') {
+                putRaw(`\"`);
+            } else if (b == '\\') {
+                putRaw(`\\`);
+            } else if (b < 0x20) {
+                putRaw(`\u00`);
+                putChar(hex[(b >> 4) & 0xF]);
+                putChar(hex[b & 0xF]);
+            } else {
+                putChar(c);
+            }
+        }
+        putChar('"');
+    }
+
+    private size_t sanitizeToTmp(const(char)[] raw, size_t maxLen, ref char[512] tmp) pure {
+        if (raw.length == 0) return 0;
+        size_t limit = maxLen > tmp.length ? tmp.length : maxLen;
+        size_t n = 0;
+        bool prevSpace = false;
+        foreach (char c; raw) {
+            ubyte b = cast(ubyte) c;
+            if (b == '\r' || b == '\n' || b == '\t') {
+                if (!prevSpace && n > 0) {
+                    tmp[n++] = ' ';
+                    prevSpace = true;
+                }
+            } else if (b < 0x20 || b == 0x7F) {
+                continue;
+            } else {
+                tmp[n++] = c;
+                prevSpace = (c == ' ');
+            }
+            if (n >= limit) break;
+        }
+        size_t start = 0;
+        while (start < n && (tmp[start] == ' ' || tmp[start] == '\t' || tmp[start] == '\r' || tmp[start] == '\n' || tmp[start] == '\v' || tmp[start] == '\f')) {
+            start++;
+        }
+        size_t end = n;
+        while (end > start && (tmp[end - 1] == ' ' || tmp[end - 1] == '\t' || tmp[end - 1] == '\r' || tmp[end - 1] == '\n' || tmp[end - 1] == '\v' || tmp[end - 1] == '\f')) {
+            end--;
+        }
+        if (start > 0 && end > start) {
+            foreach (i; 0 .. (end - start)) tmp[i] = tmp[start + i];
+        }
+        return end - start;
+    }
+
+    void putSanitizedString(const(char)[] s, size_t maxLen = 256) pure {
+        char[512] tmp;
+        auto n = sanitizeToTmp(s, maxLen, tmp);
+        putJsonString(tmp[0 .. n]);
+    }
+
+    void putSanitizedStringOrNull(const(char)[] s, size_t maxLen = 256) pure {
+        char[512] tmp;
+        auto n = sanitizeToTmp(s, maxLen, tmp);
+        if (n == 0) putRaw("null");
+        else putJsonString(tmp[0 .. n]);
+    }
+
+    void putBool(bool b) pure {
+        putRaw(b ? "true" : "false");
+    }
+
+    void putUlong(ulong v) pure {
+        if (v == 0) {
+            putChar('0');
+            return;
+        }
+        char[24] tmp;
+        size_t i = tmp.length;
+        while (v > 0) {
+            tmp[--i] = cast(char)('0' + (v % 10));
+            v /= 10;
+        }
+        putRaw(tmp[i .. $]);
+    }
+
+    void putLong(long v) pure {
+        if (v < 0) {
+            putChar('-');
+            ulong uv = cast(ulong)(-(v + 1)) + 1UL;
+            putUlong(uv);
+        } else {
+            putUlong(cast(ulong) v);
+        }
+    }
+
+    void putDouble(double v) @trusted {
+        import core.stdc.stdio : snprintf;
+        if (isNaN(v) || isInfinity(v)) {
+            putRaw("null");
+            return;
+        }
+        if (v == 0.0) {
+            putChar('0');
+            return;
+        }
+        char[48] tmp;
+        int n = snprintf(tmp.ptr, tmp.length, "%.15g", v);
+        if (n <= 0) {
+            putRaw("null");
+            return;
+        }
+        size_t len = cast(size_t) n;
+        if (len >= tmp.length) len = tmp.length - 1;
+        putRaw(tmp[0 .. len]);
+    }
+
+    void putNullableLong(Nullable!long v) pure {
+        if (v.isNull) putRaw("null");
+        else putLong(v.get);
+    }
+
+    void putNullableUlong(Nullable!ulong v) pure {
+        if (v.isNull) putRaw("null");
+        else putUlong(v.get);
+    }
+
+    void putNullableUint(Nullable!uint v) pure {
+        if (v.isNull) putRaw("null");
+        else putUlong(v.get);
+    }
+
+    void putNullableBool(Nullable!bool v) pure {
+        if (v.isNull) putRaw("null");
+        else putBool(v.get);
+    }
+
+    void putNullableDouble(Nullable!double v) {
+        if (v.isNull || isNaN(v.get) || isInfinity(v.get)) putRaw("null");
+        else putDouble(v.get);
+    }
+}
+
+void writeHardwareSummaryJson(ref JsonBufferWriter w, const ref HardwareSummary hs) @nogc nothrow @safe {
+    w.putRaw(`{"cpu":`);
+    w.putSanitizedStringOrNull(hs.cpu);
+    w.putRaw(`,"ram_bytes":`);
+    w.putNullableUlong(hs.ram_bytes);
+    w.putRaw(`,"system_model":`);
+    w.putSanitizedStringOrNull(hs.system_model);
+    w.putChar('}');
+}
+
+void writeGroupMetaJson(ref JsonBufferWriter w, const ref GroupMeta gm) @nogc nothrow @safe {
+    w.putRaw(`{"status":`);
+    w.putJsonString(cast(string) gm.status);
+    w.putRaw(`,"sampled_at":`);
+    w.putNullableLong(gm.sampled_at);
+    w.putRaw(`,"age_s":`);
+    w.putNullableLong(gm.age_s);
+    w.putRaw(`,"refreshing":`);
+    w.putBool(gm.refreshing);
+    if (!gm.last_success_at.isNull) {
+        w.putRaw(`,"last_success_at":`);
+        w.putLong(gm.last_success_at.get);
+    }
+    if (gm.error.length > 0) {
+        w.putRaw(`,"error":`);
+        w.putSanitizedString(gm.error, 160);
+    }
+    w.putChar('}');
+}
+
+void writeStatusResponseJson(ref JsonBufferWriter w, const ref StatusResponse resp) @nogc nothrow @safe {
+    w.putRaw(`{"app":`);
+    w.putJsonString(resp.app);
+    w.putRaw(`,"schema_version":`);
+    w.putLong(resp.schema_version);
+    w.putRaw(`,"agent_version":`);
+    w.putJsonString(resp.agent_version);
+    w.putRaw(`,"node_id":`);
+    w.putJsonString(resp.node_id);
+    w.putRaw(`,"host":`);
+    w.putSanitizedString(resp.host, 128);
+    w.putRaw(`,"fqdn":`);
+    w.putSanitizedStringOrNull(resp.fqdn, 253);
+    w.putRaw(`,"os":`);
+    w.putJsonString(resp.os);
+    w.putRaw(`,"arch":`);
+    w.putJsonString(resp.arch);
+    w.putRaw(`,"server_ts":`);
+    w.putLong(resp.server_ts);
+    w.putRaw(`,"boot_id":`);
+    w.putSanitizedStringOrNull(resp.boot_id, 128);
+    w.putRaw(`,"uptime_s":`);
+    w.putNullableLong(resp.uptime_s);
+    w.putRaw(`,"hardware_summary":`);
+    if (resp.hardware_summary.isNull) {
+        w.putRaw("null");
+    } else {
+        auto hs = resp.hardware_summary.get;
+        writeHardwareSummaryJson(w, hs);
+    }
+
+    w.putRaw(`,"groups":{`);
+    if (resp.use_fixed_groups) {
+        foreach (i, g; STATUS_PROBE_GROUPS) {
+            if (i > 0) w.putChar(',');
+            w.putKey(cast(string) g);
+            writeGroupMetaJson(w, resp.fixed_groups[i]);
+        }
+    } else {
+        bool firstGrp = true;
+        foreach (k, const ref gm; resp.groups) {
+            if (!firstGrp) w.putChar(',');
+            firstGrp = false;
+            w.putJsonString(k);
+            w.putChar(':');
+            writeGroupMetaJson(w, gm);
+        }
+    }
+    w.putChar('}');
+
+    w.putRaw(`,"cpu":{"pct":`);
+    w.putNullableDouble(resp.cpu.pct);
+    w.putRaw(`,"load_1m":`);
+    w.putNullableDouble(resp.cpu.load_1m);
+    w.putRaw(`,"temp_c":`);
+    w.putNullableDouble(resp.cpu.temp_c);
+    w.putChar('}');
+
+    w.putRaw(`,"memory":{"used_bytes":`);
+    w.putNullableUlong(resp.memory.used_bytes);
+    w.putRaw(`,"total_bytes":`);
+    w.putNullableUlong(resp.memory.total_bytes);
+    w.putRaw(`,"pct":`);
+    w.putNullableDouble(resp.memory.pct);
+    w.putChar('}');
+
+    w.putRaw(`,"swap":`);
+    if (resp.swap.isNull) {
+        w.putRaw("null");
+    } else {
+        w.putRaw(`{"used_bytes":`);
+        w.putNullableUlong(resp.swap.get.used_bytes);
+        w.putRaw(`,"total_bytes":`);
+        w.putNullableUlong(resp.swap.get.total_bytes);
+        w.putRaw(`,"pct":`);
+        w.putNullableDouble(resp.swap.get.pct);
+        w.putChar('}');
+    }
+
+    if (!resp.commit.isNull) {
+        w.putRaw(`,"commit":{"used_bytes":`);
+        w.putNullableUlong(resp.commit.get.used_bytes);
+        w.putRaw(`,"limit_bytes":`);
+        w.putNullableUlong(resp.commit.get.limit_bytes);
+        w.putRaw(`,"pct":`);
+        w.putNullableDouble(resp.commit.get.pct);
+        w.putChar('}');
+    }
+
+    w.putRaw(`,"network":[`);
+    foreach (i, const ref n; resp.network) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"id":`);
+        w.putSanitizedString(n.id, 64);
+        w.putRaw(`,"name":`);
+        w.putSanitizedString(n.name, 64);
+        w.putRaw(`,"kind":`);
+        w.putJsonString(n.kind);
+        w.putRaw(`,"rx_bytes":`);
+        w.putNullableUlong(n.rx_bytes);
+        w.putRaw(`,"tx_bytes":`);
+        w.putNullableUlong(n.tx_bytes);
+        w.putRaw(`,"rx_bytes_per_s":`);
+        w.putNullableDouble(n.rx_bytes_per_s);
+        w.putRaw(`,"tx_bytes_per_s":`);
+        w.putNullableDouble(n.tx_bytes_per_s);
+        if (!n.link_up.isNull) {
+            w.putRaw(`,"link_up":`);
+            w.putBool(n.link_up.get);
+        }
+        if (!n.link_speed_bps.isNull) {
+            w.putRaw(`,"link_speed_bps":`);
+            w.putUlong(n.link_speed_bps.get);
+        }
+        w.putChar('}');
+    }
+    w.putChar(']');
+
+    w.putRaw(`,"mounts":[`);
+    foreach (i, const ref m; resp.mounts) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"mount":`);
+        w.putSanitizedString(m.mount, 512);
+        w.putRaw(`,"source":`);
+        w.putSanitizedString(m.source, 256);
+        w.putRaw(`,"fs":`);
+        w.putSanitizedString(m.fs, 64);
+        w.putRaw(`,"used_bytes":`);
+        w.putNullableUlong(m.used_bytes);
+        w.putRaw(`,"total_bytes":`);
+        w.putNullableUlong(m.total_bytes);
+        w.putRaw(`,"pct":`);
+        w.putNullableDouble(m.pct);
+        w.putChar('}');
+    }
+    w.putChar(']');
+
+    w.putRaw(`,"gpus":[`);
+    foreach (i, const ref g; resp.gpus) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"id":`);
+        w.putSanitizedString(g.id, 64);
+        w.putRaw(`,"display_name":`);
+        w.putSanitizedString(g.display_name, 128);
+        w.putRaw(`,"vendor":`);
+        w.putSanitizedStringOrNull(g.vendor, 64);
+        w.putRaw(`,"utilization_pct":`);
+        w.putNullableDouble(g.utilization_pct);
+        w.putRaw(`,"temp_c":`);
+        w.putNullableDouble(g.temp_c);
+        w.putRaw(`,"vram_used_bytes":`);
+        w.putNullableUlong(g.vram_used_bytes);
+        w.putRaw(`,"vram_total_bytes":`);
+        w.putNullableUlong(g.vram_total_bytes);
+        w.putRaw(`,"power_watts":`);
+        w.putNullableDouble(g.power_watts);
+        w.putRaw(`,"capability":`);
+        w.putJsonString(cast(string) g.capability);
+        if (g.error.length > 0) {
+            w.putRaw(`,"error":`);
+            w.putSanitizedString(g.error, 128);
+        }
+        w.putChar('}');
+    }
+    w.putChar(']');
+
+    w.putRaw(`,"batteries":[`);
+    foreach (i, const ref b; resp.batteries) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"id":`);
+        w.putSanitizedString(b.id, 64);
+        w.putRaw(`,"name":`);
+        w.putSanitizedString(b.name, 64);
+        w.putRaw(`,"status":`);
+        w.putJsonString(b.status);
+        w.putRaw(`,"pct":`);
+        w.putNullableDouble(b.pct);
+        w.putRaw(`,"power_watts":`);
+        w.putNullableDouble(b.power_watts);
+        w.putRaw(`,"time_remaining_s":`);
+        w.putNullableLong(b.time_remaining_s);
+        w.putRaw(`,"health_pct":`);
+        w.putNullableDouble(b.health_pct);
+        w.putRaw(`,"cycle_count":`);
+        w.putNullableUlong(b.cycle_count);
+        w.putRaw(`,"design_capacity_wh":`);
+        w.putNullableDouble(b.design_capacity_wh);
+        w.putRaw(`,"full_charge_capacity_wh":`);
+        w.putNullableDouble(b.full_charge_capacity_wh);
+        w.putChar('}');
+    }
+    w.putChar(']');
+
+    void writeProcArray(const ProcessStatus[] procs) {
+        w.putChar('[');
+        foreach (i, const ref p; procs) {
+            if (i > 0) w.putChar(',');
+            w.putRaw(`{"pid":`);
+            w.putUlong(p.pid);
+            w.putRaw(`,"start_id":`);
+            w.putSanitizedString(p.start_id, 64);
+            w.putRaw(`,"name":`);
+            w.putSanitizedString(p.name, 128);
+            w.putRaw(`,"cpu_pct":`);
+            w.putNullableDouble(p.cpu_pct);
+            w.putRaw(`,"rss_bytes":`);
+            w.putNullableUlong(p.rss_bytes);
+            w.putRaw(`,"memory_kind":`);
+            w.putJsonString(p.memory_kind);
+            w.putChar('}');
+        }
+        w.putChar(']');
+    }
+
+    w.putRaw(`,"top_cpu":`);
+    writeProcArray(resp.top_cpu);
+    w.putRaw(`,"top_mem":`);
+    writeProcArray(resp.top_mem);
+
+    w.putRaw(`,"drift":{"running_kernel":`);
+    w.putSanitizedStringOrNull(resp.drift.running_kernel, 128);
+    w.putRaw(`,"installed_kernel":`);
+    w.putSanitizedStringOrNull(resp.drift.installed_kernel, 128);
+    w.putRaw(`,"reboot_required":`);
+    w.putNullableBool(resp.drift.reboot_required);
+    w.putRaw(`,"pending_updates":`);
+    w.putNullableUint(resp.drift.pending_updates);
+    w.putRaw(`,"package_cache_age_s":`);
+    w.putNullableLong(resp.drift.package_cache_age_s);
+    w.putRaw(`,"hikari_version":`);
+    w.putSanitizedStringOrNull(resp.drift.hikari_version, 64);
+    w.putRaw(`,"caddy_version":`);
+    w.putSanitizedStringOrNull(resp.drift.caddy_version, 64);
+    w.putRaw(`,"tailscale_version":`);
+    w.putSanitizedStringOrNull(resp.drift.tailscale_version, 64);
+    w.putRaw(`}}`);
+}
+
+void writeInfoResponseJson(ref JsonBufferWriter w, const ref InfoResponse ir) @nogc nothrow @safe {
+    w.putRaw(`{"app":`);
+    w.putJsonString(ir.app);
+    w.putRaw(`,"schema_version":`);
+    w.putLong(ir.schema_version);
+    w.putRaw(`,"agent_version":`);
+    w.putJsonString(ir.agent_version);
+    w.putRaw(`,"hikari_version":`);
+    w.putSanitizedStringOrNull(ir.hikari_version, 64);
+    w.putRaw(`,"caddy_version":`);
+    w.putSanitizedStringOrNull(ir.caddy_version, 64);
+    w.putRaw(`,"tailscale_version":`);
+    w.putSanitizedStringOrNull(ir.tailscale_version, 64);
+    w.putRaw(`,"node_id":`);
+    w.putJsonString(ir.node_id);
+    w.putRaw(`,"host":`);
+    w.putSanitizedString(ir.host, 128);
+    w.putRaw(`,"fqdn":`);
+    w.putSanitizedStringOrNull(ir.fqdn, 253);
+    w.putRaw(`,"os":`);
+    w.putJsonString(ir.os);
+    w.putRaw(`,"arch":`);
+    w.putJsonString(ir.arch);
+    w.putRaw(`,"tailnet_port":`);
+    w.putUlong(ir.tailnet_port);
+    w.putRaw(`,"base_path":`);
+    w.putJsonString(ir.base_path.length ? ir.base_path : "/");
+    w.putRaw(`,"server_ts":`);
+    w.putLong(ir.server_ts);
+    w.putRaw(`,"uptime_s":`);
+    w.putNullableLong(ir.uptime_s);
+    w.putRaw(`,"health":`);
+    w.putJsonString(ir.health);
+    w.putRaw(`,"hardware_summary":`);
+    if (ir.hardware_summary.isNull) {
+        w.putRaw("null");
+    } else {
+        auto hs = ir.hardware_summary.get;
+        writeHardwareSummaryJson(w, hs);
+    }
+    w.putChar('}');
+}
+
+void writeHealthResponseJson(ref JsonBufferWriter w, const ref HealthResponse hr) @nogc nothrow @safe {
+    w.putRaw(`{"app":`);
+    w.putJsonString(hr.app);
+    w.putRaw(`,"schema_version":`);
+    w.putLong(hr.schema_version);
+    w.putRaw(`,"agent_version":`);
+    w.putJsonString(hr.agent_version);
+    w.putRaw(`,"status":`);
+    w.putJsonString(hr.status);
+    w.putRaw(`,"node_id":`);
+    w.putJsonString(hr.node_id);
+    w.putRaw(`,"server_ts":`);
+    w.putLong(hr.server_ts);
+    w.putChar('}');
+}
+
+void writeCollectingResponseJson(ref JsonBufferWriter w, const ref CollectingResponse cr) @nogc nothrow @safe {
+    w.putRaw(`{"app":`);
+    w.putJsonString(cr.app);
+    w.putRaw(`,"schema_version":`);
+    w.putLong(cr.schema_version);
+    w.putRaw(`,"status":`);
+    w.putJsonString(cr.status);
+    w.putRaw(`,"retry_after_s":`);
+    w.putUlong(cr.retry_after_s);
+    w.putChar('}');
+}
+
+void writeErrorResponseJson(ref JsonBufferWriter w, const(char)[] errCode, const(char)[] message, const GroupMeta[string] groups = null) @nogc nothrow @safe {
+    w.putRaw(`{"app":"hikari","schema_version":`);
+    w.putLong(SCHEMA_VERSION);
+    w.putRaw(`,"status":"error","error":`);
+    w.putSanitizedString(errCode, 64);
+    w.putRaw(`,"message":`);
+    w.putSanitizedString(message, 256);
+    if (groups !is null) {
+        w.putRaw(`,"groups":{`);
+        bool first = true;
+        foreach (k, const ref gm; groups) {
+            if (!first) w.putChar(',');
+            first = false;
+            w.putJsonString(k);
+            w.putChar(':');
+            writeGroupMetaJson(w, gm);
+        }
+        w.putChar('}');
+    }
+    w.putChar('}');
+}
+
+void writeErrorResponseFixedGroupsJson(ref JsonBufferWriter w, const(char)[] errCode, const(char)[] message, const ref GroupMeta[5] fixedGroups) @nogc nothrow @safe {
+    w.putRaw(`{"app":"hikari","schema_version":`);
+    w.putLong(SCHEMA_VERSION);
+    w.putRaw(`,"status":"error","error":`);
+    w.putSanitizedString(errCode, 64);
+    w.putRaw(`,"message":`);
+    w.putSanitizedString(message, 256);
+    w.putRaw(`,"groups":{`);
+    foreach (i, g; STATUS_PROBE_GROUPS) {
+        if (i > 0) w.putChar(',');
+        w.putKey(cast(string) g);
+        writeGroupMetaJson(w, fixedGroups[i]);
+    }
+    w.putRaw(`}}`);
+}
+
+void writeNodesResponseJson(ref JsonBufferWriter w, const ref NodesResponse nr) @nogc nothrow @safe {
+    w.putRaw(`{"schema_version":`);
+    w.putLong(nr.schema_version);
+    w.putRaw(`,"generated_at":`);
+    w.putLong(nr.generated_at);
+    w.putRaw(`,"nodes":[`);
+    foreach (i, const ref n; nr.nodes) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"node_id":`);
+        w.putJsonString(n.node_id);
+        w.putRaw(`,"tailscale_node_id":`);
+        w.putSanitizedStringOrNull(n.tailscale_node_id, 64);
+        w.putRaw(`,"name":`);
+        w.putSanitizedString(n.name, 128);
+        w.putRaw(`,"alias":`);
+        w.putSanitizedStringOrNull(n.alias_name, 128);
+        w.putRaw(`,"fqdn":`);
+        w.putSanitizedStringOrNull(n.fqdn, 253);
+        w.putRaw(`,"status_url":`);
+        w.putSanitizedStringOrNull(n.status_url, 512);
+        w.putRaw(`,"hardware_url":`);
+        w.putSanitizedStringOrNull(n.hardware_url, 512);
+        w.putRaw(`,"info_url":`);
+        w.putSanitizedStringOrNull(n.info_url, 512);
+        w.putRaw(`,"tailnet_port":`);
+        w.putUlong(n.tailnet_port);
+        w.putRaw(`,"base_path":`);
+        w.putJsonString(n.base_path.length ? n.base_path : "/");
+        w.putRaw(`,"os":`);
+        w.putSanitizedStringOrNull(n.os, 32);
+        w.putRaw(`,"arch":`);
+        w.putSanitizedStringOrNull(n.arch, 32);
+        w.putRaw(`,"is_self":`);
+        w.putBool(n.is_self);
+        w.putRaw(`,"tailscale_online":`);
+        w.putNullableBool(n.tailscale_online);
+        w.putRaw(`,"discovery_state":`);
+        w.putJsonString(n.discovery_state);
+        w.putRaw(`,"last_seen_ts":`);
+        w.putNullableLong(n.last_seen_ts);
+        w.putRaw(`,"last_success_ts":`);
+        w.putNullableLong(n.last_success_ts);
+        w.putRaw(`,"last_known_hardware_summary":`);
+        if (n.last_known_hardware_summary.isNull) {
+            w.putRaw("null");
+        } else {
+            auto hs = n.last_known_hardware_summary.get;
+            writeHardwareSummaryJson(w, hs);
+        }
+        w.putRaw(`,"hidden":`);
+        w.putBool(n.hidden);
+        w.putChar('}');
+    }
+    w.putChar(']');
+    if (!nr.discovery.isNull) {
+        auto d = nr.discovery.get;
+        w.putRaw(`,"discovery":{"running":`);
+        w.putBool(d.running);
+        w.putRaw(`,"last_started_at":`);
+        w.putNullableLong(d.last_started_at);
+        w.putRaw(`,"last_finished_at":`);
+        w.putNullableLong(d.last_finished_at);
+        w.putRaw(`,"tailscale_available":`);
+        w.putBool(d.tailscale_available);
+        w.putChar('}');
+    }
+    w.putChar('}');
+}

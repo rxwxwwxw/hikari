@@ -33,7 +33,7 @@ struct GroupTtlMap {
     long maintenance = 43200;
     long hardware = 604800;
 
-    long get(ProbeGroup g) const pure nothrow @safe {
+    long get(ProbeGroup g) const pure nothrow @nogc @safe {
         final switch (g) {
             case ProbeGroup.fast: return fast;
             case ProbeGroup.processes: return processes;
@@ -55,7 +55,7 @@ struct GroupMaxStaleMap {
     long maintenance = 604800;
     long hardware = 2592000;
 
-    long get(ProbeGroup g) const pure nothrow @safe {
+    long get(ProbeGroup g) const pure nothrow @nogc @safe {
         final switch (g) {
             case ProbeGroup.fast: return fast;
             case ProbeGroup.processes: return processes;

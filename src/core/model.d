@@ -15,6 +15,14 @@ enum ProbeGroup : string {
     hardware = "hardware",
 }
 
+static immutable ProbeGroup[5] STATUS_PROBE_GROUPS = [
+    ProbeGroup.fast,
+    ProbeGroup.processes,
+    ProbeGroup.device_dynamic,
+    ProbeGroup.filesystems,
+    ProbeGroup.maintenance,
+];
+
 enum GroupStatus : string {
     uninitialized = "uninitialized",
     fresh = "fresh",
@@ -156,6 +164,8 @@ struct StatusResponse {
     Nullable!long uptime_s;
     Nullable!HardwareSummary hardware_summary;
     GroupMeta[string] groups;
+    bool use_fixed_groups = false;
+    GroupMeta[5] fixed_groups;
     CpuStatus cpu;
     MemoryStatus memory;
     Nullable!SwapStatus swap;

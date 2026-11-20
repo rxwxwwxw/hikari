@@ -1,7 +1,10 @@
 module platform.linux;
 
+import core.limits;
 import core.model;
 import core.serializer : sanitizeOsString;
+import core.sync.mutex : Mutex;
+import core.tracker : FixedString;
 import hardware.inventory;
 import hardware.isa_names;
 import platform.api;
@@ -20,12 +23,141 @@ import std.string : endsWith, indexOf, lastIndexOf, replace, strip, toLower;
 import std.typecons : Nullable;
 
 version (Posix) {
+    import core.stdc.string : memmove, strlen;
+    import core.sys.posix.dirent : closedir, DIR, dirent, opendir, readdir;
+    import core.sys.posix.fcntl : O_RDONLY, posixOpen = open;
+    import core.sys.posix.sys.stat : posixStat = stat, S_ISDIR, stat_t;
     import core.sys.posix.sys.statvfs : statvfs, statvfs_t;
     import core.sys.posix.sys.utsname : uname, utsname;
-    import core.sys.posix.unistd : _SC_CLK_TCK, _SC_PAGESIZE, sysconf;
+    import core.sys.posix.unistd : _SC_CLK_TCK, _SC_PAGESIZE, F_OK, posixAccess = access, posixClose = close, posixRead = read, sysconf;
 }
 
 alias StatvfsFn = bool delegate(string mountPath, out ulong totalBytes, out ulong usedBytes);
+
+private struct PathBuf(size_t N = 512) {
+    char[N] buf = void;
+    size_t len = 0;
+
+    nothrow @nogc @safe:
+
+    void clear() {
+        len = 0;
+        buf[0] = '\0';
+    }
+
+    bool put(const(char)[] s) {
+        if (len + s.length >= N) return false;
+        if (s.length > 0) {
+            buf[len .. len + s.length] = s[];
+            len += s.length;
+        }
+        buf[len] = '\0';
+        return true;
+    }
+
+    bool putUint(ulong v) {
+        char[24] tmp = void;
+        size_t p = 0;
+        do {
+            tmp[p++] = cast(char)('0' + (v % 10));
+            v /= 10;
+        } while (v > 0);
+        if (len + p >= N) return false;
+        foreach (i; 0 .. p) {
+            buf[len++] = tmp[p - 1 - i];
+        }
+        buf[len] = '\0';
+        return true;
+    }
+
+    const(char)[] slice() const return {
+        return buf[0 .. len];
+    }
+
+    const(char)* ptr() const return @trusted {
+        return len == 0 ? "".ptr : buf.ptr;
+    }
+}
+
+version (Posix) {
+    private struct PosixLineReader(size_t BUF_SIZE = 4096) {
+        int fd = -1;
+        char[BUF_SIZE] buf = void;
+        size_t cursor = 0;
+        size_t filled = 0;
+        bool eof = false;
+        bool hadBytes = false;
+
+        nothrow @trusted:
+
+        bool open(const(char)* pathZ) {
+            close();
+            if (pathZ is null) return false;
+            fd = posixOpen(pathZ, O_RDONLY);
+            cursor = 0;
+            filled = 0;
+            eof = false;
+            hadBytes = false;
+            return fd >= 0;
+        }
+
+        void close() {
+            if (fd >= 0) {
+                posixClose(fd);
+                fd = -1;
+            }
+        }
+
+        bool nextLine(out const(char)[] line) {
+            line = null;
+            if (fd < 0) return false;
+
+            while (true) {
+                foreach (i; cursor .. filled) {
+                    if (buf[i] == '\n') {
+                        size_t end = i;
+                        if (end > cursor && buf[end - 1] == '\r') end--;
+                        line = buf[cursor .. end];
+                        cursor = i + 1;
+                        return true;
+                    }
+                }
+
+                if (eof) {
+                    if (cursor < filled) {
+                        size_t end = filled;
+                        if (end > cursor && buf[end - 1] == '\r') end--;
+                        line = buf[cursor .. end];
+                        cursor = filled;
+                        return true;
+                    }
+                    return false;
+                }
+
+                size_t rem = filled - cursor;
+                if (rem == BUF_SIZE) {
+                    // Single line longer than BUF_SIZE: yield chunk to guarantee forward progress.
+                    line = buf[0 .. BUF_SIZE];
+                    cursor = BUF_SIZE;
+                    return true;
+                }
+                if (rem > 0 && cursor > 0) {
+                    memmove(buf.ptr, buf.ptr + cursor, rem);
+                }
+                cursor = 0;
+                filled = rem;
+
+                auto n = posixRead(fd, buf.ptr + filled, BUF_SIZE - filled);
+                if (n <= 0) {
+                    eof = true;
+                } else {
+                    hadBytes = true;
+                    filled += cast(size_t) n;
+                }
+            }
+        }
+    }
+}
 
 class LinuxPlatformBackend : PlatformBackend {
     string procRoot;
@@ -39,6 +171,40 @@ class LinuxPlatformBackend : PlatformBackend {
     private NvmlLoader nvml;
     private PciIdLookup pciIds;
     private bool pciIdsLoaded = false;
+
+    // Thread-safe identity cache (boot_id / host only allocate if changed from cached value)
+    private Mutex idMtx;
+    private FixedString!128 idHostStore;
+    private string idHostCached;
+    private FixedString!128 idBootStore;
+    private string idBootCached;
+    private FixedString!64 idArchStore;
+    private string idArchCached;
+
+    // Preallocated buffers for single-group periodic/on-demand probes (fast, processes, filesystems, gpu, battery, maintenance)
+    private RawNetworkInterface[MAX_NETWORK_INTERFACES] netBuf;
+    private FixedString!64[MAX_NETWORK_INTERFACES] netIdStore;
+    private FixedString!64[MAX_NETWORK_INTERFACES] netNameStore;
+
+    private RawProcess[MAX_TRACKED_PROCESSES] procBuf;
+    private FixedString!64[MAX_TRACKED_PROCESSES] procStartStore;
+    private FixedString!128[MAX_TRACKED_PROCESSES] procNameStore;
+
+    private MountStatus[MAX_FILESYSTEM_MOUNTS] mountBuf;
+    private FixedString!512[MAX_FILESYSTEM_MOUNTS] mountPathStore;
+    private FixedString!512[MAX_FILESYSTEM_MOUNTS] mountSrcStore;
+    private FixedString!64[MAX_FILESYSTEM_MOUNTS] mountFsStore;
+    private FixedString!256[MAX_FILESYSTEM_MOUNTS] mountDedupKeyStore;
+
+    private GpuDynamicStatus[MAX_GPUS] gpuBuf;
+    private FixedString!64[MAX_GPUS] gpuIdStore;
+    private FixedString!128[MAX_GPUS] gpuNameStore;
+
+    private BatteryStatus[MAX_BATTERIES] batBuf;
+    private FixedString!64[MAX_BATTERIES] batIdStore;
+
+    private FixedString!128 maintKernelStore;
+    private FixedString!128 maintInstalledKernelStore;
 
     this(
         string procRoot = "/proc",
@@ -57,10 +223,219 @@ class LinuxPlatformBackend : PlatformBackend {
         this.exposeMacAddresses = exposeMacAddresses;
         this.statvfsHook = statvfsHook;
         this.nvml = new NvmlLoader();
+        this.idMtx = new Mutex();
     }
 
     private bool isRealHost() const pure nothrow @safe {
         return procRoot == "/proc" && sysRoot == "/sys";
+    }
+
+    private static bool isAsciiSpace(char c) pure nothrow @nogc @safe {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    }
+
+    private static const(char)[] trimAscii(const(char)[] s) pure nothrow @nogc @safe {
+        size_t start = 0;
+        while (start < s.length && isAsciiSpace(s[start])) start++;
+        size_t end = s.length;
+        while (end > start && isAsciiSpace(s[end - 1])) end--;
+        return s[start .. end];
+    }
+
+    private static char toAsciiLower(char c) pure nothrow @nogc @safe {
+        return (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
+    }
+
+    private static bool equalsIgnoreCase(const(char)[] a, const(char)[] b) pure nothrow @nogc @safe {
+        if (a.length != b.length) return false;
+        foreach (i; 0 .. a.length) {
+            if (toAsciiLower(a[i]) != toAsciiLower(b[i])) return false;
+        }
+        return true;
+    }
+
+    private static bool startsWithAscii(const(char)[] s, const(char)[] prefix) pure nothrow @nogc @safe {
+        return s.length >= prefix.length && s[0 .. prefix.length] == prefix;
+    }
+
+    private static bool startsWithIgnoreCase(const(char)[] s, const(char)[] prefix) pure nothrow @nogc @safe {
+        return s.length >= prefix.length && equalsIgnoreCase(s[0 .. prefix.length], prefix);
+    }
+
+    private static bool containsIgnoreCase(const(char)[] hay, const(char)[] needle) pure nothrow @nogc @safe {
+        if (needle.length == 0) return true;
+        if (hay.length < needle.length) return false;
+        foreach (i; 0 .. hay.length - needle.length + 1) {
+            if (equalsIgnoreCase(hay[i .. i + needle.length], needle)) return true;
+        }
+        return false;
+    }
+
+    private static ptrdiff_t indexOfChar(const(char)[] s, char ch) pure nothrow @nogc @safe {
+        foreach (i, char c; s) {
+            if (c == ch) return cast(ptrdiff_t) i;
+        }
+        return -1;
+    }
+
+    private static ptrdiff_t indexOfSlice(const(char)[] hay, const(char)[] needle) pure nothrow @nogc @safe {
+        if (needle.length == 0) return 0;
+        if (hay.length < needle.length) return -1;
+        foreach (i; 0 .. hay.length - needle.length + 1) {
+            if (hay[i .. i + needle.length] == needle) return cast(ptrdiff_t) i;
+        }
+        return -1;
+    }
+
+    private static bool nextToken(const(char)[] s, ref size_t pos, out const(char)[] tok) pure nothrow @nogc @safe {
+        while (pos < s.length && isAsciiSpace(s[pos])) pos++;
+        if (pos >= s.length) {
+            tok = null;
+            return false;
+        }
+        size_t start = pos;
+        while (pos < s.length && !isAsciiSpace(s[pos])) pos++;
+        tok = s[start .. pos];
+        return true;
+    }
+
+    private static bool parseI64Token(const(char)[] tok, out long val) pure nothrow @safe {
+        if (tok.length == 0) return false;
+        size_t i = 0;
+        bool neg = false;
+        if (tok[0] == '-') {
+            neg = true;
+            i = 1;
+        } else if (tok[0] == '+') {
+            i = 1;
+        }
+        if (i >= tok.length) return false;
+        ulong acc = 0;
+        ulong limit = neg ? (cast(ulong) long.max + 1) : cast(ulong) long.max;
+        foreach (char c; tok[i .. $]) {
+            if (c < '0' || c > '9') return false;
+            ulong d = cast(ulong)(c - '0');
+            if (acc > (limit - d) / 10) return false;
+            acc = acc * 10 + d;
+        }
+        val = neg ? (acc == cast(ulong) long.max + 1 ? long.min : -cast(long) acc) : cast(long) acc;
+        return true;
+    }
+
+    private static bool parseDoubleToken(const(char)[] tok, out double val) pure nothrow @safe {
+        if (tok.length == 0) return false;
+        size_t i = 0;
+        bool neg = false;
+        if (tok[0] == '-') {
+            neg = true;
+            i = 1;
+        } else if (tok[0] == '+') {
+            i = 1;
+        }
+        if (i >= tok.length) return false;
+
+        double acc = 0.0;
+        bool anyDigit = false;
+        while (i < tok.length && tok[i] >= '0' && tok[i] <= '9') {
+            anyDigit = true;
+            acc = acc * 10.0 + cast(double)(tok[i] - '0');
+            i++;
+        }
+        if (i < tok.length && tok[i] == '.') {
+            i++;
+            double fracScale = 0.1;
+            while (i < tok.length && tok[i] >= '0' && tok[i] <= '9') {
+                anyDigit = true;
+                acc += cast(double)(tok[i] - '0') * fracScale;
+                fracScale *= 0.1;
+                i++;
+            }
+        }
+        if (!anyDigit) return false;
+
+        if (i < tok.length && (tok[i] == 'e' || tok[i] == 'E')) {
+            i++;
+            bool expNeg = false;
+            if (i < tok.length && (tok[i] == '-' || tok[i] == '+')) {
+                expNeg = (tok[i] == '-');
+                i++;
+            }
+            if (i >= tok.length || tok[i] < '0' || tok[i] > '9') return false;
+            int exp = 0;
+            while (i < tok.length && tok[i] >= '0' && tok[i] <= '9') {
+                if (exp < 1000) exp = exp * 10 + (tok[i] - '0');
+                i++;
+            }
+            double scale = 1.0;
+            foreach (_; 0 .. exp) scale *= 10.0;
+            acc = expNeg ? (acc / scale) : (acc * scale);
+        }
+
+        if (i != tok.length) return false;
+        val = neg ? -acc : acc;
+        return true;
+    }
+
+    private static void sanitizeInto(size_t N)(ref FixedString!N dst, const(char)[] raw, size_t maxLen = N) pure nothrow @safe {
+        dst.clear();
+        if (raw.length == 0) return;
+        size_t limit = maxLen < N ? maxLen : N;
+
+        if (raw.length <= limit) {
+            auto trimmed = trimAscii(raw);
+            if (trimmed.length == 0) return;
+            bool clean = true;
+            foreach (char c; trimmed) {
+                ubyte b = cast(ubyte) c;
+                if (b < 0x20 || b == 0x7F) {
+                    clean = false;
+                    break;
+                }
+            }
+            if (clean) {
+                dst.set(trimmed);
+                return;
+            }
+        }
+
+        char[N] tmp = void;
+        size_t tmpLen = 0;
+        bool prevSpace = false;
+        foreach (char c; raw) {
+            ubyte b = cast(ubyte) c;
+            if (b == '\r' || b == '\n' || b == '\t') {
+                if (!prevSpace && tmpLen > 0) {
+                    tmp[tmpLen++] = ' ';
+                    prevSpace = true;
+                }
+                if (tmpLen >= limit) break;
+                continue;
+            }
+            if (b < 0x20 || b == 0x7F) continue;
+            tmp[tmpLen++] = c;
+            prevSpace = (c == ' ');
+            if (tmpLen >= limit) break;
+        }
+        auto res = trimAscii(tmp[0 .. tmpLen]);
+        if (res.length > 0) dst.set(res);
+    }
+
+    private static const(char)[] readStackFile(ref PathBuf!512 path, char[] dst, bool stripWs = true) nothrow @trusted {
+        version (Posix) {
+            int fd = posixOpen(path.ptr, O_RDONLY);
+            if (fd < 0) return null;
+            scope (exit) posixClose(fd);
+            size_t total = 0;
+            while (total < dst.length) {
+                auto n = posixRead(fd, dst.ptr + total, dst.length - total);
+                if (n <= 0) break;
+                total += cast(size_t) n;
+            }
+            auto s = cast(const(char)[]) dst[0 .. total];
+            return stripWs ? trimAscii(s) : s;
+        } else {
+            return null;
+        }
     }
 
     private string safeReadText(string path) const {
@@ -115,22 +490,40 @@ class LinuxPlatformBackend : PlatformBackend {
     }
 
     private string detectArch() const {
-        if (!isRealHost()) {
-            auto ci = safeReadText(procRoot ~ "/cpuinfo").toLower();
-            if (ci.canFind("aarch64") || ci.canFind("cortex-") || ci.canFind("asimd") || ci.canFind("cpu architecture: 8")) {
-                return "aarch64";
-            }
-            if (ci.canFind("x86_64") || ci.canFind("lm ") || ci.canFind("authenticamd") || ci.canFind("genuineintel")) {
-                return "x86_64";
-            }
-        }
         version (Posix) {
+            if (!isRealHost()) {
+                PathBuf!512 p;
+                p.put(procRoot);
+                p.put("/cpuinfo");
+                PosixLineReader!2048 reader;
+                if (reader.open(p.ptr)) {
+                    scope (exit) reader.close();
+                    const(char)[] line;
+                    bool foundX86 = false;
+                    while (reader.nextLine(line)) {
+                        if (containsIgnoreCase(line, "aarch64") || containsIgnoreCase(line, "cortex-")
+                            || containsIgnoreCase(line, "asimd") || containsIgnoreCase(line, "cpu architecture: 8")) {
+                            return "aarch64";
+                        }
+                        if (containsIgnoreCase(line, "x86_64") || containsIgnoreCase(line, "lm ")
+                            || containsIgnoreCase(line, "authenticamd") || containsIgnoreCase(line, "genuineintel")) {
+                            foundX86 = true;
+                        }
+                    }
+                    if (foundX86) return "x86_64";
+                }
+            }
             utsname u;
             if (uname(&u) == 0) {
-                import std.string : fromStringz;
-                auto m = fromStringz(u.machine.ptr).idup;
-                if (m == "arm64") return "aarch64";
-                if (m.length > 0) return m;
+                const(char)[] m = u.machine[0 .. strlen(u.machine.ptr)];
+                if (m == "x86_64") return "x86_64";
+                if (m == "aarch64" || m == "arm64") return "aarch64";
+                if (m == "i686") return "i686";
+                if (m == "armv7l") return "armv7l";
+                if (m == "riscv64") return "riscv64";
+                if (m == "ppc64le") return "ppc64le";
+                if (m == "s390x") return "s390x";
+                if (m.length > 0) return m.idup;
             }
         }
         version (X86_64) return "x86_64";
@@ -141,32 +534,76 @@ class LinuxPlatformBackend : PlatformBackend {
     override PlatformIdentity identity() {
         PlatformIdentity id;
         id.os = "linux";
-        id.arch = detectArch();
 
-        if (!isRealHost()) {
-            id.host = sanitizeOsString(safeReadText(procRoot ~ "/sys/kernel/hostname"), 128);
-        }
-        if (id.host.length == 0) {
-            version (Posix) {
+        auto arch = detectArch();
+        FixedString!128 cleanHost;
+        FixedString!128 cleanBoot;
+        char[256] tmp = void;
+
+        version (Posix) {
+            PathBuf!512 p;
+            if (!isRealHost()) {
+                p.clear();
+                p.put(procRoot);
+                p.put("/sys/kernel/hostname");
+                auto h = readStackFile(p, tmp);
+                sanitizeInto(cleanHost, h, 128);
+            }
+            if (cleanHost.len == 0) {
                 utsname u;
                 if (uname(&u) == 0) {
-                    import std.string : fromStringz;
-                    id.host = sanitizeOsString(fromStringz(u.nodename.ptr).idup, 128);
+                    const(char)[] nodename = u.nodename[0 .. strlen(u.nodename.ptr)];
+                    sanitizeInto(cleanHost, nodename, 128);
+                }
+            }
+
+            p.clear();
+            p.put(procRoot);
+            p.put("/sys/kernel/random/boot_id");
+            auto bi = readStackFile(p, tmp);
+            sanitizeInto(cleanBoot, bi, 128);
+
+            p.clear();
+            p.put(procRoot);
+            p.put("/uptime");
+            auto upTxt = readStackFile(p, tmp);
+            if (upTxt.length > 0) {
+                size_t pos = 0;
+                const(char)[] tok;
+                double upSec;
+                if (nextToken(upTxt, pos, tok) && parseDoubleToken(tok, upSec)) {
+                    id.uptime_s = cast(long) upSec;
                 }
             }
         }
-        if (id.host.length == 0) id.host = "linux-host";
 
-        id.boot_id = sanitizeOsString(safeReadText(procRoot ~ "/sys/kernel/random/boot_id"), 128);
-        if (id.boot_id.length == 0) id.boot_id = "unknown-boot";
+        synchronized (idMtx) {
+            if (idArchCached.length > 0 && idArchStore.equals(arch)) {
+                id.arch = idArchCached;
+            } else {
+                idArchStore.set(arch);
+                idArchCached = arch;
+                id.arch = arch;
+            }
 
-        auto upTxt = safeReadText(procRoot ~ "/uptime");
-        if (upTxt.length > 0) {
-            auto parts = upTxt.split();
-            if (parts.length >= 1) {
-                try {
-                    id.uptime_s = cast(long) to!double(parts[0]);
-                } catch (Exception) {}
+            if (cleanHost.len == 0) {
+                id.host = "linux-host";
+            } else if (idHostCached.length > 0 && idHostStore == cleanHost) {
+                id.host = idHostCached;
+            } else {
+                idHostStore = cleanHost;
+                idHostCached = cleanHost.slice().idup;
+                id.host = idHostCached;
+            }
+
+            if (cleanBoot.len == 0) {
+                id.boot_id = "unknown-boot";
+            } else if (idBootCached.length > 0 && idBootStore == cleanBoot) {
+                id.boot_id = idBootCached;
+            } else {
+                idBootStore = cleanBoot;
+                idBootCached = cleanBoot.slice().idup;
+                id.boot_id = idBootCached;
             }
         }
         return id;
@@ -174,213 +611,360 @@ class LinuxPlatformBackend : PlatformBackend {
 
     override RawCpu sampleCpu() {
         RawCpu c;
-        auto statTxt = safeReadText(procRoot ~ "/stat");
-        if (statTxt.length == 0) {
-            c.state = CapabilityState.error;
-            c.error = "proc_stat_unreadable";
-            return c;
-        }
-
-        bool foundAgg = false;
-        uint cores = 0;
-        foreach (line; statTxt.split('\n')) {
-            auto s = line.strip();
-            if (s.startsWith("cpu ")) {
-                auto parts = s.split();
-                if (parts.length >= 5) {
-                    ulong[10] vals;
-                    size_t n = parts.length - 1;
-                    if (n > 8) n = 8; // user, nice, system, idle, iowait, irq, softirq, steal (exclude guest/guest_nice already in user/nice)
-                    foreach (i; 0 .. n) {
-                        try {
-                            vals[i] = to!ulong(parts[i + 1]);
-                        } catch (Exception) {
-                            vals[i] = 0;
+        version (Posix) {
+            PathBuf!512 p;
+            p.put(procRoot);
+            p.put("/stat");
+            PosixLineReader!4096 reader;
+            if (!reader.open(p.ptr)) {
+                c.state = CapabilityState.error;
+                c.error = "proc_stat_unreadable";
+                return c;
+            }
+            bool foundAgg = false;
+            uint cores = 0;
+            {
+                scope (exit) reader.close();
+                const(char)[] line;
+                while (reader.nextLine(line)) {
+                    auto s = trimAscii(line);
+                    if (startsWithAscii(s, "cpu ")) {
+                        size_t pos = 0;
+                        const(char)[] tok;
+                        nextToken(s, pos, tok); // "cpu"
+                        ulong[8] vals = 0;
+                        size_t n = 0;
+                        while (n < 8 && nextToken(s, pos, tok)) {
+                            ulong v = 0;
+                            if (parseU64Token(tok, v)) {
+                                vals[n] = v;
+                            } else {
+                                vals[n] = 0;
+                            }
+                            n++;
                         }
+                        if (n >= 4) {
+                            ulong total = 0;
+                            foreach (i; 0 .. n) total += vals[i];
+                            ulong idle = vals[3] + (n > 4 ? vals[4] : 0);
+                            c.total_ticks = total;
+                            c.idle_ticks = idle;
+                            foundAgg = true;
+                        }
+                    } else if (startsWithAscii(s, "cpu") && s.length > 3 && s[3] >= '0' && s[3] <= '9') {
+                        cores++;
                     }
-                    ulong total = 0;
-                    foreach (i; 0 .. n) total += vals[i];
-                    ulong idle = vals[3] + (n > 4 ? vals[4] : 0);
-                    c.total_ticks = total;
-                    c.idle_ticks = idle;
-                    foundAgg = true;
                 }
-            } else if (s.startsWith("cpu") && s.length > 3 && s[3] >= '0' && s[3] <= '9') {
-                cores++;
             }
-        }
 
-        if (!foundAgg) {
-            c.state = CapabilityState.error;
-            c.error = "proc_stat_missing_cpu_line";
+            if (!reader.hadBytes) {
+                c.state = CapabilityState.error;
+                c.error = "proc_stat_unreadable";
+                return c;
+            }
+            if (!foundAgg) {
+                c.state = CapabilityState.error;
+                c.error = "proc_stat_missing_cpu_line";
+                return c;
+            }
+            c.logical_cores = cores > 0 ? cores : 1;
+
+            p.clear();
+            p.put(procRoot);
+            p.put("/loadavg");
+            char[256] loadBuf = void;
+            auto loadTxt = readStackFile(p, loadBuf);
+            if (loadTxt.length > 0) {
+                size_t pos = 0;
+                const(char)[] tok;
+                double l1;
+                if (nextToken(loadTxt, pos, tok) && parseDoubleToken(tok, l1)) {
+                    c.load_1m = l1;
+                }
+            }
+
+            c.temp_c = sampleCpuTemp();
+            c.state = CapabilityState.ok;
+            return c;
+        } else {
+            c.state = CapabilityState.unsupported;
             return c;
         }
-        c.logical_cores = cores > 0 ? cores : 1;
-
-        auto loadTxt = safeReadText(procRoot ~ "/loadavg");
-        if (loadTxt.length > 0) {
-            auto parts = loadTxt.split();
-            if (parts.length >= 1) {
-                try {
-                    c.load_1m = to!double(parts[0]);
-                } catch (Exception) {}
-            }
-        }
-
-        c.temp_c = sampleCpuTemp();
-        c.state = CapabilityState.ok;
-        return c;
     }
 
     private Nullable!double sampleCpuTemp() const {
         Nullable!double res;
-        auto hwmonDir = sysRoot ~ "/class/hwmon";
-        if (!exists(hwmonDir)) return res;
+        version (Posix) {
+            static immutable string[] preferredNames = ["k10temp", "zenpower", "coretemp", "cpu_thermal", "soc_thermal", "x86_pkg_temp"];
+            PathBuf!512 hwmonDir;
+            hwmonDir.put(sysRoot);
+            hwmonDir.put("/class/hwmon");
+            DIR* dir = opendir(hwmonDir.ptr);
+            if (dir is null) return res;
+            scope (exit) closedir(dir);
 
-        static immutable string[] preferredNames = ["k10temp", "zenpower", "coretemp", "cpu_thermal", "soc_thermal", "x86_pkg_temp"];
-        try {
-            foreach (DirEntry de; dirEntries(hwmonDir, SpanMode.shallow)) {
-                auto name = safeReadText(de.name ~ "/name").toLower();
-                if (!preferredNames.canFind(name)) continue;
+            PathBuf!512 p;
+            char[64] buf = void;
+            dirent* ent;
+            while ((ent = readdir(dir)) !is null) {
+                auto dname = ent.d_name[0 .. strlen(ent.d_name.ptr)];
+                if (dname == "." || dname == "..") continue;
 
-                // Look for temp1_input or preferred package/Tdie/Tctl label
-                foreach (idx; 1 .. 6) {
-                    auto tempPath = de.name ~ "/temp" ~ to!string(idx) ~ "_input";
-                    auto raw = safeReadText(tempPath);
+                p.clear();
+                p.put(sysRoot);
+                p.put("/class/hwmon/");
+                p.put(dname);
+                p.put("/name");
+                auto name = readStackFile(p, buf);
+                if (name.length == 0) continue;
+
+                bool preferred = false;
+                foreach (pn; preferredNames) {
+                    if (equalsIgnoreCase(name, pn)) {
+                        preferred = true;
+                        break;
+                    }
+                }
+                if (!preferred) continue;
+
+                foreach (ulong idx; 1 .. 6) {
+                    p.clear();
+                    p.put(sysRoot);
+                    p.put("/class/hwmon/");
+                    p.put(dname);
+                    p.put("/temp");
+                    p.putUint(idx);
+                    p.put("_input");
+                    auto raw = readStackFile(p, buf);
                     if (raw.length == 0) continue;
-                    try {
-                        long milli = to!long(raw);
-                        if (milli > -40_000 && milli < 150_000) {
-                            res = cast(double) milli / 1000.0;
-                            return res;
-                        }
-                    } catch (Exception) {}
+                    long milli;
+                    if (parseI64Token(raw, milli) && milli > -40_000 && milli < 150_000) {
+                        res = cast(double) milli / 1000.0;
+                        return res;
+                    }
                 }
             }
-        } catch (Exception) {}
+        }
         return res;
     }
 
     override RawMemory sampleMemory() {
         RawMemory m;
-        auto txt = safeReadText(procRoot ~ "/meminfo");
-        if (txt.length == 0) {
-            m.state = CapabilityState.error;
-            m.error = "proc_meminfo_unreadable";
-            return m;
-        }
-
-        ulong[string] kb;
-        foreach (line; txt.split('\n')) {
-            auto colon = line.indexOf(':');
-            if (colon <= 0) continue;
-            auto key = line[0 .. colon].strip();
-            auto rest = line[colon + 1 .. $].strip().split();
-            if (rest.length == 0) continue;
-            try {
-                kb[key] = to!ulong(rest[0]);
-            } catch (Exception) {}
-        }
-
-        if (auto pt = "MemTotal" in kb) {
-            ulong total = (*pt) * 1024UL;
-            m.total_bytes = total;
-            if (auto pa = "MemAvailable" in kb) {
-                ulong avail = (*pa) * 1024UL;
-                m.used_bytes = total > avail ? (total - avail) : 0;
-            } else {
-                ulong freeB = (("MemFree" in kb) ? kb["MemFree"] : 0) * 1024UL;
-                ulong bufB = (("Buffers" in kb) ? kb["Buffers"] : 0) * 1024UL;
-                ulong cacheB = (("Cached" in kb) ? kb["Cached"] : 0) * 1024UL;
-                ulong freeTotal = freeB + bufB + cacheB;
-                m.used_bytes = total > freeTotal ? (total - freeTotal) : 0;
+        version (Posix) {
+            PathBuf!512 p;
+            p.put(procRoot);
+            p.put("/meminfo");
+            PosixLineReader!4096 reader;
+            if (!reader.open(p.ptr)) {
+                m.state = CapabilityState.error;
+                m.error = "proc_meminfo_unreadable";
+                return m;
             }
+
+            bool hasTotal = false, hasAvail = false, hasFree = false, hasBuf = false, hasCache = false, hasSwapTotal = false, hasSwapFree = false;
+            ulong memTotalKb = 0, memAvailKb = 0, memFreeKb = 0, buffersKb = 0, cachedKb = 0, swapTotalKb = 0, swapFreeKb = 0;
+
+            {
+                scope (exit) reader.close();
+                const(char)[] line;
+                while (reader.nextLine(line)) {
+                    auto colon = indexOfChar(line, ':');
+                    if (colon <= 0) continue;
+                    auto key = trimAscii(line[0 .. colon]);
+                    size_t pos = cast(size_t)(colon + 1);
+                    const(char)[] tok;
+                    if (!nextToken(line, pos, tok)) continue;
+                    ulong valKb = 0;
+                    if (!parseU64Token(tok, valKb)) continue;
+
+                    if (key == "MemTotal") { hasTotal = true; memTotalKb = valKb; }
+                    else if (key == "MemAvailable") { hasAvail = true; memAvailKb = valKb; }
+                    else if (key == "MemFree") { hasFree = true; memFreeKb = valKb; }
+                    else if (key == "Buffers") { hasBuf = true; buffersKb = valKb; }
+                    else if (key == "Cached") { hasCache = true; cachedKb = valKb; }
+                    else if (key == "SwapTotal") { hasSwapTotal = true; swapTotalKb = valKb; }
+                    else if (key == "SwapFree") { hasSwapFree = true; swapFreeKb = valKb; }
+                }
+            }
+
+            if (!reader.hadBytes) {
+                m.state = CapabilityState.error;
+                m.error = "proc_meminfo_unreadable";
+                return m;
+            }
+
+            if (hasTotal) {
+                ulong total = memTotalKb * 1024UL;
+                m.total_bytes = total;
+                if (hasAvail) {
+                    ulong avail = memAvailKb * 1024UL;
+                    m.used_bytes = total > avail ? (total - avail) : 0;
+                } else {
+                    ulong freeB = (hasFree ? memFreeKb : 0) * 1024UL;
+                    ulong bufB = (hasBuf ? buffersKb : 0) * 1024UL;
+                    ulong cacheB = (hasCache ? cachedKb : 0) * 1024UL;
+                    ulong freeTotal = freeB + bufB + cacheB;
+                    m.used_bytes = total > freeTotal ? (total - freeTotal) : 0;
+                }
+            } else {
+                m.state = CapabilityState.error;
+                m.error = "proc_meminfo_missing_total";
+                return m;
+            }
+
+            if (hasSwapTotal) {
+                ulong swTotal = swapTotalKb * 1024UL;
+                m.swap_total_bytes = swTotal;
+                ulong swFree = (hasSwapFree ? swapFreeKb : 0) * 1024UL;
+                m.swap_used_bytes = swTotal > swFree ? (swTotal - swFree) : 0;
+            }
+
+            m.state = CapabilityState.ok;
+            return m;
         } else {
-            m.state = CapabilityState.error;
-            m.error = "proc_meminfo_missing_total";
+            m.state = CapabilityState.unsupported;
             return m;
         }
-
-        if (auto pst = "SwapTotal" in kb) {
-            ulong swTotal = (*pst) * 1024UL;
-            m.swap_total_bytes = swTotal;
-            ulong swFree = (("SwapFree" in kb) ? kb["SwapFree"] : 0) * 1024UL;
-            m.swap_used_bytes = swTotal > swFree ? (swTotal - swFree) : 0;
-        }
-
-        m.state = CapabilityState.ok;
-        return m;
     }
 
-    private string classifyNetKind(string ifName) const {
-        if (ifName == "lo") return "loopback";
-        if (ifName.startsWith("tailscale") || ifName.startsWith("ts")) return "tailnet";
-        auto netPath = sysRoot ~ "/class/net/" ~ ifName;
-        if (exists(netPath ~ "/wireless") || exists(netPath ~ "/phy80211") || ifName.startsWith("wl")) {
-            return "wireless";
+    private bool netAttrExists(const(char)[] ifName, const(char)[] suffix) const nothrow @nogc @trusted {
+        version (Posix) {
+            PathBuf!512 p;
+            p.put(sysRoot);
+            p.put("/class/net/");
+            p.put(ifName);
+            p.put(suffix);
+            return posixAccess(p.ptr, F_OK) == 0;
+        } else {
+            return false;
         }
-        if (exists(netPath ~ "/tun_flags") || ifName.startsWith("veth") || ifName.startsWith("docker")
-            || ifName.startsWith("br-") || ifName.startsWith("virbr") || ifName.startsWith("tun")
-            || ifName.startsWith("tap") || ifName.startsWith("wg")) {
+    }
+
+    private string classifyNetKind(const(char)[] ifName) const nothrow @nogc @safe {
+        if (ifName == "lo") return "loopback";
+        if (startsWithAscii(ifName, "tailscale") || startsWithAscii(ifName, "ts")) return "tailnet";
+
+        version (Posix) {
+            if (netAttrExists(ifName, "/wireless") || netAttrExists(ifName, "/phy80211") || startsWithAscii(ifName, "wl")) {
+                return "wireless";
+            }
+            if (netAttrExists(ifName, "/tun_flags") || startsWithAscii(ifName, "veth") || startsWithAscii(ifName, "docker")
+                || startsWithAscii(ifName, "br-") || startsWithAscii(ifName, "virbr") || startsWithAscii(ifName, "tun")
+                || startsWithAscii(ifName, "tap") || startsWithAscii(ifName, "wg")) {
+                return "virtual";
+            }
+            if (netAttrExists(ifName, "/device")) {
+                return "physical";
+            }
+            return "virtual";
+        } else {
             return "virtual";
         }
-        if (exists(netPath ~ "/device")) {
-            return "physical";
-        }
-        return "virtual";
     }
 
     override RawNetworkResult sampleNetwork() {
         RawNetworkResult r;
-        auto txt = safeReadText(procRoot ~ "/net/dev");
-        if (txt.length == 0) {
-            r.state = CapabilityState.error;
-            r.error = "proc_net_dev_unreadable";
+        version (Posix) {
+            PathBuf!512 p;
+            p.put(procRoot);
+            p.put("/net/dev");
+            PosixLineReader!4096 reader;
+            if (!reader.open(p.ptr)) {
+                r.state = CapabilityState.error;
+                r.error = "proc_net_dev_unreadable";
+                return r;
+            }
+
+            size_t outCount = 0;
+            {
+                scope (exit) reader.close();
+                const(char)[] line;
+                char[64] tmpBuf = void;
+                while (reader.nextLine(line)) {
+                    if (outCount >= MAX_NETWORK_INTERFACES) break;
+                    auto colon = indexOfChar(line, ':');
+                    if (colon <= 0) continue;
+
+                    sanitizeInto(netNameStore[outCount], line[0 .. colon], 64);
+                    auto ifName = netNameStore[outCount].slice();
+                    if (ifName.length == 0 || ifName == "lo") continue;
+
+                    size_t pos = cast(size_t)(colon + 1);
+                    const(char)[] rxTok, txTok, dummy;
+                    if (!nextToken(line, pos, rxTok)) continue;
+                    bool enoughCols = true;
+                    foreach (_; 1 .. 8) {
+                        if (!nextToken(line, pos, dummy)) { enoughCols = false; break; }
+                    }
+                    if (!enoughCols || !nextToken(line, pos, txTok)) continue;
+                    if (!nextToken(line, pos, dummy)) continue; // require >= 10 columns
+
+                    ulong rxBytes = 0, txBytes = 0;
+                    if (!parseU64Token(rxTok, rxBytes) || !parseU64Token(txTok, txBytes)) continue;
+
+                    RawNetworkInterface ni;
+                    ni.name = ifName;
+                    ni.kind = classifyNetKind(ifName);
+                    ni.rx_bytes = rxBytes;
+                    ni.tx_bytes = txBytes;
+
+                    p.clear();
+                    p.put(sysRoot);
+                    p.put("/class/net/");
+                    p.put(ifName);
+                    p.put("/ifindex");
+                    auto ifIndexTxt = readStackFile(p, tmpBuf);
+                    PathBuf!64 idFmt;
+                    if (ifIndexTxt.length > 0) {
+                        idFmt.put("ifindex:");
+                        idFmt.put(ifIndexTxt);
+                    } else {
+                        idFmt.put("name:");
+                        idFmt.put(ifName);
+                    }
+                    netIdStore[outCount].set(idFmt.slice());
+                    ni.id = netIdStore[outCount].slice();
+
+                    p.clear();
+                    p.put(sysRoot);
+                    p.put("/class/net/");
+                    p.put(ifName);
+                    p.put("/operstate");
+                    auto oper = readStackFile(p, tmpBuf);
+                    if (oper.length > 0) {
+                        ni.link_up = (equalsIgnoreCase(oper, "up") || equalsIgnoreCase(oper, "unknown"));
+                    }
+
+                    p.clear();
+                    p.put(sysRoot);
+                    p.put("/class/net/");
+                    p.put(ifName);
+                    p.put("/speed");
+                    auto spd = readStackFile(p, tmpBuf);
+                    if (spd.length > 0) {
+                        long mbps;
+                        if (parseI64Token(spd, mbps) && mbps > 0 && mbps < 1_000_000) {
+                            ni.link_speed_bps = cast(ulong) mbps * 1_000_000UL;
+                        }
+                    }
+
+                    netBuf[outCount++] = ni;
+                }
+            }
+
+            if (!reader.hadBytes) {
+                r.state = CapabilityState.error;
+                r.error = "proc_net_dev_unreadable";
+                return r;
+            }
+
+            r.interfaces = netBuf[0 .. outCount];
+            r.state = CapabilityState.ok;
+            return r;
+        } else {
+            r.state = CapabilityState.unsupported;
             return r;
         }
-
-        foreach (line; txt.split('\n')) {
-            auto colon = line.indexOf(':');
-            if (colon <= 0) continue;
-            auto ifName = sanitizeOsString(line[0 .. colon].strip(), 64);
-            if (ifName.length == 0 || ifName == "lo") continue;
-
-            auto cols = line[colon + 1 .. $].strip().split();
-            if (cols.length < 10) continue;
-
-            RawNetworkInterface ni;
-            ni.name = ifName;
-            ni.kind = classifyNetKind(ifName);
-
-            auto ifIndexTxt = safeReadText(sysRoot ~ "/class/net/" ~ ifName ~ "/ifindex");
-            ni.id = ifIndexTxt.length > 0 ? ("ifindex:" ~ ifIndexTxt) : ("name:" ~ ifName);
-
-            try {
-                ni.rx_bytes = to!ulong(cols[0]);
-                ni.tx_bytes = to!ulong(cols[8]);
-            } catch (Exception) {
-                continue;
-            }
-
-            auto oper = safeReadText(sysRoot ~ "/class/net/" ~ ifName ~ "/operstate").toLower();
-            if (oper.length > 0) {
-                ni.link_up = (oper == "up" || oper == "unknown");
-            }
-            auto spd = safeReadText(sysRoot ~ "/class/net/" ~ ifName ~ "/speed");
-            if (spd.length > 0) {
-                try {
-                    long mbps = to!long(spd);
-                    if (mbps > 0 && mbps < 1_000_000) {
-                        ni.link_speed_bps = cast(ulong) mbps * 1_000_000UL;
-                    }
-                } catch (Exception) {}
-            }
-
-            r.interfaces ~= ni;
-        }
-
-        r.state = CapabilityState.ok;
-        return r;
     }
 
     private static bool parseU64Token(const(char)[] tok, out ulong val) pure nothrow @safe {
@@ -407,37 +991,46 @@ class LinuxPlatformBackend : PlatformBackend {
         r.total_cpu_ticks = cpu.total_ticks;
         r.logical_cores = cpu.logical_cores;
 
-        long pageSize = 4096;
         version (Posix) {
+            long pageSize = 4096;
             long ps = sysconf(_SC_PAGESIZE);
             if (ps > 0) pageSize = ps;
-        }
 
-        import std.stdio : File;
-        char[1024] statBuf;
-        try {
-            foreach (DirEntry de; dirEntries(procRoot, SpanMode.shallow)) {
-                auto name = baseName(de.name);
-                if (name.length == 0 || name[0] < '0' || name[0] > '9') continue;
+            PathBuf!512 procDirPb;
+            procDirPb.put(procRoot);
+            DIR* dir = opendir(procDirPb.ptr);
+            if (dir is null) {
+                r.state = CapabilityState.error;
+                r.error = "proc_enumeration_failed";
+                return r;
+            }
+            scope (exit) closedir(dir);
+
+            size_t outCount = 0;
+            char[1024] statBuf = void;
+            PathBuf!512 statPath;
+            dirent* ent;
+            while ((ent = readdir(dir)) !is null) {
+                if (outCount >= MAX_TRACKED_PROCESSES) break;
+                auto dname = ent.d_name[0 .. strlen(ent.d_name.ptr)];
+                if (dname.length == 0 || dname[0] < '0' || dname[0] > '9') continue;
+
                 uint pid = 0;
                 bool validPid = true;
-                foreach (char ch; name) {
+                foreach (char ch; dname) {
                     if (ch < '0' || ch > '9') { validPid = false; break; }
                     pid = pid * 10 + cast(uint)(ch - '0');
                 }
                 if (!validPid) continue;
 
                 // Never read /cmdline or /environ
-                size_t statLen = 0;
-                try {
-                    auto f = File(de.name ~ "/stat", "rb");
-                    scope (exit) f.close();
-                    statLen = f.rawRead(statBuf[]).length;
-                } catch (Exception) {
-                    continue;
-                }
-                if (statLen == 0) continue;
-                auto statSlice = cast(const(char)[]) statBuf[0 .. statLen];
+                statPath.clear();
+                statPath.put(procRoot);
+                statPath.put("/");
+                statPath.put(dname);
+                statPath.put("/stat");
+                auto statSlice = readStackFile(statPath, statBuf, false);
+                if (statSlice.length == 0) continue;
 
                 ptrdiff_t openParen = -1;
                 ptrdiff_t closeParen = -1;
@@ -447,22 +1040,17 @@ class LinuxPlatformBackend : PlatformBackend {
                 }
                 if (openParen < 0 || closeParen <= openParen || closeParen + 2 >= statSlice.length) continue;
 
-                // sanitizeOsString always allocates an independent heap string (never slices statBuf)
-                auto comm = sanitizeOsString(cast(string) statSlice[openParen + 1 .. closeParen], 128);
+                sanitizeInto(procNameStore[outCount], statSlice[openParen + 1 .. closeParen], 128);
                 auto rest = statSlice[closeParen + 2 .. $];
 
-                // Scan fields after ') ' directly on stack buffer without allocating arrays
                 ulong utime = 0, stime = 0, rssPages = 0;
                 const(char)[] startTok;
                 size_t fieldIdx = 0;
                 size_t pos = 0;
                 bool parseErr = false;
                 while (pos < rest.length && fieldIdx <= 21) {
-                    while (pos < rest.length && (rest[pos] == ' ' || rest[pos] == '\t' || rest[pos] == '\r' || rest[pos] == '\n')) pos++;
-                    if (pos >= rest.length) break;
-                    size_t start = pos;
-                    while (pos < rest.length && rest[pos] != ' ' && rest[pos] != '\t' && rest[pos] != '\r' && rest[pos] != '\n') pos++;
-                    auto tok = rest[start .. pos];
+                    const(char)[] tok;
+                    if (!nextToken(rest, pos, tok)) break;
                     if (fieldIdx == 11) {
                         if (!parseU64Token(tok, utime)) { parseErr = true; break; }
                     } else if (fieldIdx == 12) {
@@ -476,23 +1064,24 @@ class LinuxPlatformBackend : PlatformBackend {
                 }
                 if (parseErr || fieldIdx <= 21 || startTok.length == 0) continue;
 
+                procStartStore[outCount].set(startTok);
                 RawProcess rp;
                 rp.pid = pid;
-                rp.start_id = startTok.idup;
-                rp.name = comm;
+                rp.start_id = procStartStore[outCount].slice();
+                rp.name = procNameStore[outCount].slice();
                 rp.cpu_ticks = utime + stime;
                 rp.rss_bytes = rssPages * cast(ulong) pageSize;
                 rp.memory_kind = "rss";
-                r.processes ~= rp;
+                procBuf[outCount++] = rp;
             }
-        } catch (Exception) {
-            r.state = CapabilityState.error;
-            r.error = "proc_enumeration_failed";
+
+            r.processes = procBuf[0 .. outCount];
+            r.state = CapabilityState.ok;
+            return r;
+        } else {
+            r.state = CapabilityState.unsupported;
             return r;
         }
-
-        r.state = CapabilityState.ok;
-        return r;
     }
 
     static string unescapeMountPath(string raw) pure @safe {
@@ -500,7 +1089,37 @@ class LinuxPlatformBackend : PlatformBackend {
         return sanitizeOsString(s, 512);
     }
 
-    private static bool isIgnoredFsType(string fsType) pure @safe {
+    private static void unescapeMountInto(size_t N)(ref FixedString!N dst, const(char)[] raw) pure nothrow @safe {
+        char[512] tmp = void;
+        size_t tmpLen = 0;
+        size_t i = 0;
+        while (i < raw.length && tmpLen < tmp.length) {
+            if (i + 3 < raw.length && raw[i] == '\\') {
+                auto esc = raw[i + 1 .. i + 4];
+                if (esc == "040") {
+                    tmp[tmpLen++] = ' ';
+                    i += 4;
+                    continue;
+                } else if (esc == "011") {
+                    tmp[tmpLen++] = '\t';
+                    i += 4;
+                    continue;
+                } else if (esc == "012") {
+                    tmp[tmpLen++] = '\n';
+                    i += 4;
+                    continue;
+                } else if (esc == "134") {
+                    tmp[tmpLen++] = '\\';
+                    i += 4;
+                    continue;
+                }
+            }
+            tmp[tmpLen++] = raw[i++];
+        }
+        sanitizeInto(dst, tmp[0 .. tmpLen], N < 512 ? N : 512);
+    }
+
+    private static bool isIgnoredFsType(const(char)[] fsType) pure nothrow @safe {
         static immutable string[] ignored = [
             "proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "cgroup", "cgroup2",
             "pstore", "bpf", "tracefs", "debugfs", "securityfs", "configfs",
@@ -508,89 +1127,142 @@ class LinuxPlatformBackend : PlatformBackend {
             "squashfs", "nsfs", "efivarfs", "rpc_pipefs", "binfmt_misc",
             "fuse.portal", "fuse.gvfsd-fuse", "selinuxfs",
         ];
-        return ignored.canFind(fsType.toLower());
+        foreach (ig; ignored) {
+            if (equalsIgnoreCase(fsType, ig)) return true;
+        }
+        return false;
     }
 
-    private static bool isNetworkFsType(string fsType) pure @safe {
+    private static bool isNetworkFsType(const(char)[] fsType) pure nothrow @safe {
         static immutable string[] netFs = [
             "nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "fuse.sshfs", "9p", "ceph", "glusterfs", "lustre",
         ];
-        return netFs.canFind(fsType.toLower());
-    }
-
-    private struct ParsedMount {
-        string dedupKey;
-        string mountPoint;
-        string source;
-        string fsType;
-    }
-
-    private ParsedMount[] parseMounts() const {
-        ParsedMount[] list;
-        auto miTxt = safeReadText(procRoot ~ "/self/mountinfo");
-        if (miTxt.length > 0) {
-            bool[string] seenKey;
-            foreach (line; miTxt.split('\n')) {
-                auto s = line.strip();
-                if (s.length == 0) continue;
-                auto sep = s.indexOf(" - ");
-                if (sep <= 0) continue;
-                auto left = s[0 .. sep].split();
-                auto right = s[sep + 3 .. $].split();
-                if (left.length < 5 || right.length < 2) continue;
-
-                string devId = left[2];
-                string fsRoot = left[3];
-                string mountPt = unescapeMountPath(left[4]);
-                string fsType = right[0];
-                string source = unescapeMountPath(right[1]);
-
-                if (isIgnoredFsType(fsType) || isNetworkFsType(fsType)) continue;
-                if (mountPt.startsWith("/sys") || mountPt.startsWith("/proc") || mountPt.startsWith("/dev") || mountPt.startsWith("/run/")) continue;
-
-                // Deduplicate identical bind mounts of the same device+subroot while keeping distinct Btrfs subvolumes!
-                auto key = devId ~ ":" ~ fsRoot;
-                if (key in seenKey) continue;
-                seenKey[key] = true;
-
-                list ~= ParsedMount(key, mountPt, source, fsType);
-            }
-            return list;
+        foreach (nf; netFs) {
+            if (equalsIgnoreCase(fsType, nf)) return true;
         }
-
-        auto mountsTxt = safeReadText(procRoot ~ "/mounts");
-        if (mountsTxt.length > 0) {
-            bool[string] seen;
-            foreach (line; mountsTxt.split('\n')) {
-                auto cols = line.strip().split();
-                if (cols.length < 3) continue;
-                string source = unescapeMountPath(cols[0]);
-                string mountPt = unescapeMountPath(cols[1]);
-                string fsType = cols[2];
-                if (isIgnoredFsType(fsType) || isNetworkFsType(fsType)) continue;
-                if (mountPt in seen) continue;
-                seen[mountPt] = true;
-                list ~= ParsedMount(source ~ ":" ~ mountPt, mountPt, source, fsType);
-            }
-        }
-        return list;
+        return false;
     }
 
-    private bool queryMountStats(string mountPoint, out ulong totalBytes, out ulong usedBytes) const {
+    private size_t parseMountsFixed() {
+        size_t count = 0;
+        version (Posix) {
+            PathBuf!512 p;
+            p.put(procRoot);
+            p.put("/self/mountinfo");
+            PosixLineReader!8192 reader;
+            if (reader.open(p.ptr)) {
+                scope (exit) reader.close();
+                const(char)[] line;
+                FixedString!512 tmpMount;
+                while (reader.nextLine(line)) {
+                    if (count >= MAX_FILESYSTEM_MOUNTS) break;
+                    auto s = trimAscii(line);
+                    if (s.length == 0) continue;
+                    auto sep = indexOfSlice(s, " - ");
+                    if (sep <= 0) continue;
+
+                    auto leftSlice = s[0 .. sep];
+                    auto rightSlice = s[sep + 3 .. $];
+
+                    const(char)[] l0, l1, devId, fsRoot, rawMountPt;
+                    size_t lp = 0;
+                    if (!nextToken(leftSlice, lp, l0) || !nextToken(leftSlice, lp, l1)
+                        || !nextToken(leftSlice, lp, devId) || !nextToken(leftSlice, lp, fsRoot)
+                        || !nextToken(leftSlice, lp, rawMountPt)) {
+                        continue;
+                    }
+
+                    const(char)[] fsType, rawSource;
+                    size_t rp = 0;
+                    if (!nextToken(rightSlice, rp, fsType) || !nextToken(rightSlice, rp, rawSource)) {
+                        continue;
+                    }
+
+                    if (isIgnoredFsType(fsType) || isNetworkFsType(fsType)) continue;
+                    unescapeMountInto(tmpMount, rawMountPt);
+                    auto mp = tmpMount.slice();
+                    if (startsWithAscii(mp, "/sys") || startsWithAscii(mp, "/proc")
+                        || startsWithAscii(mp, "/dev") || startsWithAscii(mp, "/run/")) {
+                        continue;
+                    }
+
+                    // Deduplicate identical bind mounts of the same device+subroot while keeping distinct Btrfs subvolumes!
+                    PathBuf!256 keyFmt;
+                    keyFmt.put(devId);
+                    keyFmt.put(":");
+                    keyFmt.put(fsRoot);
+                    bool dup = false;
+                    foreach (i; 0 .. count) {
+                        if (mountDedupKeyStore[i].equals(keyFmt.slice())) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+
+                    mountDedupKeyStore[count].set(keyFmt.slice());
+                    mountPathStore[count] = tmpMount;
+                    unescapeMountInto(mountSrcStore[count], rawSource);
+                    sanitizeInto(mountFsStore[count], fsType, 64);
+                    count++;
+                }
+                if (reader.hadBytes) return count;
+            }
+
+            p.clear();
+            p.put(procRoot);
+            p.put("/mounts");
+            if (reader.open(p.ptr)) {
+                scope (exit) reader.close();
+                const(char)[] line;
+                FixedString!512 tmpMount;
+                while (reader.nextLine(line)) {
+                    if (count >= MAX_FILESYSTEM_MOUNTS) break;
+                    auto s = trimAscii(line);
+                    if (s.length == 0) continue;
+                    const(char)[] rawSource, rawMountPt, fsType;
+                    size_t pos = 0;
+                    if (!nextToken(s, pos, rawSource) || !nextToken(s, pos, rawMountPt) || !nextToken(s, pos, fsType)) {
+                        continue;
+                    }
+                    if (isIgnoredFsType(fsType) || isNetworkFsType(fsType)) continue;
+                    unescapeMountInto(tmpMount, rawMountPt);
+                    auto mp = tmpMount.slice();
+                    bool dup = false;
+                    foreach (i; 0 .. count) {
+                        if (mountPathStore[i].equals(mp)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+
+                    mountPathStore[count] = tmpMount;
+                    unescapeMountInto(mountSrcStore[count], rawSource);
+                    sanitizeInto(mountFsStore[count], fsType, 64);
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private bool queryMountStats(const(char)[] mountPoint, out ulong totalBytes, out ulong usedBytes) const {
         if (statvfsHook !is null) {
-            return statvfsHook(mountPoint, totalBytes, usedBytes);
+            return statvfsHook(cast(string) mountPoint, totalBytes, usedBytes);
         }
         version (Posix) {
-            import std.string : toStringz;
+            char[514] pathZ = void;
+            if (mountPoint.length >= pathZ.length) return false;
+            if (mountPoint.length > 0) pathZ[0 .. mountPoint.length] = mountPoint[];
+            pathZ[mountPoint.length] = '\0';
             statvfs_t sv;
-            if (statvfs(mountPoint.toStringz(), &sv) != 0) return false;
+            if (statvfs(pathZ.ptr, &sv) != 0) return false;
             ulong frsize = sv.f_frsize > 0 ? sv.f_frsize : sv.f_bsize;
             totalBytes = cast(ulong) sv.f_blocks * frsize;
             ulong freeAvail = cast(ulong) sv.f_bavail * frsize;
             ulong freeTotal = cast(ulong) sv.f_bfree * frsize;
             usedBytes = totalBytes > freeTotal ? (totalBytes - freeTotal) : 0;
-            // Use f_blocks - f_bfree + f_bavail for accurate user-visible capacity percentage denominator if desired,
-            // or totalBytes with usedBytes = totalBytes - freeTotal:
             cast(void) freeAvail;
             return totalBytes > 0;
         } else {
@@ -600,26 +1272,42 @@ class LinuxPlatformBackend : PlatformBackend {
 
     override RawFilesystemResult sampleFilesystems() {
         RawFilesystemResult r;
-        auto parsed = parseMounts();
-        if (parsed.length == 0 && !exists(procRoot ~ "/self/mountinfo") && !exists(procRoot ~ "/mounts")) {
-            r.state = CapabilityState.error;
-            r.error = "mountinfo_unreadable";
-            return r;
+        size_t candCount = parseMountsFixed();
+        if (candCount == 0) {
+            version (Posix) {
+                PathBuf!512 p1, p2;
+                p1.put(procRoot);
+                p1.put("/self/mountinfo");
+                p2.put(procRoot);
+                p2.put("/mounts");
+                if (posixAccess(p1.ptr, F_OK) != 0 && posixAccess(p2.ptr, F_OK) != 0) {
+                    r.state = CapabilityState.error;
+                    r.error = "mountinfo_unreadable";
+                    return r;
+                }
+            }
         }
 
-        foreach (pm; parsed) {
+        size_t outCount = 0;
+        foreach (i; 0 .. candCount) {
             ulong totalB = 0, usedB = 0;
-            if (!queryMountStats(pm.mountPoint, totalB, usedB)) continue;
+            if (!queryMountStats(mountPathStore[i].slice(), totalB, usedB)) continue;
+            if (outCount != i) {
+                mountPathStore[outCount] = mountPathStore[i];
+                mountSrcStore[outCount] = mountSrcStore[i];
+                mountFsStore[outCount] = mountFsStore[i];
+            }
             MountStatus ms;
-            ms.mount = pm.mountPoint;
-            ms.source = pm.source;
-            ms.fs = pm.fsType;
+            ms.mount = mountPathStore[outCount].slice();
+            ms.source = mountSrcStore[outCount].slice();
+            ms.fs = mountFsStore[outCount].slice();
             ms.total_bytes = totalB;
             ms.used_bytes = usedB;
             ms.pct = totalB > 0 ? (cast(double) usedB / cast(double) totalB) * 100.0 : 0.0;
-            r.mounts ~= ms;
+            mountBuf[outCount++] = ms;
         }
 
+        r.mounts = mountBuf[0 .. outCount];
         r.state = CapabilityState.ok;
         return r;
     }
@@ -631,129 +1319,204 @@ class LinuxPlatformBackend : PlatformBackend {
         }
 
         RawGpuResult r;
-        auto drmDir = sysRoot ~ "/class/drm";
-        if (exists(drmDir)) {
-            try {
-                foreach (DirEntry de; dirEntries(drmDir, SpanMode.shallow)) {
-                    auto name = baseName(de.name);
-                    if (!name.startsWith("card") || name.canFind('-')) continue;
-                    auto devDir = de.name ~ "/device";
-                    auto busyTxt = safeReadText(devDir ~ "/gpu_busy_percent");
-                    auto vramUsedTxt = safeReadText(devDir ~ "/mem_info_vram_used");
-                    auto vramTotTxt = safeReadText(devDir ~ "/mem_info_vram_total");
+        version (Posix) {
+            PathBuf!512 drmDir;
+            drmDir.put(sysRoot);
+            drmDir.put("/class/drm");
+            DIR* dir = opendir(drmDir.ptr);
+            size_t outCount = 0;
+            if (dir !is null) {
+                scope (exit) closedir(dir);
+                PathBuf!512 p;
+                char[64] busyBuf = void, vramUsedBuf = void, vramTotBuf = void, vendBuf = void;
+                dirent* ent;
+                while ((ent = readdir(dir)) !is null) {
+                    if (outCount >= MAX_GPUS) break;
+                    auto dname = ent.d_name[0 .. strlen(ent.d_name.ptr)];
+                    if (!startsWithAscii(dname, "card") || indexOfChar(dname, '-') >= 0) continue;
+
+                    p.clear(); p.put(sysRoot); p.put("/class/drm/"); p.put(dname); p.put("/device/gpu_busy_percent");
+                    auto busyTxt = readStackFile(p, busyBuf);
+                    p.clear(); p.put(sysRoot); p.put("/class/drm/"); p.put(dname); p.put("/device/mem_info_vram_used");
+                    auto vramUsedTxt = readStackFile(p, vramUsedBuf);
+                    p.clear(); p.put(sysRoot); p.put("/class/drm/"); p.put(dname); p.put("/device/mem_info_vram_total");
+                    auto vramTotTxt = readStackFile(p, vramTotBuf);
                     if (busyTxt.length == 0 && vramUsedTxt.length == 0) continue;
 
+                    p.clear(); p.put(sysRoot); p.put("/class/drm/"); p.put(dname); p.put("/device/vendor");
+                    auto vendorHex = readStackFile(p, vendBuf);
+                    string vendor = vendorHex == "0x1002" ? "AMD" : (vendorHex == "0x8086" ? "Intel" : "GPU");
+
+                    PathBuf!64 idFmt;
+                    idFmt.put("drm:");
+                    idFmt.put(dname);
+                    gpuIdStore[outCount].set(idFmt.slice());
+
+                    PathBuf!128 nameFmt;
+                    nameFmt.put(vendor);
+                    nameFmt.put(" (");
+                    nameFmt.put(dname);
+                    nameFmt.put(")");
+                    gpuNameStore[outCount].set(nameFmt.slice());
+
                     GpuDynamicStatus g;
-                    g.id = "drm:" ~ name;
-                    auto vendorHex = safeReadText(devDir ~ "/vendor");
-                    g.vendor = vendorHex == "0x1002" ? "AMD" : (vendorHex == "0x8086" ? "Intel" : "GPU");
-                    g.display_name = g.vendor ~ " (" ~ name ~ ")";
+                    g.id = gpuIdStore[outCount].slice();
+                    g.vendor = vendor;
+                    g.display_name = gpuNameStore[outCount].slice();
                     g.capability = CapabilityState.ok;
 
-                    if (busyTxt.length > 0) {
-                        try { g.utilization_pct = to!double(busyTxt); } catch (Exception) {}
+                    double busyVal;
+                    if (busyTxt.length > 0 && parseDoubleToken(busyTxt, busyVal)) {
+                        g.utilization_pct = busyVal;
                     }
-                    if (vramUsedTxt.length > 0) {
-                        try { g.vram_used_bytes = to!ulong(vramUsedTxt); } catch (Exception) {}
+                    ulong uVal;
+                    if (vramUsedTxt.length > 0 && parseU64Token(vramUsedTxt, uVal)) {
+                        g.vram_used_bytes = uVal;
                     }
-                    if (vramTotTxt.length > 0) {
-                        try { g.vram_total_bytes = to!ulong(vramTotTxt); } catch (Exception) {}
+                    if (vramTotTxt.length > 0 && parseU64Token(vramTotTxt, uVal)) {
+                        g.vram_total_bytes = uVal;
                     }
-                    r.gpus ~= g;
+                    gpuBuf[outCount++] = g;
                 }
-            } catch (Exception) {}
+            }
+            r.gpus = gpuBuf[0 .. outCount];
+            r.state = outCount > 0 ? CapabilityState.ok : CapabilityState.unsupported;
+            return r;
+        } else {
+            r.state = CapabilityState.unsupported;
+            return r;
         }
-
-        r.state = r.gpus.length > 0 ? CapabilityState.ok : CapabilityState.unsupported;
-        return r;
     }
 
     override RawBatteryResult sampleBatteries() {
         RawBatteryResult r;
-        auto psDir = sysRoot ~ "/class/power_supply";
-        if (!exists(psDir)) {
-            r.state = CapabilityState.ok;
-            return r;
-        }
+        version (Posix) {
+            PathBuf!512 psDir;
+            psDir.put(sysRoot);
+            psDir.put("/class/power_supply");
+            DIR* dir = opendir(psDir.ptr);
+            if (dir is null) {
+                r.state = CapabilityState.ok;
+                return r;
+            }
+            scope (exit) closedir(dir);
 
-        try {
-            foreach (DirEntry de; dirEntries(psDir, SpanMode.shallow)) {
-                auto name = baseName(de.name);
-                auto ptype = safeReadText(de.name ~ "/type").toLower();
-                if (ptype != "battery" && !name.startsWith("BAT")) continue;
+            size_t outCount = 0;
+            PathBuf!512 p;
+            char[64] tmpBuf = void;
+            dirent* ent;
+            while ((ent = readdir(dir)) !is null) {
+                if (outCount >= MAX_BATTERIES) break;
+                auto dname = ent.d_name[0 .. strlen(ent.d_name.ptr)];
+                if (dname == "." || dname == "..") continue;
 
+                p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/type");
+                auto ptype = readStackFile(p, tmpBuf);
+                if (!equalsIgnoreCase(ptype, "battery") && !startsWithAscii(dname, "BAT")) continue;
+
+                batIdStore[outCount].set(dname);
                 BatteryStatus b;
-                b.id = name;
-                b.name = name;
-                auto st = safeReadText(de.name ~ "/status").toLower();
-                switch (st) {
-                    case "charging": b.status = "charging"; break;
-                    case "discharging": b.status = "discharging"; break;
-                    case "full": b.status = "full"; break;
-                    case "not charging": b.status = "not_charging"; break;
-                    default: b.status = "unknown"; break;
-                }
+                b.id = batIdStore[outCount].slice();
+                b.name = b.id;
+
+                p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/status");
+                auto st = readStackFile(p, tmpBuf);
+                if (equalsIgnoreCase(st, "charging")) b.status = "charging";
+                else if (equalsIgnoreCase(st, "discharging")) b.status = "discharging";
+                else if (equalsIgnoreCase(st, "full")) b.status = "full";
+                else if (equalsIgnoreCase(st, "not charging")) b.status = "not_charging";
+                else b.status = "unknown";
 
                 // Prefer energy_* (µWh), fall back to charge_* (µAh) * voltage_now (µV), or capacity %
                 double energyNowUwh = -1, energyFullUwh = -1, energyDesignUwh = -1, powerUw = -1;
-                try {
-                    auto en = safeReadText(de.name ~ "/energy_now");
-                    auto ef = safeReadText(de.name ~ "/energy_full");
-                    auto ed = safeReadText(de.name ~ "/energy_full_design");
-                    auto pn = safeReadText(de.name ~ "/power_now");
-                    if (en.length > 0 && ef.length > 0) {
-                        energyNowUwh = to!double(en);
-                        energyFullUwh = to!double(ef);
-                        if (ed.length > 0) energyDesignUwh = to!double(ed);
-                        if (pn.length > 0) powerUw = to!double(pn);
-                    } else {
-                        auto cn = safeReadText(de.name ~ "/charge_now");
-                        auto cf = safeReadText(de.name ~ "/charge_full");
-                        auto cd = safeReadText(de.name ~ "/charge_full_design");
-                        auto vn = safeReadText(de.name ~ "/voltage_now");
-                        auto cur = safeReadText(de.name ~ "/current_now");
-                        double v = vn.length > 0 ? to!double(vn) / 1_000_000.0 : 0.0;
-                        if (cn.length > 0 && cf.length > 0) {
-                            double cnVal = to!double(cn);
-                            double cfVal = to!double(cf);
-                            if (v > 0) {
-                                energyNowUwh = cnVal * v;
-                                energyFullUwh = cfVal * v;
-                                if (cd.length > 0) energyDesignUwh = to!double(cd) * v;
-                                if (cur.length > 0) powerUw = to!double(cur) * v;
-                            } else if (cfVal > 0) {
-                                b.pct = (cnVal / cfVal) * 100.0;
-                            }
+                bool hasEnergyDesignFile = false;
+
+                p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/energy_now");
+                double enVal = 0, efVal = 0;
+                auto enTxt = readStackFile(p, tmpBuf);
+                bool hasEn = enTxt.length > 0 && parseDoubleToken(enTxt, enVal);
+
+                p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/energy_full");
+                auto efTxt = readStackFile(p, tmpBuf);
+                bool hasEf = efTxt.length > 0 && parseDoubleToken(efTxt, efVal);
+
+                if (hasEn && hasEf) {
+                    energyNowUwh = enVal;
+                    energyFullUwh = efVal;
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/energy_full_design");
+                    auto edTxt = readStackFile(p, tmpBuf);
+                    double edVal;
+                    if (edTxt.length > 0) {
+                        hasEnergyDesignFile = true;
+                        if (parseDoubleToken(edTxt, edVal)) energyDesignUwh = edVal;
+                    }
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/power_now");
+                    auto pnTxt = readStackFile(p, tmpBuf);
+                    double pnVal;
+                    if (pnTxt.length > 0 && parseDoubleToken(pnTxt, pnVal)) powerUw = pnVal;
+                } else {
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/charge_now");
+                    double cnVal = 0, cfVal = 0, v = 0;
+                    auto cnTxt = readStackFile(p, tmpBuf);
+                    bool hasCn = cnTxt.length > 0 && parseDoubleToken(cnTxt, cnVal);
+
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/charge_full");
+                    auto cfTxt = readStackFile(p, tmpBuf);
+                    bool hasCf = cfTxt.length > 0 && parseDoubleToken(cfTxt, cfVal);
+
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/voltage_now");
+                    auto vnTxt = readStackFile(p, tmpBuf);
+                    double vnVal;
+                    if (vnTxt.length > 0 && parseDoubleToken(vnTxt, vnVal)) v = vnVal / 1_000_000.0;
+
+                    if (hasCn && hasCf) {
+                        if (v > 0) {
+                            energyNowUwh = cnVal * v;
+                            energyFullUwh = cfVal * v;
+                            p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/charge_full_design");
+                            auto cdTxt = readStackFile(p, tmpBuf);
+                            double cdVal;
+                            if (cdTxt.length > 0 && parseDoubleToken(cdTxt, cdVal)) energyDesignUwh = cdVal * v;
+                            p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/current_now");
+                            auto curTxt = readStackFile(p, tmpBuf);
+                            double curVal;
+                            if (curTxt.length > 0 && parseDoubleToken(curTxt, curVal)) powerUw = curVal * v;
+                        } else if (cfVal > 0) {
+                            b.pct = (cnVal / cfVal) * 100.0;
                         }
                     }
-                } catch (Exception) {}
+                }
 
                 if (energyNowUwh >= 0 && energyFullUwh > 0) {
                     b.pct = (energyNowUwh / energyFullUwh) * 100.0;
                 } else if (b.pct.isNull) {
-                    auto capTxt = safeReadText(de.name ~ "/capacity");
-                    if (capTxt.length > 0) {
-                        try { b.pct = to!double(capTxt); } catch (Exception) {}
+                    p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/capacity");
+                    auto capTxt = readStackFile(p, tmpBuf);
+                    double capVal;
+                    if (capTxt.length > 0 && parseDoubleToken(capTxt, capVal)) {
+                        b.pct = capVal;
                     }
                 }
 
                 if (energyFullUwh > 0 && energyDesignUwh > 0) {
                     b.health_pct = (energyFullUwh / energyDesignUwh) * 100.0;
-                    // Watt-hours only from energy_* (µWh); charge_* times the
-                    // instantaneous voltage_now is not a stable capacity figure.
-                    if (safeReadText(de.name ~ "/energy_full_design").length > 0) {
+                    if (!hasEnergyDesignFile) {
+                        p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/energy_full_design");
+                        hasEnergyDesignFile = readStackFile(p, tmpBuf).length > 0;
+                    }
+                    if (hasEnergyDesignFile) {
                         b.design_capacity_wh = energyDesignUwh / 1_000_000.0;
                         b.full_charge_capacity_wh = energyFullUwh / 1_000_000.0;
                     }
                 }
-                // Many ACPI drivers report 0 when they do not track cycles; publish only real counts.
-                auto cyc = safeReadText(de.name ~ "/cycle_count");
-                if (cyc.length > 0) {
-                    try {
-                        auto c = to!ulong(cyc);
-                        if (c > 0) b.cycle_count = c;
-                    } catch (Exception) {}
+
+                p.clear(); p.put(sysRoot); p.put("/class/power_supply/"); p.put(dname); p.put("/cycle_count");
+                auto cycTxt = readStackFile(p, tmpBuf);
+                ulong cycVal;
+                if (cycTxt.length > 0 && parseU64Token(cycTxt, cycVal) && cycVal > 0) {
+                    b.cycle_count = cycVal;
                 }
+
                 if (powerUw > 0) {
                     b.power_watts = powerUw / 1_000_000.0;
                     if (b.status == "discharging" && energyNowUwh >= 0) {
@@ -763,77 +1526,113 @@ class LinuxPlatformBackend : PlatformBackend {
                     }
                 }
 
-                r.batteries ~= b;
+                batBuf[outCount++] = b;
             }
-        } catch (Exception) {}
 
-        r.state = CapabilityState.ok;
-        return r;
+            r.batteries = batBuf[0 .. outCount];
+            r.state = CapabilityState.ok;
+            return r;
+        } else {
+            r.state = CapabilityState.ok;
+            return r;
+        }
     }
 
     override RawMaintenanceResult sampleMaintenance() {
         RawMaintenanceResult r;
         r.state = CapabilityState.ok;
 
-        string runningKernel;
-        if (!isRealHost()) {
-            runningKernel = sanitizeOsString(safeReadText(procRoot ~ "/sys/kernel/osrelease"), 128);
-        }
-        if (runningKernel.length == 0) {
-            version (Posix) {
+        maintKernelStore.clear();
+        maintInstalledKernelStore.clear();
+
+        version (Posix) {
+            PathBuf!512 p;
+            char[128] osBuf = void;
+            if (!isRealHost()) {
+                p.put(procRoot);
+                p.put("/sys/kernel/osrelease");
+                sanitizeInto(maintKernelStore, readStackFile(p, osBuf), 128);
+            }
+            if (maintKernelStore.len == 0) {
                 utsname u;
                 if (uname(&u) == 0) {
-                    import std.string : fromStringz;
-                    runningKernel = sanitizeOsString(fromStringz(u.release.ptr).idup, 128);
+                    const(char)[] rel = u.release[0 .. strlen(u.release.ptr)];
+                    sanitizeInto(maintKernelStore, rel, 128);
                 }
             }
-        }
-        r.drift.running_kernel = runningKernel;
+            r.drift.running_kernel = maintKernelStore.slice();
 
-        // Check Debian/Ubuntu /var/run/reboot-required
-        if (exists(varRoot ~ "/run/reboot-required")) {
-            r.drift.reboot_required = true;
-        }
+            // Check Debian/Ubuntu /var/run/reboot-required
+            p.clear();
+            p.put(varRoot);
+            p.put("/run/reboot-required");
+            if (posixAccess(p.ptr, F_OK) == 0) {
+                r.drift.reboot_required = true;
+            }
 
-        // Check /lib/modules to detect running kernel vs installed kernel drift (Arch/CachyOS/Fedora/Ubuntu)
-        if (runningKernel.length > 0 && exists(libModulesRoot)) {
-            string[] installed;
-            try {
-                foreach (DirEntry de; dirEntries(libModulesRoot, SpanMode.shallow)) {
-                    if (de.isDir) installed ~= baseName(de.name);
-                }
-            } catch (Exception) {}
-
-            if (installed.length > 0) {
-                if (!installed.canFind(runningKernel)) {
-                    r.drift.installed_kernel = installed[0];
-                    r.drift.reboot_required = true;
-                } else {
-                    r.drift.installed_kernel = runningKernel;
-                    if (r.drift.reboot_required.isNull) r.drift.reboot_required = false;
+            // Check /lib/modules to detect running kernel vs installed kernel drift
+            auto runningKernel = maintKernelStore.slice();
+            if (runningKernel.length > 0) {
+                p.clear();
+                p.put(libModulesRoot);
+                DIR* dir = opendir(p.ptr);
+                if (dir !is null) {
+                    scope (exit) closedir(dir);
+                    bool anyInstalled = false;
+                    bool foundRunning = false;
+                    PathBuf!512 subPb;
+                    dirent* ent;
+                    while ((ent = readdir(dir)) !is null) {
+                        auto dname = ent.d_name[0 .. strlen(ent.d_name.ptr)];
+                        if (dname == "." || dname == "..") continue;
+                        subPb.clear();
+                        subPb.put(libModulesRoot);
+                        subPb.put("/");
+                        subPb.put(dname);
+                        stat_t st;
+                        if (posixStat(subPb.ptr, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+                        if (!anyInstalled) {
+                            anyInstalled = true;
+                            maintInstalledKernelStore.set(dname);
+                        }
+                        if (dname == runningKernel) {
+                            foundRunning = true;
+                            break;
+                        }
+                    }
+                    if (anyInstalled) {
+                        if (!foundRunning) {
+                            r.drift.installed_kernel = maintInstalledKernelStore.slice();
+                            r.drift.reboot_required = true;
+                        } else {
+                            r.drift.installed_kernel = runningKernel;
+                            if (r.drift.reboot_required.isNull) r.drift.reboot_required = false;
+                        }
+                    }
                 }
             }
-        }
 
-        // Check local package cache mtime without running apt/pacman/dnf or network
-        static immutable string[] cacheHints = [
-            "/var/lib/apt/periodic/update-success-stamp",
-            "/var/cache/apt/pkgcache.bin",
-            "/var/lib/pacman/sync",
-            "/var/cache/libdnf5",
-            "/var/cache/dnf",
-        ];
-        long nowWall = Clock.currTime.toUnixTime();
-        foreach (rel; cacheHints) {
-            string p = varRoot == "/var" ? rel : (varRoot ~ rel[4 .. $]);
-            if (exists(p)) {
-                try {
-                    long mtime = timeLastModified(p).toUnixTime();
+            // Check local package cache mtime without running apt/pacman/dnf or network
+            static immutable string[] cacheHints = [
+                "/lib/apt/periodic/update-success-stamp",
+                "/cache/apt/pkgcache.bin",
+                "/lib/pacman/sync",
+                "/cache/libdnf5",
+                "/cache/dnf",
+            ];
+            long nowWall = Clock.currTime.toUnixTime();
+            foreach (rel; cacheHints) {
+                p.clear();
+                p.put(varRoot);
+                p.put(rel);
+                stat_t st;
+                if (posixStat(p.ptr, &st) == 0) {
+                    long mtime = cast(long) st.st_mtime;
                     if (nowWall >= mtime) {
                         r.drift.package_cache_age_s = nowWall - mtime;
                         break;
                     }
-                } catch (Exception) {}
+                }
             }
         }
 

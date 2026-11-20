@@ -1,6 +1,7 @@
 module core.cache;
 
 import core.config;
+import core.limits;
 import core.model;
 import core.serializer;
 import core.tracker;
@@ -32,23 +33,65 @@ class TelemetryCacheStore {
     HikariConfig config;
     string nodeId;
     string fqdn;
+    private FixedString!256 fqdnStore;
 
     SystemRateState rateState;
     GroupCacheEntry[ProbeGroup] groups;
 
-    // Cached group payloads
+    // Cached group payloads (backed by preallocated inline string storage)
     PlatformIdentity cachedIdentity;
+    private FixedString!128 idHostStore;
+    private FixedString!32 idOsStore;
+    private FixedString!32 idArchStore;
+    private FixedString!128 idBootStore;
+
     CpuStatus cachedCpu;
     MemoryStatus cachedMemory;
     Nullable!SwapStatus cachedSwap;
     Nullable!CommitStatus cachedCommit;
-    NetworkInterfaceStatus[] cachedNetwork;
-    ProcessStatus[] cachedTopCpu;
-    ProcessStatus[] cachedTopMem;
-    MountStatus[] cachedMounts;
-    GpuDynamicStatus[] cachedGpus;
-    BatteryStatus[] cachedBatteries;
+
+    private NetworkInterfaceStatus[MAX_NETWORK_INTERFACES] cachedNetworkBuf;
+    private size_t cachedNetworkLen = 0;
+    private FixedString!64[MAX_NETWORK_INTERFACES] cachedNetIdStore;
+    private FixedString!64[MAX_NETWORK_INTERFACES] cachedNetNameStore;
+    private FixedString!16[MAX_NETWORK_INTERFACES] cachedNetKindStore;
+
+    private ProcessStatus[MAX_TOP_PROCESSES] cachedTopCpuBuf;
+    private size_t cachedTopCpuLen = 0;
+    private FixedString!31[MAX_TOP_PROCESSES] cachedTopCpuStartStore;
+    private FixedString!128[MAX_TOP_PROCESSES] cachedTopCpuNameStore;
+
+    private ProcessStatus[MAX_TOP_PROCESSES] cachedTopMemBuf;
+    private size_t cachedTopMemLen = 0;
+    private FixedString!31[MAX_TOP_PROCESSES] cachedTopMemStartStore;
+    private FixedString!128[MAX_TOP_PROCESSES] cachedTopMemNameStore;
+
+    private MountStatus[MAX_FILESYSTEM_MOUNTS] cachedMountsBuf;
+    private size_t cachedMountsLen = 0;
+    private FixedString!512[MAX_FILESYSTEM_MOUNTS] cachedMountPathStore;
+    private FixedString!256[MAX_FILESYSTEM_MOUNTS] cachedMountSrcStore;
+    private FixedString!64[MAX_FILESYSTEM_MOUNTS] cachedMountFsStore;
+
+    private GpuDynamicStatus[MAX_GPUS] cachedGpusBuf;
+    private size_t cachedGpusLen = 0;
+    private FixedString!64[MAX_GPUS] cachedGpuIdStore;
+    private FixedString!160[MAX_GPUS] cachedGpuNameStore;
+    private FixedString!64[MAX_GPUS] cachedGpuVendorStore;
+    private FixedString!128[MAX_GPUS] cachedGpuErrStore;
+
+    private BatteryStatus[MAX_BATTERIES] cachedBatteriesBuf;
+    private size_t cachedBatteriesLen = 0;
+    private FixedString!64[MAX_BATTERIES] cachedBatIdStore;
+    private FixedString!64[MAX_BATTERIES] cachedBatNameStore;
+    private FixedString!32[MAX_BATTERIES] cachedBatStatusStore;
+
     DriftStatus cachedDrift;
+    private FixedString!128 driftRunKernelStore;
+    private FixedString!128 driftInstKernelStore;
+    private FixedString!64 driftHikariVerStore;
+    private FixedString!64 driftCaddyVerStore;
+    private FixedString!64 driftTailscaleVerStore;
+
     Nullable!HardwareInventory cachedHardware;
     Nullable!HardwareSummary cachedHardwareSummary;
 
@@ -70,6 +113,139 @@ class TelemetryCacheStore {
         loadPersistedHardware();
     }
 
+    @nogc nothrow @safe {
+        void setFqdn(const(char)[] f) {
+            fqdnStore.set(f);
+            fqdn = fqdnStore.slice();
+        }
+
+        void setIdentity(const ref PlatformIdentity id) {
+            idHostStore.set(id.host);
+            idOsStore.set(id.os);
+            idArchStore.set(id.arch);
+            idBootStore.set(id.boot_id);
+            cachedIdentity.host = idHostStore.slice();
+            cachedIdentity.os = idOsStore.slice();
+            cachedIdentity.arch = idArchStore.slice();
+            cachedIdentity.boot_id = idBootStore.slice();
+            cachedIdentity.uptime_s = id.uptime_s;
+        }
+
+        void setNetwork(const NetworkInterfaceStatus[] items) {
+            size_t n = items.length > MAX_NETWORK_INTERFACES ? MAX_NETWORK_INTERFACES : items.length;
+            foreach (i; 0 .. n) {
+                cachedNetIdStore[i].set(items[i].id);
+                cachedNetNameStore[i].set(items[i].name);
+                cachedNetKindStore[i].set(items[i].kind);
+                cachedNetworkBuf[i] = items[i];
+                cachedNetworkBuf[i].id = cachedNetIdStore[i].slice();
+                cachedNetworkBuf[i].name = cachedNetNameStore[i].slice();
+                cachedNetworkBuf[i].kind = cachedNetKindStore[i].slice();
+            }
+            cachedNetworkLen = n;
+        }
+
+        void setTopCpu(const ProcessStatus[] items) {
+            size_t n = items.length > MAX_TOP_PROCESSES ? MAX_TOP_PROCESSES : items.length;
+            foreach (i; 0 .. n) {
+                cachedTopCpuStartStore[i].set(items[i].start_id);
+                cachedTopCpuNameStore[i].set(items[i].name);
+                cachedTopCpuBuf[i] = items[i];
+                cachedTopCpuBuf[i].start_id = cachedTopCpuStartStore[i].slice();
+                cachedTopCpuBuf[i].name = cachedTopCpuNameStore[i].slice();
+            }
+            cachedTopCpuLen = n;
+        }
+
+        void setTopMem(const ProcessStatus[] items) {
+            size_t n = items.length > MAX_TOP_PROCESSES ? MAX_TOP_PROCESSES : items.length;
+            foreach (i; 0 .. n) {
+                cachedTopMemStartStore[i].set(items[i].start_id);
+                cachedTopMemNameStore[i].set(items[i].name);
+                cachedTopMemBuf[i] = items[i];
+                cachedTopMemBuf[i].start_id = cachedTopMemStartStore[i].slice();
+                cachedTopMemBuf[i].name = cachedTopMemNameStore[i].slice();
+            }
+            cachedTopMemLen = n;
+        }
+
+        void setMounts(const MountStatus[] items) {
+            size_t n = items.length > MAX_FILESYSTEM_MOUNTS ? MAX_FILESYSTEM_MOUNTS : items.length;
+            foreach (i; 0 .. n) {
+                cachedMountPathStore[i].set(items[i].mount);
+                cachedMountSrcStore[i].set(items[i].source);
+                cachedMountFsStore[i].set(items[i].fs);
+                cachedMountsBuf[i] = items[i];
+                cachedMountsBuf[i].mount = cachedMountPathStore[i].slice();
+                cachedMountsBuf[i].source = cachedMountSrcStore[i].slice();
+                cachedMountsBuf[i].fs = cachedMountFsStore[i].slice();
+            }
+            cachedMountsLen = n;
+        }
+
+        void setGpus(const GpuDynamicStatus[] items) {
+            size_t n = items.length > MAX_GPUS ? MAX_GPUS : items.length;
+            foreach (i; 0 .. n) {
+                cachedGpuIdStore[i].set(items[i].id);
+                cachedGpuNameStore[i].set(items[i].display_name);
+                cachedGpuVendorStore[i].set(items[i].vendor);
+                cachedGpuErrStore[i].set(items[i].error);
+                cachedGpusBuf[i] = items[i];
+                cachedGpusBuf[i].id = cachedGpuIdStore[i].slice();
+                cachedGpusBuf[i].display_name = cachedGpuNameStore[i].slice();
+                cachedGpusBuf[i].vendor = cachedGpuVendorStore[i].slice();
+                cachedGpusBuf[i].error = cachedGpuErrStore[i].slice();
+            }
+            cachedGpusLen = n;
+        }
+
+        void setBatteries(const BatteryStatus[] items) {
+            size_t n = items.length > MAX_BATTERIES ? MAX_BATTERIES : items.length;
+            foreach (i; 0 .. n) {
+                cachedBatIdStore[i].set(items[i].id);
+                cachedBatNameStore[i].set(items[i].name);
+                cachedBatStatusStore[i].set(items[i].status);
+                cachedBatteriesBuf[i] = items[i];
+                cachedBatteriesBuf[i].id = cachedBatIdStore[i].slice();
+                cachedBatteriesBuf[i].name = cachedBatNameStore[i].slice();
+                cachedBatteriesBuf[i].status = cachedBatStatusStore[i].slice();
+            }
+            cachedBatteriesLen = n;
+        }
+
+        void setDrift(const ref DriftStatus d) {
+            driftRunKernelStore.set(d.running_kernel);
+            driftInstKernelStore.set(d.installed_kernel);
+            driftHikariVerStore.set(d.hikari_version);
+            driftCaddyVerStore.set(d.caddy_version);
+            driftTailscaleVerStore.set(d.tailscale_version);
+            cachedDrift = d;
+            cachedDrift.running_kernel = driftRunKernelStore.slice();
+            cachedDrift.installed_kernel = driftInstKernelStore.slice();
+            cachedDrift.hikari_version = driftHikariVerStore.slice();
+            cachedDrift.caddy_version = driftCaddyVerStore.slice();
+            cachedDrift.tailscale_version = driftTailscaleVerStore.slice();
+        }
+    }
+
+    @property NetworkInterfaceStatus[] cachedNetwork() return @safe { return cachedNetworkBuf[0 .. cachedNetworkLen]; }
+    @property void cachedNetwork(const NetworkInterfaceStatus[] items) @nogc nothrow @safe { setNetwork(items); }
+
+    @property ProcessStatus[] cachedTopCpu() return @safe { return cachedTopCpuBuf[0 .. cachedTopCpuLen]; }
+    @property void cachedTopCpu(const ProcessStatus[] items) @nogc nothrow @safe { setTopCpu(items); }
+
+    @property ProcessStatus[] cachedTopMem() return @safe { return cachedTopMemBuf[0 .. cachedTopMemLen]; }
+    @property void cachedTopMem(const ProcessStatus[] items) @nogc nothrow @safe { setTopMem(items); }
+
+    @property MountStatus[] cachedMounts() return @safe { return cachedMountsBuf[0 .. cachedMountsLen]; }
+    @property void cachedMounts(const MountStatus[] items) @nogc nothrow @safe { setMounts(items); }
+
+    @property GpuDynamicStatus[] cachedGpus() return @safe { return cachedGpusBuf[0 .. cachedGpusLen]; }
+    @property void cachedGpus(const GpuDynamicStatus[] items) @nogc nothrow @safe { setGpus(items); }
+
+    @property BatteryStatus[] cachedBatteries() return @safe { return cachedBatteriesBuf[0 .. cachedBatteriesLen]; }
+    @property void cachedBatteries(const BatteryStatus[] items) @nogc nothrow @safe { setBatteries(items); }
+
     string hardwareCachePath() const pure @safe {
         return config.paths.state_dir ~ "/hardware_cache.json";
     }
@@ -84,14 +260,9 @@ class TelemetryCacheStore {
                 cachedHardware = hw;
                 updateHardwareSummaryFromInventory(hw);
                 if (!hw.collected_at.isNull) {
-                    // Mark persisted hardware as usable/stale until TTL or max_stale evaluated
-                    // Persisted across restarts: set monoNs baseline relative to now only if wall age known,
-                    // or keep hasSuccess=true with lastSuccessWallTs so wall-age check knows its real age.
                     auto entry = groups[ProbeGroup.hardware];
                     entry.hasSuccess = true;
                     entry.lastSuccessWallTs = hw.collected_at.get;
-                    // On restart, monotonic clock starts fresh; keep lastSuccessMonoNs = -1 sentinel
-                    // so wall age determines freshness accurately without rescanning needlessly!
                     entry.lastSuccessMonoNs = -1;
                     groups[ProbeGroup.hardware] = entry;
                 }
@@ -130,44 +301,44 @@ class TelemetryCacheStore {
         cachedHardwareSummary = hs;
     }
 
-    long computeGroupAgeS(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @safe {
-        auto e = groups[g];
-        if (!e.hasSuccess) return long.max;
-        if (e.lastSuccessMonoNs >= 0) {
-            long d = (nowMonoNs - e.lastSuccessMonoNs) / 1_000_000_000L;
+    long computeGroupAgeS(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @nogc @safe {
+        auto p = g in groups;
+        if (p is null || !p.hasSuccess) return long.max;
+        if (p.lastSuccessMonoNs >= 0) {
+            long d = (nowMonoNs - p.lastSuccessMonoNs) / 1_000_000_000L;
             return d < 0 ? 0 : d;
         }
-        // Restored persisted entry (hardware): use wall clock safely clamped
-        long dw = nowWallTs - e.lastSuccessWallTs;
+        long dw = nowWallTs - p.lastSuccessWallTs;
         return dw < 0 ? 0 : dw;
     }
 
-    bool isFresh(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @safe {
-        auto e = groups[g];
+    bool isFresh(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @nogc @safe {
+        auto p = g in groups;
+        if (p is null) return false;
         long ttl = config.collection.ttl_seconds.get(g);
-        if (e.unsupported && !e.hasSuccess) {
-            long d = (e.lastAttemptMonoNs >= 0 && nowMonoNs >= e.lastAttemptMonoNs)
-                ? (nowMonoNs - e.lastAttemptMonoNs) / 1_000_000_000L
+        if (p.unsupported && !p.hasSuccess) {
+            long d = (p.lastAttemptMonoNs >= 0 && nowMonoNs >= p.lastAttemptMonoNs)
+                ? (nowMonoNs - p.lastAttemptMonoNs) / 1_000_000_000L
                 : long.max;
             return d < ttl;
         }
-        if (!e.hasSuccess) return false;
+        if (!p.hasSuccess) return false;
         return computeGroupAgeS(g, nowMonoNs, nowWallTs) < ttl;
     }
 
-    bool isUsableStale(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @safe {
-        auto e = groups[g];
-        if (!e.hasSuccess) return false;
+    bool isUsableStale(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @nogc @safe {
+        auto p = g in groups;
+        if (p is null || !p.hasSuccess) return false;
         long ageS = computeGroupAgeS(g, nowMonoNs, nowWallTs);
         return ageS <= config.collection.max_stale_seconds.get(g);
     }
 
-    GroupMeta buildGroupMeta(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure @safe {
-        auto e = groups[g];
+    GroupMeta buildGroupMeta(ProbeGroup g, long nowMonoNs, long nowWallTs) const pure nothrow @nogc @safe {
+        auto p = g in groups;
         GroupMeta gm;
+        if (p is null) return gm;
+        auto e = *p;
         gm.refreshing = e.inFlight;
-        // A completed probe publishes its sample before its thread exits. Only
-        // a worker reaped for timeout is hung during that short cleanup window.
         bool hung = e.workerAlive && !e.inFlight && e.lastError == "probe_timeout";
         if (e.hasSuccess) {
             long age = computeGroupAgeS(g, nowMonoNs, nowWallTs);
@@ -199,8 +370,7 @@ class TelemetryCacheStore {
         return gm;
     }
 
-    StatusResponse snapshotStatusResponse(long nowMonoNs, long nowWallTs) const @safe {
-        StatusResponse resp;
+    void snapshotStatusInto(ref StatusResponse resp, long nowMonoNs, long nowWallTs) @nogc nothrow @safe {
         resp.app = "hikari";
         resp.schema_version = SCHEMA_VERSION;
         resp.agent_version = AGENT_VERSION;
@@ -214,8 +384,9 @@ class TelemetryCacheStore {
         resp.uptime_s = cachedIdentity.uptime_s;
         resp.hardware_summary = cachedHardwareSummary;
 
-        foreach (g; [ProbeGroup.fast, ProbeGroup.processes, ProbeGroup.device_dynamic, ProbeGroup.filesystems, ProbeGroup.maintenance]) {
-            resp.groups[cast(string) g] = buildGroupMeta(g, nowMonoNs, nowWallTs);
+        resp.use_fixed_groups = true;
+        foreach (i, g; STATUS_PROBE_GROUPS) {
+            resp.fixed_groups[i] = buildGroupMeta(g, nowMonoNs, nowWallTs);
         }
 
         if (isUsableStale(ProbeGroup.fast, nowMonoNs, nowWallTs)) {
@@ -223,21 +394,45 @@ class TelemetryCacheStore {
             resp.memory = cachedMemory;
             resp.swap = cachedSwap;
             resp.commit = cachedCommit;
-            resp.network = cachedNetwork.dup;
+            resp.network = cachedNetworkBuf[0 .. cachedNetworkLen];
+        } else {
+            resp.cpu = CpuStatus.init;
+            resp.memory = MemoryStatus.init;
+            resp.swap = Nullable!SwapStatus.init;
+            resp.commit = Nullable!CommitStatus.init;
+            resp.network = null;
         }
         if (isUsableStale(ProbeGroup.processes, nowMonoNs, nowWallTs)) {
-            resp.top_cpu = cachedTopCpu.dup;
-            resp.top_mem = cachedTopMem.dup;
+            resp.top_cpu = cachedTopCpuBuf[0 .. cachedTopCpuLen];
+            resp.top_mem = cachedTopMemBuf[0 .. cachedTopMemLen];
+        } else {
+            resp.top_cpu = null;
+            resp.top_mem = null;
         }
         if (isUsableStale(ProbeGroup.filesystems, nowMonoNs, nowWallTs)) {
-            resp.mounts = cachedMounts.dup;
+            resp.mounts = cachedMountsBuf[0 .. cachedMountsLen];
+        } else {
+            resp.mounts = null;
         }
         if (isUsableStale(ProbeGroup.device_dynamic, nowMonoNs, nowWallTs)) {
-            resp.gpus = cachedGpus.dup;
-            resp.batteries = cachedBatteries.dup;
+            resp.gpus = cachedGpusBuf[0 .. cachedGpusLen];
+            resp.batteries = cachedBatteriesBuf[0 .. cachedBatteriesLen];
+        } else {
+            resp.gpus = null;
+            resp.batteries = null;
         }
         if (isUsableStale(ProbeGroup.maintenance, nowMonoNs, nowWallTs)) {
             resp.drift = cachedDrift;
+        } else {
+            resp.drift = DriftStatus.init;
+        }
+    }
+
+    StatusResponse snapshotStatusResponse(long nowMonoNs, long nowWallTs) @safe {
+        StatusResponse resp;
+        snapshotStatusInto(resp, nowMonoNs, nowWallTs);
+        foreach (i, g; STATUS_PROBE_GROUPS) {
+            resp.groups[cast(string) g] = resp.fixed_groups[i];
         }
         return resp;
     }
@@ -258,7 +453,7 @@ class TelemetryCacheStore {
         return hw;
     }
 
-    InfoResponse buildInfoResponse(long nowWallTs) const @safe {
+    InfoResponse buildInfoResponse(long nowWallTs) const nothrow @nogc @safe {
         InfoResponse ir;
         ir.app = "hikari";
         ir.schema_version = SCHEMA_VERSION;
@@ -275,7 +470,8 @@ class TelemetryCacheStore {
         ir.base_path = config.listen.base_path;
         ir.server_ts = nowWallTs;
         ir.uptime_s = cachedIdentity.uptime_s;
-        ir.health = (groups[ProbeGroup.fast].consecutiveFailures > 0 && !groups[ProbeGroup.fast].hasSuccess) ? "degraded" : "ok";
+        auto fp = ProbeGroup.fast in groups;
+        ir.health = (fp !is null && fp.consecutiveFailures > 0 && !fp.hasSuccess) ? "degraded" : "ok";
         ir.hardware_summary = cachedHardwareSummary;
         return ir;
     }
