@@ -6,6 +6,8 @@ import std.algorithm : canFind;
 import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
 import std.math : abs;
 
+version (Posix) {
+
 private string makeFakeSysTree(string name) {
     auto root = tempDir() ~ "/hikari-test-linux-" ~ name;
     if (exists(root)) rmdirRecurse(root);
@@ -164,6 +166,20 @@ unittest {
     assert(drift.drift.installed_kernel == "6.12.5-1-cachyos");
     assert(drift.drift.reboot_required.get == true);
 
+    // Multi-chunk (>4096 bytes) /proc/self/mountinfo & >100 processes parsed via stack-buffer path
+    string bigMounts = "26 1 0:25 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw\n";
+    foreach (idx; 0 .. 120) {
+        bigMounts ~= "30 26 0:30 / /tmp/ignored-" ~ cast(char)('a' + (idx % 26)) ~ " rw,nosuid - tmpfs tmpfs rw\n";
+    }
+    assert(bigMounts.length > 4096);
+    write(root ~ "/proc/self/mountinfo", bigMounts);
+    auto bigFs = backend.sampleFilesystems();
+    assert(bigFs.mounts.length == 1 && bigFs.mounts[0].mount == "/");
+}
+
+} // version (Posix)
+
+unittest {
     // SMBIOS Type 17 synthetic test (16 GiB DDR5-5600 DIMM in slot DIMM_A1)
     ubyte[] smbios = [
         17, 0x20, 0x11, 0x00, // Type 17, length 32, handle
@@ -185,14 +201,4 @@ unittest {
     assert(mods[0].technology == "DDR5");
     assert(mods[0].speed_mt_s.get == 5600);
     assert(mods[0].size_bytes.get == 16384UL * 1024UL * 1024UL);
-
-    // Multi-chunk (>4096 bytes) /proc/self/mountinfo & >100 processes parsed via stack-buffer path
-    string bigMounts = "26 1 0:25 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw\n";
-    foreach (idx; 0 .. 120) {
-        bigMounts ~= "30 26 0:30 / /tmp/ignored-" ~ cast(char)('a' + (idx % 26)) ~ " rw,nosuid - tmpfs tmpfs rw\n";
-    }
-    assert(bigMounts.length > 4096);
-    write(root ~ "/proc/self/mountinfo", bigMounts);
-    auto bigFs = backend.sampleFilesystems();
-    assert(bigFs.mounts.length == 1 && bigFs.mounts[0].mount == "/");
 }

@@ -101,7 +101,7 @@ if [ "$1" = reload ]; then touch "$HIKARI_RELOAD_MARKER"; echo "simulated reload
 exec "$HIKARI_REAL_CADDY" "$@"
 WRAPPER
 chmod +x "$TMP/failing-caddy"
-if "$HIKARI_BIN" caddy integrate --caddyfile "$USER_CF" --caddy "$TMP/failing-caddy" \
+if "$HIKARI_BIN" caddy integrate --config "$TMP/no-config.json" --caddyfile "$USER_CF" --caddy "$TMP/failing-caddy" \
   --state-dir "$TMP/reload-state" --fqdn fixture.tail.ts.net --tailscale-ip 100.64.0.10 \
   --web-dir "$TMP/web" --reload >/dev/null 2>&1; then
   fail "failed reload should fail integration"

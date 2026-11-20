@@ -305,9 +305,64 @@ unittest {
     // queryLocalTailscaleVersion extracts Version from fixture files safely
     import platform.command : queryLocalTailscaleVersion;
     import std.file : write;
+    import std.typecons : Nullable;
     auto stateDir = makeTempStateDir("ts-ver-fixture");
     scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
     auto fix = stateDir ~ "/ts.json";
     write(fix, `{"Version":"1.78.1-t123456-g789","MagicDNSSuffix":"tail.ts.net"}`);
     assert(queryLocalTailscaleVersion(fix) == "1.78.1");
+}
+
+unittest {
+    // Regression: getInfo() and getStatus() return owned string/slice data unaffected by
+    // later store updates, and tailscale_fixture overrides backend tailscale_version.
+    import std.file : write;
+    import std.typecons : Nullable;
+    auto stateDir = makeTempStateDir("owned-snapshots");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+
+    auto tsFix = stateDir ~ "/ts-override.json";
+    write(tsFix, `{"Version":"9.9.9-t123-g456","MagicDNSSuffix":"tail.ts.net"}`);
+
+    auto cfg = HikariConfig.init;
+    cfg.paths.state_dir = stateDir;
+    cfg.tailscale_fixture = tsFix;
+    cfg.collection.cold_wait_ms = 500;
+
+    auto fake = new FakePlatformBackend("desktop-x86_64");
+    auto store = new TelemetryCacheStore(cfg, "hikari:owned-test");
+    auto coord = new RefreshCoordinator(fake, store);
+    coord.updateFqdn("box-one.tail.ts.net");
+
+    auto st1 = coord.getStatus();
+    assert(st1.httpStatus == 200);
+    assert(st1.payload.drift.tailscale_version == "9.9.9", "tailscale_fixture must override backend tailscale_version");
+    assert(st1.payload.host == "workstation-linux");
+    assert(st1.payload.fqdn == "box-one.tail.ts.net");
+    assert(st1.payload.network.length > 0);
+    auto savedIfName = st1.payload.network[0].name.idup;
+    auto savedHost = st1.payload.host.idup;
+    auto savedFqdn = st1.payload.fqdn.idup;
+
+    auto info1 = coord.getInfo();
+    assert(info1.host == savedHost);
+    assert(info1.fqdn == savedFqdn);
+    assert(info1.tailscale_version == "9.9.9");
+
+    // Mutate underlying FixedString stores inside TelemetryCacheStore
+    auto mutId = PlatformIdentity("mutated-host", "darwin", "arm64", "boot-mutated", Nullable!long(1));
+    store.setIdentity(mutId);
+    store.setFqdn("mutated-fqdn.tail.ts.net");
+    store.setNetwork([NetworkInterfaceStatus("ifindex:99", "mutated0", "virtual")]);
+    DriftStatus mutDrift;
+    mutDrift.tailscale_version = "0.0.0";
+    store.setDrift(mutDrift);
+
+    assert(st1.payload.host == savedHost, "getStatus() payload host must be owned");
+    assert(st1.payload.fqdn == savedFqdn, "getStatus() payload fqdn must be owned");
+    assert(st1.payload.network[0].name == savedIfName, "getStatus() payload network must be owned");
+    assert(st1.payload.drift.tailscale_version == "9.9.9", "getStatus() payload drift must be owned");
+    assert(info1.host == savedHost, "getInfo() host must be owned");
+    assert(info1.fqdn == savedFqdn, "getInfo() fqdn must be owned");
+    assert(info1.tailscale_version == "9.9.9", "getInfo() tailscale_version must be owned");
 }

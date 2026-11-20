@@ -16,12 +16,20 @@ import std.string : indexOf, strip, toLower;
 
 version (Posix) {
     import core.stdc.errno : EINTR, errno;
-    import core.sys.posix.sys.socket : accept, MSG_NOSIGNAL, recv, send, setsockopt, shutdown, SHUT_RDWR, SO_RCVTIMEO, SO_SNDTIMEO, SOL_SOCKET;
+    import core.sys.posix.sys.socket : accept, recv, send, setsockopt, shutdown, SHUT_RDWR, SO_RCVTIMEO, SO_SNDTIMEO, SOL_SOCKET;
+    version (OSX) {
+        import core.sys.posix.sys.socket : SO_NOSIGPIPE;
+    } else version (FreeBSD) {
+        import core.sys.posix.sys.socket : MSG_NOSIGNAL, SO_NOSIGPIPE;
+    } else {
+        import core.sys.posix.sys.socket : MSG_NOSIGNAL;
+    }
     import core.sys.posix.sys.time : timeval;
     import core.sys.posix.unistd : posixClose = close;
 }
 version (Windows) {
-    import core.sys.windows.winsock2 : accept, closesocket, DWORD, INVALID_SOCKET, recv, send, setsockopt, shutdown, SD_BOTH, SO_EXCLUSIVEADDRUSE, SO_RCVTIMEO, SO_SNDTIMEO, SOCKET, SOCKET_ERROR, SOL_SOCKET;
+    import core.sys.windows.windef : DWORD;
+    import core.sys.windows.winsock2 : accept, closesocket, INVALID_SOCKET, recv, send, setsockopt, shutdown, SD_BOTH, SO_EXCLUSIVEADDRUSE, SO_RCVTIMEO, SO_SNDTIMEO, SOCKET, SOCKET_ERROR, SOL_SOCKET;
 }
 
 private pure nothrow @nogc @safe {
@@ -267,6 +275,12 @@ string formatRawHttpResponse(const ref HttpResponse resp, bool headOnly = false)
     app.put(format!"Content-Type: %s\r\n"(resp.contentType));
     app.put(format!"Content-Length: %u\r\n"(resp.bodyText.length));
     app.put("Connection: close\r\n");
+    if ("X-Content-Type-Options" !in resp.headers) {
+        app.put("X-Content-Type-Options: nosniff\r\n");
+    }
+    if ("Cache-Control" !in resp.headers) {
+        app.put("Cache-Control: no-store\r\n");
+    }
     if (resp.corsAllowOrigin.length > 0 && "Access-Control-Allow-Origin" !in resp.headers) {
         app.put("Access-Control-Allow-Origin: " ~ resp.corsAllowOrigin ~ "\r\n");
         app.put("Vary: Origin\r\n");
@@ -317,10 +331,13 @@ class LoopbackHttpServer {
 
     uint activeClients() { return atomicLoad(clients); }
 
-    this(string bindAddr, ushort port, HikariRouter router, uint maxClients = 32) {
+    this(string bindAddr, ushort port, HikariRouter router, uint maxClients = 32, uint workerCount = DEFAULT_HTTP_WORKERS) {
         if (!maxClients || maxClients > 1024) throw new Exception("Invalid HTTP client limit");
         this.maxClients = maxClients;
-        this.workerCount = maxClients < MAX_HTTP_WORKERS ? maxClients : MAX_HTTP_WORKERS;
+        uint desiredWorkers = workerCount > 0 ? workerCount : DEFAULT_HTTP_WORKERS;
+        if (desiredWorkers > maxClients) desiredWorkers = maxClients;
+        if (desiredWorkers > MAX_HTTP_WORKERS) desiredWorkers = MAX_HTTP_WORKERS;
+        this.workerCount = desiredWorkers;
         if (!isLoopbackBindAddress(bindAddr)) {
             throw new Exception("Security violation: HTTP server refuses non-loopback bind address: " ~ bindAddr);
         }
@@ -482,10 +499,17 @@ class LoopbackHttpServer {
 
     void stop() {
         atomicStore(running, false);
-        atomicStore(rawHandle, size_t.max);
+        auto h = atomicExchange(&rawHandle, size_t.max);
         if (listener !is null) {
-            try { listener.shutdown(SocketShutdown.BOTH); } catch (Exception) {}
-            try { listener.close(); } catch (Exception) {}
+            version (Windows) {
+                if (h != size_t.max) {
+                    try { listener.shutdown(SocketShutdown.BOTH); } catch (Exception) {}
+                    try { listener.close(); } catch (Exception) {}
+                }
+            } else {
+                try { listener.shutdown(SocketShutdown.BOTH); } catch (Exception) {}
+                try { listener.close(); } catch (Exception) {}
+            }
         }
         synchronized (qMtx) {
             while (qCount > 0) {
@@ -616,7 +640,11 @@ class LoopbackHttpServer {
             int maxChunk = len > int.max ? int.max : cast(int) len;
             return cast(ptrdiff_t) recv(cast(SOCKET) cfd, ptr, maxChunk, 0);
         } else {
-            return cast(ptrdiff_t) recv(cast(int) cfd, ptr, len, 0);
+            while (true) {
+                auto n = cast(ptrdiff_t) recv(cast(int) cfd, ptr, len, 0);
+                if (n < 0 && errno == EINTR) continue;
+                return n;
+            }
         }
     }
 
@@ -632,6 +660,7 @@ class LoopbackHttpServer {
                 size_t rem = data.length - sent;
                 int chunk = rem > int.max ? int.max : cast(int) rem;
                 n = cast(ptrdiff_t) send(cast(SOCKET) cfd, data.ptr + sent, chunk, 0);
+                if (n <= 0) return false;
             } else {
                 static if (__traits(compiles, MSG_NOSIGNAL)) {
                     enum int SEND_FLAGS = MSG_NOSIGNAL;
@@ -639,8 +668,9 @@ class LoopbackHttpServer {
                     enum int SEND_FLAGS = 0;
                 }
                 n = cast(ptrdiff_t) send(cast(int) cfd, data.ptr + sent, data.length - sent, SEND_FLAGS);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
             }
-            if (n <= 0) return false;
             sent += cast(size_t) n;
         }
         return true;

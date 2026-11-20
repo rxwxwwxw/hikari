@@ -1,5 +1,6 @@
 module http.routes;
 
+import core.cache : InfoScratch;
 import core.config;
 import core.coordinator;
 import core.model;
@@ -102,8 +103,9 @@ class HikariRouter {
         }
 
         string originHdr = req.getOriginHeader();
-        auto knownFqdns = registry !is null ? registry.knownFqdnsSlice() : null;
-        auto ov = validateRequestOrigin(originHdr, config, localFqdn, magicSuffix, knownFqdns);
+        auto ov = discovery !is null
+            ? discovery.validateOrigin(originHdr, config)
+            : validateRequestOrigin(originHdr, config, localFqdn, magicSuffix, registry !is null ? registry.knownFqdnsSlice() : null);
         if (!ov.allowed) {
             return jsonErrorInto(403, "Forbidden", "origin_denied", "Origin not authorized for this tailnet node", "", bodyBuf, bodyLen);
         }
@@ -148,13 +150,36 @@ class HikariRouter {
             auto sr = coordinator.getStatusJson(bodyBuf, bodyLen, false);
             final switch (sr.kind) {
                 case EndpointOutcomeKind.ok:
-                    resp.statusCode = 200;
-                    resp.statusText = "OK";
                     if (bodyLen == size_t.max) {
                         auto srFull = coordinator.getStatus(false);
-                        resp.bodyText = toJsonText(serializeStatusResponse(srFull.payload));
-                        bodyLen = resp.bodyText.length;
+                        final switch (srFull.kind) {
+                            case EndpointOutcomeKind.ok:
+                                resp.statusCode = 200;
+                                resp.statusText = "OK";
+                                resp.bodyText = toJsonText(serializeStatusResponse(srFull.payload));
+                                bodyLen = resp.bodyText.length;
+                                break;
+                            case EndpointOutcomeKind.collecting:
+                                resp.statusCode = 202;
+                                resp.statusText = "Accepted";
+                                resp.retryAfter = smallUintLiteral(srFull.retryAfterS);
+                                CollectingResponse cr;
+                                cr.retry_after_s = srFull.retryAfterS;
+                                resp.bodyText = toJsonText(serializeCollectingResponse(cr));
+                                bodyLen = resp.bodyText.length;
+                                break;
+                            case EndpointOutcomeKind.error:
+                                resp.statusCode = 503;
+                                resp.statusText = "Service Unavailable";
+                                resp.retryAfter = "2";
+                                resp.bodyText = toJsonText(serializeErrorResponse(srFull.errorCode, srFull.errorMessage, srFull.groups));
+                                bodyLen = resp.bodyText.length;
+                                break;
+                        }
+                        return resp;
                     }
+                    resp.statusCode = 200;
+                    resp.statusText = "OK";
                     return resp;
                 case EndpointOutcomeKind.collecting:
                     resp.statusCode = 202;
@@ -209,10 +234,14 @@ class HikariRouter {
         }
 
         if (routePath == "/api/v1/nodes") {
+            if (discovery is null) {
+                return jsonErrorInto(503, "Service Unavailable", "discovery_unavailable", "Discovery service unavailable", resp.corsAllowOrigin, bodyBuf, bodyLen);
+            }
             bool probePeers = config.discovery.enabled_on_dashboard_open && !queryHas(req.query, "probe=0");
             bool forced = queryHas(req.query, "refresh=1");
-            auto info = coordinator.getInfo();
-            if (discovery !is null && discovery.listNodesAndScheduleDiscoveryJson(info.node_id, info, probePeers, forced, bodyBuf, bodyLen)) {
+            InfoScratch infoScratch;
+            auto info = coordinator.getInfoInto(infoScratch);
+            if (discovery.listNodesAndScheduleDiscoveryJson(info.node_id, info, probePeers, forced, bodyBuf, bodyLen)) {
                 resp.statusCode = 200;
                 resp.statusText = "OK";
                 return resp;
@@ -268,8 +297,9 @@ class HikariRouter {
 
         string originHdr = req.getOriginHeader();
 
-        auto knownFqdns = registry !is null ? registry.knownFqdns() : null;
-        auto ov = validateRequestOrigin(originHdr, config, localFqdn, magicSuffix, knownFqdns);
+        auto ov = discovery !is null
+            ? discovery.validateOrigin(originHdr, config)
+            : validateRequestOrigin(originHdr, config, localFqdn, magicSuffix, registry !is null ? registry.knownFqdns() : null);
         if (!ov.allowed) {
             return jsonError(403, "Forbidden", "origin_denied", "Origin not authorized for this tailnet node", resp.headers);
         }
@@ -363,6 +393,9 @@ class HikariRouter {
         }
 
         if (routePath == "/api/v1/nodes") {
+            if (discovery is null) {
+                return jsonError(503, "Service Unavailable", "discovery_unavailable", "Discovery service unavailable", resp.headers);
+            }
             // Returns the registry immediately; peer validation runs in the background
             // when due (tailnet TTL, or a rate-limited operator "Scan peers" request).
             bool probePeers = config.discovery.enabled_on_dashboard_open && !queryHas(req.query, "probe=0");

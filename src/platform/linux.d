@@ -174,6 +174,7 @@ class LinuxPlatformBackend : PlatformBackend {
 
     // Thread-safe identity cache (boot_id / host only allocate if changed from cached value)
     private Mutex idMtx;
+    private Mutex fsMtx;
     private FixedString!128 idHostStore;
     private string idHostCached;
     private FixedString!128 idBootStore;
@@ -224,6 +225,7 @@ class LinuxPlatformBackend : PlatformBackend {
         this.statvfsHook = statvfsHook;
         this.nvml = new NvmlLoader();
         this.idMtx = new Mutex();
+        this.fsMtx = new Mutex();
     }
 
     private bool isRealHost() const pure nothrow @safe {
@@ -1271,6 +1273,12 @@ class LinuxPlatformBackend : PlatformBackend {
     }
 
     override RawFilesystemResult sampleFilesystems() {
+        synchronized (fsMtx) {
+            return sampleFilesystemsLocked();
+        }
+    }
+
+    private RawFilesystemResult sampleFilesystemsLocked() {
         RawFilesystemResult r;
         size_t candCount = parseMountsFixed();
         if (candCount == 0) {
@@ -2036,7 +2044,16 @@ class LinuxPlatformBackend : PlatformBackend {
         auto blkDir = sysRoot ~ "/block";
         if (!exists(blkDir)) return outStor;
 
-        auto mounts = sampleFilesystems().mounts;
+        MountStatus[] mounts;
+        synchronized (fsMtx) {
+            foreach (m; sampleFilesystemsLocked().mounts) {
+                MountStatus copy = m;
+                copy.mount = m.mount.idup;
+                copy.source = m.source.idup;
+                copy.fs = m.fs.idup;
+                mounts ~= copy;
+            }
+        }
 
         try {
             foreach (DirEntry de; dirEntries(blkDir, SpanMode.shallow)) {

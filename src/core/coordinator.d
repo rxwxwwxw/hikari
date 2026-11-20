@@ -133,7 +133,21 @@ class RefreshCoordinator {
 
     InfoResponse getInfo() {
         synchronized (mtx) {
-            return store.buildInfoResponse(clocks.wallTs());
+            auto ir = store.buildInfoResponse(clocks.wallTs());
+            ir.hikari_version = ir.hikari_version.length > 0 ? ir.hikari_version.idup : "";
+            ir.caddy_version = ir.caddy_version.length > 0 ? ir.caddy_version.idup : "";
+            ir.tailscale_version = ir.tailscale_version.length > 0 ? ir.tailscale_version.idup : "";
+            ir.host = ir.host.length > 0 ? ir.host.idup : "";
+            ir.fqdn = ir.fqdn.length > 0 ? ir.fqdn.idup : "";
+            ir.os = ir.os.length > 0 ? ir.os.idup : "";
+            ir.arch = ir.arch.length > 0 ? ir.arch.idup : "";
+            return ir;
+        }
+    }
+
+    InfoResponse getInfoInto(ref InfoScratch scratch) {
+        synchronized (mtx) {
+            return store.copyInfoResponseInto(scratch, clocks.wallTs());
         }
     }
 
@@ -702,14 +716,20 @@ class RefreshCoordinator {
         if (mr.drift.hikari_version.length == 0) {
             mr.drift.hikari_version = AGENT_VERSION;
         }
-        if (mr.drift.caddy_version.length == 0 && stateDir.length > 0) {
+        if (stateDir.length > 0) {
             IntegrationRecord rec;
             if (loadIntegrationRecord(stateDir, rec)) {
-                mr.drift.caddy_version = queryLocalCaddyVersion(stateDir);
+                auto integratedVer = queryLocalCaddyVersion(stateDir);
+                if (integratedVer.length > 0) {
+                    mr.drift.caddy_version = integratedVer;
+                }
             }
         }
-        if (mr.drift.tailscale_version.length == 0 && tsFixture.length > 0) {
-            mr.drift.tailscale_version = queryLocalTailscaleVersion(tsFixture);
+        if (tsFixture.length > 0) {
+            auto fixTsVer = queryLocalTailscaleVersion(tsFixture);
+            if (fixTsVer.length > 0) {
+                mr.drift.tailscale_version = fixTsVer;
+            }
         }
 
         synchronized (mtx) {

@@ -857,7 +857,7 @@
       const pres = getPresenceInfo(n, st);
       if (pres.online) onlineCount++;
       else if (pres.maybeOffline) maybeOfflineCount++;
-      else offlineCount++;
+      else if (pres.offline) offlineCount++;
       if (st && st.data && st.data.drift && st.data.drift.reboot_required === true) rebootCount++;
     }
 
@@ -1436,7 +1436,7 @@
       for (const b of d.batteries) {
         batCard.appendChild(el("div", { className: "sub-item" }, renderKv([
           [b.name || b.id, `${formatPct(b.pct)} (${b.status})`],
-          ["Power", b.power_watts !== null ? b.power_watts.toFixed(1) + " W" : "—"],
+          ["Power", (b.power_watts !== null && b.power_watts !== undefined) ? b.power_watts.toFixed(1) + " W" : "—"],
           ["Remaining", formatDuration(b.time_remaining_s)],
           ["Health", b.health_pct !== null && b.health_pct !== undefined
             ? formatPct(b.health_pct) + " of design capacity" : "—"],
@@ -1852,8 +1852,8 @@
       renderKv([
         ["Running kernel", dr.running_kernel],
         ["Installed kernel", dr.installed_kernel],
-        ["Reboot required", dr.reboot_required === null ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
-        ["Pending updates", dr.pending_updates !== null ? String(dr.pending_updates) : "Unknown"],
+        ["Reboot required", (dr.reboot_required === null || dr.reboot_required === undefined) ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
+        ["Pending updates", (dr.pending_updates !== null && dr.pending_updates !== undefined) ? String(dr.pending_updates) : "Unknown"],
         ["Package cache age", formatDuration(dr.package_cache_age_s)],
         ["hikari version", formatVer(dr.hikari_version || d.agent_version)],
         ["Caddy version", dr.caddy_version ? formatVer(dr.caddy_version) : "Unavailable"],

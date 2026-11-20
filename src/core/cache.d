@@ -29,6 +29,16 @@ struct GroupCacheEntry {
     ulong generation = 0;
 }
 
+struct InfoScratch {
+    FixedString!64 hikariVer;
+    FixedString!64 caddyVer;
+    FixedString!64 tailscaleVer;
+    FixedString!128 host;
+    FixedString!256 fqdn;
+    FixedString!32 os;
+    FixedString!32 arch;
+}
+
 class TelemetryCacheStore {
     HikariConfig config;
     string nodeId;
@@ -428,9 +438,86 @@ class TelemetryCacheStore {
         }
     }
 
+    private static string ownedCopy(string s) pure nothrow @safe {
+        return s.length > 0 ? s.idup : "";
+    }
+
     StatusResponse snapshotStatusResponse(long nowMonoNs, long nowWallTs) @safe {
         StatusResponse resp;
         snapshotStatusInto(resp, nowMonoNs, nowWallTs);
+        resp.host = ownedCopy(resp.host);
+        resp.fqdn = ownedCopy(resp.fqdn);
+        resp.os = ownedCopy(resp.os);
+        resp.arch = ownedCopy(resp.arch);
+        resp.boot_id = ownedCopy(resp.boot_id);
+        resp.drift.running_kernel = ownedCopy(resp.drift.running_kernel);
+        resp.drift.installed_kernel = ownedCopy(resp.drift.installed_kernel);
+        resp.drift.hikari_version = ownedCopy(resp.drift.hikari_version);
+        resp.drift.caddy_version = ownedCopy(resp.drift.caddy_version);
+        resp.drift.tailscale_version = ownedCopy(resp.drift.tailscale_version);
+
+        if (resp.network.length > 0) {
+            auto nets = new NetworkInterfaceStatus[resp.network.length];
+            foreach (i, n; resp.network) {
+                nets[i] = n;
+                nets[i].id = ownedCopy(n.id);
+                nets[i].name = ownedCopy(n.name);
+                nets[i].kind = ownedCopy(n.kind);
+            }
+            resp.network = nets;
+        }
+        if (resp.top_cpu.length > 0) {
+            auto cpus = new ProcessStatus[resp.top_cpu.length];
+            foreach (i, p; resp.top_cpu) {
+                cpus[i] = p;
+                cpus[i].start_id = ownedCopy(p.start_id);
+                cpus[i].name = ownedCopy(p.name);
+                cpus[i].memory_kind = ownedCopy(p.memory_kind);
+            }
+            resp.top_cpu = cpus;
+        }
+        if (resp.top_mem.length > 0) {
+            auto mems = new ProcessStatus[resp.top_mem.length];
+            foreach (i, p; resp.top_mem) {
+                mems[i] = p;
+                mems[i].start_id = ownedCopy(p.start_id);
+                mems[i].name = ownedCopy(p.name);
+                mems[i].memory_kind = ownedCopy(p.memory_kind);
+            }
+            resp.top_mem = mems;
+        }
+        if (resp.mounts.length > 0) {
+            auto mnts = new MountStatus[resp.mounts.length];
+            foreach (i, m; resp.mounts) {
+                mnts[i] = m;
+                mnts[i].mount = ownedCopy(m.mount);
+                mnts[i].source = ownedCopy(m.source);
+                mnts[i].fs = ownedCopy(m.fs);
+            }
+            resp.mounts = mnts;
+        }
+        if (resp.gpus.length > 0) {
+            auto gpus = new GpuDynamicStatus[resp.gpus.length];
+            foreach (i, g; resp.gpus) {
+                gpus[i] = g;
+                gpus[i].id = ownedCopy(g.id);
+                gpus[i].display_name = ownedCopy(g.display_name);
+                gpus[i].vendor = ownedCopy(g.vendor);
+                gpus[i].error = ownedCopy(g.error);
+            }
+            resp.gpus = gpus;
+        }
+        if (resp.batteries.length > 0) {
+            auto bats = new BatteryStatus[resp.batteries.length];
+            foreach (i, b; resp.batteries) {
+                bats[i] = b;
+                bats[i].id = ownedCopy(b.id);
+                bats[i].name = ownedCopy(b.name);
+                bats[i].status = ownedCopy(b.status);
+            }
+            resp.batteries = bats;
+        }
+
         foreach (i, g; STATUS_PROBE_GROUPS) {
             resp.groups[cast(string) g] = resp.fixed_groups[i];
         }
@@ -473,6 +560,25 @@ class TelemetryCacheStore {
         auto fp = ProbeGroup.fast in groups;
         ir.health = (fp !is null && fp.consecutiveFailures > 0 && !fp.hasSuccess) ? "degraded" : "ok";
         ir.hardware_summary = cachedHardwareSummary;
+        return ir;
+    }
+
+    InfoResponse copyInfoResponseInto(ref InfoScratch scratch, long nowWallTs) const nothrow @nogc @trusted {
+        auto ir = buildInfoResponse(nowWallTs);
+        scratch.hikariVer.set(ir.hikari_version);
+        scratch.caddyVer.set(ir.caddy_version);
+        scratch.tailscaleVer.set(ir.tailscale_version);
+        scratch.host.set(ir.host);
+        scratch.fqdn.set(ir.fqdn);
+        scratch.os.set(ir.os);
+        scratch.arch.set(ir.arch);
+        ir.hikari_version = scratch.hikariVer.slice();
+        ir.caddy_version = scratch.caddyVer.slice();
+        ir.tailscale_version = scratch.tailscaleVer.slice();
+        ir.host = scratch.host.slice();
+        ir.fqdn = scratch.fqdn.slice();
+        ir.os = scratch.os.slice();
+        ir.arch = scratch.arch.slice();
         return ir;
     }
 }

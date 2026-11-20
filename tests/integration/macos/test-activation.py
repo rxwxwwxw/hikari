@@ -74,6 +74,7 @@ class Activation(unittest.TestCase):
             # Model installer interruption after the atomic switch. The shipped
             # D recovery command must understand the installer's marker.
             subprocess.run([str(REPO / "bin/hikari"), "update", "recover", "--no-restart",
+                            "--config", str(config),
                             "--versions-dir", str(versions), "--state-dir", str(root / "state")], check=True,
                            capture_output=True, text=True)
             self.assertEqual((versions / "current").resolve(), new)

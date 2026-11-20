@@ -7,6 +7,7 @@ import core.model;
 import core.serializer : JsonBufferWriter, parseHardwareSummary, sanitizeOsString, writeNodesResponseJson;
 import core.sync.mutex;
 import core.thread;
+import http.security : OriginValidation, validateRequestOrigin;
 import std.algorithm : canFind, endsWith, startsWith;
 import std.file : exists, readText;
 import std.json : JSONType, JSONValue, parseJSON;
@@ -461,6 +462,15 @@ class TailnetDiscoveryService {
         synchronized (mtx) {
             if (cachedTailnet.available && cachedTailnet.magic_dns_suffix.length > 0) return cachedTailnet.magic_dns_suffix;
             return stickyMagicSuffix;
+        }
+    }
+
+    OriginValidation validateOrigin(string originHeader, const ref HikariConfig cfg) {
+        synchronized (mtx) {
+            string lf = (cachedTailnet.available && cachedTailnet.selfNode.fqdn.length > 0) ? cachedTailnet.selfNode.fqdn : stickySelfFqdn;
+            string ms = (cachedTailnet.available && cachedTailnet.magic_dns_suffix.length > 0) ? cachedTailnet.magic_dns_suffix : stickyMagicSuffix;
+            auto known = registry !is null ? registry.knownFqdnsSlice() : null;
+            return validateRequestOrigin(originHeader, cfg, lf, ms, known);
         }
     }
 

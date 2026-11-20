@@ -126,3 +126,49 @@ unittest {
         assert(state.trackedNetworkCount() == 2, "Compaction must retain exact active interface count");
     }
 }
+
+unittest {
+    // Regression: over-length bootId (>128), network id (>64), and process start_id (>31)
+    // must match their truncated slot keys across updates without leaking duplicate slots.
+    import std.array : replicate;
+
+    auto longBoot = replicate("B", 140);
+    auto longIfId = replicate("N", 80);
+    auto longStartId = replicate("S", 48);
+
+    auto state = new SystemRateState();
+
+    assert(state.computeAggregateCpuPct(longBoot, 1000, 800, 500_000_000L).isNull);
+    auto cpu2 = state.computeAggregateCpuPct(longBoot, 2000, 1300, 1_500_000_000L);
+    assert(!cpu2.isNull && abs(cpu2.get - 50.0) < 0.1, "Over-length bootId must match CPU baseline");
+
+    auto n1 = state.computeNetworkRates(longBoot, [
+        RawNetworkInterface(longIfId, "eth0", "physical", 1000, 500, Nullable!bool(true), Nullable!ulong.init),
+    ], 1_000_000_000L);
+    assert(n1.length == 1 && n1[0].rx_bytes_per_s.isNull);
+    assert(state.trackedNetworkCount() == 1);
+
+    auto n2 = state.computeNetworkRates(longBoot, [
+        RawNetworkInterface(longIfId, "eth0", "physical", 3000, 1500, Nullable!bool(true), Nullable!ulong.init),
+    ], 2_000_000_000L);
+    assert(n2.length == 1 && !n2[0].rx_bytes_per_s.isNull);
+    assert(abs(n2[0].rx_bytes_per_s.get - 2000.0) < 0.1);
+    assert(state.trackedNetworkCount() == 1, "Over-length net key must match existing slot");
+
+    RawProcessResult p1;
+    p1.total_cpu_ticks = 1000;
+    p1.logical_cores = 2;
+    p1.processes = [RawProcess(42, longStartId, "worker", 100, 1024, "rss")];
+    auto pr1 = state.computeProcessRates(longBoot, p1, 3_000_000_000L);
+    assert(pr1.length == 1 && pr1[0].cpu_pct.isNull);
+    assert(state.trackedProcessCount() == 1);
+
+    RawProcessResult p2;
+    p2.total_cpu_ticks = 1200;
+    p2.logical_cores = 2;
+    p2.processes = [RawProcess(42, longStartId, "worker", 150, 1024, "rss")];
+    auto pr2 = state.computeProcessRates(longBoot, p2, 4_000_000_000L);
+    assert(pr2.length == 1 && !pr2[0].cpu_pct.isNull);
+    assert(abs(pr2[0].cpu_pct.get - 50.0) < 0.1);
+    assert(state.trackedProcessCount() == 1, "Over-length start_id must match existing slot");
+}

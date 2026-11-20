@@ -47,7 +47,7 @@ struct FixedString(size_t N) {
 struct NetCounterTable {
     struct Slot {
         bool occupied = false;
-        FixedString!64 bootId;
+        FixedString!128 bootId;
         FixedString!64 id;
         ulong value = 0;
         long monoNs = 0;
@@ -82,6 +82,8 @@ struct NetCounterTable {
     }
 
     Nullable!double update(const(char)[] bootId, const(char)[] id, ulong value, long monoNs, long bootOrWallNs = -1) {
+        if (bootId.length > 128) bootId = bootId[0 .. 128];
+        if (id.length > 64) id = id[0 .. 64];
         Nullable!double rate;
         size_t idx = hashPair(bootId, id) & MASK;
         Slot* found = null;
@@ -284,6 +286,7 @@ class SystemRateState {
     }
 
     void checkBootId(const(char)[] bootId) {
+        if (bootId.length > 128) bootId = bootId[0 .. 128];
         if (lastBootId.len > 0 && bootId.length > 0 && !lastBootId.equals(bootId)) {
             resetAll();
         }
@@ -293,6 +296,7 @@ class SystemRateState {
     }
 
     Nullable!double computeAggregateCpuPct(const(char)[] bootId, ulong totalTicks, ulong idleTicks, long monoNs, long bootOrWallNs = -1) {
+        if (bootId.length > 128) bootId = bootId[0 .. 128];
         Nullable!double pct;
         checkBootId(bootId);
 
@@ -361,6 +365,7 @@ class SystemRateState {
     }
 
     NetworkInterfaceStatus[] computeNetworkRates(const(char)[] bootId, const RawNetworkInterface[] rawIfs, long monoNs, long bootOrWallNs = -1) {
+        if (bootId.length > 128) bootId = bootId[0 .. 128];
         checkBootId(bootId);
         netRxTracker.minIntervalNs = minIntervalNs;
         netRxTracker.maxIntervalNs = maxIntervalNs;
@@ -423,6 +428,7 @@ class SystemRateState {
     }
 
     ProcessStatus[] computeProcessRates(const(char)[] bootId, const ref RawProcessResult raw, long monoNs, long bootOrWallNs = -1) {
+        if (bootId.length > 128) bootId = bootId[0 .. 128];
         checkBootId(bootId);
         procGen++;
 
@@ -432,7 +438,8 @@ class SystemRateState {
         foreach (const ref rp; raw.processes) {
             if (outCount >= MAX_TRACKED_PROCESSES) break;
 
-            procStartStore[outCount].set(rp.start_id);
+            auto startId = rp.start_id.length > 31 ? rp.start_id[0 .. 31] : rp.start_id;
+            procStartStore[outCount].set(startId);
             procNameStore[outCount].set(rp.name);
 
             ProcessStatus ps;
@@ -442,7 +449,7 @@ class SystemRateState {
             ps.rss_bytes = rp.rss_bytes;
             ps.memory_kind = rp.memory_kind;
 
-            size_t idx = hashProcess(rp.pid, rp.start_id) & PROC_MASK;
+            size_t idx = hashProcess(rp.pid, startId) & PROC_MASK;
             ProcSlot* found = null;
             size_t emptyIdx = size_t.max;
             foreach (_; 0 .. PROC_TRACKER_SLOTS) {
@@ -450,7 +457,7 @@ class SystemRateState {
                     emptyIdx = idx;
                     break;
                 }
-                if (procSlots[idx].pid == rp.pid && procSlots[idx].startId.equals(rp.start_id)) {
+                if (procSlots[idx].pid == rp.pid && procSlots[idx].startId.equals(startId)) {
                     found = &procSlots[idx];
                     break;
                 }
@@ -461,7 +468,7 @@ class SystemRateState {
                 if (emptyIdx != size_t.max && procCount + 1 < PROC_TRACKER_SLOTS) {
                     procSlots[emptyIdx].occupied = true;
                     procSlots[emptyIdx].pid = rp.pid;
-                    procSlots[emptyIdx].startId.set(rp.start_id);
+                    procSlots[emptyIdx].startId.set(startId);
                     procSlots[emptyIdx].procTicks = rp.cpu_ticks;
                     procSlots[emptyIdx].totalCpuTicks = raw.total_cpu_ticks;
                     procSlots[emptyIdx].monoNs = monoNs;

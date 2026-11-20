@@ -131,8 +131,14 @@ JSONValue serializeStatusResponse(const ref StatusResponse resp) pure @safe {
     }
 
     JSONValue groups = JSONValue.emptyObject;
-    foreach (k, gm; resp.groups) {
-        groups[k] = serializeGroupMeta(gm);
+    if (resp.use_fixed_groups && resp.groups.length == 0) {
+        foreach (i, g; STATUS_PROBE_GROUPS) {
+            groups[cast(string) g] = serializeGroupMeta(resp.fixed_groups[i]);
+        }
+    } else {
+        foreach (k, gm; resp.groups) {
+            groups[k] = serializeGroupMeta(gm);
+        }
     }
     j["groups"] = groups;
 

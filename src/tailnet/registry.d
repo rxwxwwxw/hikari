@@ -281,6 +281,18 @@ class NodeRegistry {
         size_t idx = findIndex(incoming.node_id, incoming.tailscale_node_id, incoming.fqdn);
         if (idx == size_t.max) {
             NodeRecord copy = incoming;
+            copy.node_id = copy.node_id.length > 0 ? copy.node_id.idup : "";
+            copy.tailscale_node_id = copy.tailscale_node_id.length > 0 ? copy.tailscale_node_id.idup : "";
+            copy.name = copy.name.length > 0 ? copy.name.idup : "";
+            copy.alias_name = copy.alias_name.length > 0 ? copy.alias_name.idup : "";
+            copy.fqdn = copy.fqdn.length > 0 ? copy.fqdn.idup : "";
+            copy.status_url = copy.status_url.length > 0 ? copy.status_url.idup : "";
+            copy.hardware_url = copy.hardware_url.length > 0 ? copy.hardware_url.idup : "";
+            copy.info_url = copy.info_url.length > 0 ? copy.info_url.idup : "";
+            copy.base_path = copy.base_path.length > 0 ? copy.base_path.idup : "/";
+            copy.os = copy.os.length > 0 ? copy.os.idup : "";
+            copy.arch = copy.arch.length > 0 ? copy.arch.idup : "";
+            copy.discovery_state = copy.discovery_state.length > 0 ? copy.discovery_state.idup : "confirmed";
             if (copy.fqdn.length > 0) {
                 ushort p = copy.tailnet_port > 0 ? copy.tailnet_port : 9100;
                 auto bp = copy.base_path.length > 0 ? copy.base_path : "/";
@@ -303,15 +315,15 @@ class NodeRegistry {
         // Preserve operator-owned fields: alias_name, tailnet_port, base_path, hidden
         auto existing = nodes[idx];
         auto prevFqdn = existing.fqdn;
-        existing.node_id = incoming.node_id;
-        if (incoming.tailscale_node_id.length > 0) existing.tailscale_node_id = incoming.tailscale_node_id;
-        if (incoming.name.length > 0) existing.name = incoming.name;
-        if (incoming.fqdn.length > 0) existing.fqdn = incoming.fqdn;
-        if (incoming.os.length > 0) existing.os = incoming.os;
-        if (incoming.arch.length > 0) existing.arch = incoming.arch;
+        if (existing.node_id != incoming.node_id) existing.node_id = incoming.node_id.length > 0 ? incoming.node_id.idup : "";
+        if (incoming.tailscale_node_id.length > 0 && existing.tailscale_node_id != incoming.tailscale_node_id) existing.tailscale_node_id = incoming.tailscale_node_id.idup;
+        if (incoming.name.length > 0 && existing.name != incoming.name) existing.name = incoming.name.idup;
+        if (incoming.fqdn.length > 0 && existing.fqdn != incoming.fqdn) existing.fqdn = incoming.fqdn.idup;
+        if (incoming.os.length > 0 && existing.os != incoming.os) existing.os = incoming.os.idup;
+        if (incoming.arch.length > 0 && existing.arch != incoming.arch) existing.arch = incoming.arch.idup;
         existing.is_self = incoming.is_self || existing.is_self;
         if (!incoming.tailscale_online.isNull) existing.tailscale_online = incoming.tailscale_online;
-        existing.discovery_state = incoming.discovery_state;
+        if (existing.discovery_state != incoming.discovery_state) existing.discovery_state = incoming.discovery_state.length > 0 ? incoming.discovery_state.idup : "";
         if (!incoming.last_seen_ts.isNull) existing.last_seen_ts = incoming.last_seen_ts;
         if (!incoming.last_success_ts.isNull) existing.last_success_ts = incoming.last_success_ts;
         if (!incoming.last_known_hardware_summary.isNull) {

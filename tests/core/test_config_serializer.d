@@ -159,10 +159,10 @@ unittest {
     runHotPathNoGc();
 }
 
-unittest {
+version (Posix) unittest {
     // Runtime zero-GC-allocation verification in steady state across Linux probes and HTTP routing
     import core.cache : TelemetryCacheStore;
-    import core.coordinator : ClockSource, RefreshCoordinator;
+    import core.coordinator : ClockSource, EndpointOutcomeKind, RefreshCoordinator;
     import core.limits : HTTP_RESPONSE_BUF_SIZE;
     import core.memory : GC;
     import http.routes : HikariRouter, HttpRequest;
@@ -243,9 +243,11 @@ unittest {
         auto dl = MonoTime.currTime + msecs(2000);
         while (MonoTime.currTime < dl) {
             auto st = coord.getStatus(false);
-            bool anyRefreshing = false;
-            foreach (_, gm; st.groups) {
-                if (gm.refreshing) anyRefreshing = true;
+            bool anyRefreshing = st.kind != EndpointOutcomeKind.ok;
+            if (st.kind == EndpointOutcomeKind.ok) {
+                foreach (_, gm; st.payload.groups) {
+                    if (gm.refreshing) anyRefreshing = true;
+                }
             }
             if (!anyRefreshing) break;
             Thread.sleep(msecs(5));
