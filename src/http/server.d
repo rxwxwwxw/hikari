@@ -454,11 +454,14 @@ class LoopbackHttpServer {
         }
     }
 
+    pragma(inline, false)
+    private void wakeWorkers() {
+        synchronized (qMtx) qCond.notifyAll();
+    }
+
     void serveLoop() {
         if (listener is null) startListening();
-        scope (exit) {
-            synchronized (qMtx) qCond.notifyAll();
-        }
+        scope (exit) wakeWorkers();
         while (atomicLoad(running)) {
             auto h = atomicLoad(rawHandle);
             if (h == size_t.max) break;
@@ -490,7 +493,7 @@ class LoopbackHttpServer {
     // Called after stopping acceptance. An external update supervisor waits for
     // the service to stop before starting the replacement, preserving responses.
     void drainClients() {
-        synchronized (qMtx) qCond.notifyAll();
+        wakeWorkers();
         while (atomicLoad(clients)) Thread.sleep(msecs(10));
     }
 
