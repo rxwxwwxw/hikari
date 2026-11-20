@@ -934,6 +934,39 @@ void writeGroupMetaJson(ref JsonBufferWriter w, const ref GroupMeta gm) @nogc no
     w.putChar('}');
 }
 
+private void writeGroupMetaMapJson(ref JsonBufferWriter w, const GroupMeta[string] groups) @nogc nothrow @trusted {
+    if (groups is null) return;
+    bool first = true;
+    foreach (kv; groups.byKeyValue) {
+        if (!first) w.putChar(',');
+        first = false;
+        w.putJsonString(kv.key);
+        w.putChar(':');
+        writeGroupMetaJson(w, kv.value);
+    }
+}
+
+private void writeProcessArrayJson(ref JsonBufferWriter w, const ProcessStatus[] procs) @nogc nothrow @safe {
+    w.putChar('[');
+    foreach (i, const ref p; procs) {
+        if (i > 0) w.putChar(',');
+        w.putRaw(`{"pid":`);
+        w.putUlong(p.pid);
+        w.putRaw(`,"start_id":`);
+        w.putSanitizedString(p.start_id, 64);
+        w.putRaw(`,"name":`);
+        w.putSanitizedString(p.name, 128);
+        w.putRaw(`,"cpu_pct":`);
+        w.putNullableDouble(p.cpu_pct);
+        w.putRaw(`,"rss_bytes":`);
+        w.putNullableUlong(p.rss_bytes);
+        w.putRaw(`,"memory_kind":`);
+        w.putJsonString(p.memory_kind);
+        w.putChar('}');
+    }
+    w.putChar(']');
+}
+
 void writeStatusResponseJson(ref JsonBufferWriter w, const ref StatusResponse resp) @nogc nothrow @safe {
     w.putRaw(`{"app":`);
     w.putJsonString(resp.app);
@@ -973,14 +1006,7 @@ void writeStatusResponseJson(ref JsonBufferWriter w, const ref StatusResponse re
             writeGroupMetaJson(w, resp.fixed_groups[i]);
         }
     } else {
-        bool firstGrp = true;
-        foreach (k, const ref gm; resp.groups) {
-            if (!firstGrp) w.putChar(',');
-            firstGrp = false;
-            w.putJsonString(k);
-            w.putChar(':');
-            writeGroupMetaJson(w, gm);
-        }
+        writeGroupMetaMapJson(w, resp.groups);
     }
     w.putChar('}');
 
@@ -1127,31 +1153,10 @@ void writeStatusResponseJson(ref JsonBufferWriter w, const ref StatusResponse re
     }
     w.putChar(']');
 
-    void writeProcArray(const ProcessStatus[] procs) {
-        w.putChar('[');
-        foreach (i, const ref p; procs) {
-            if (i > 0) w.putChar(',');
-            w.putRaw(`{"pid":`);
-            w.putUlong(p.pid);
-            w.putRaw(`,"start_id":`);
-            w.putSanitizedString(p.start_id, 64);
-            w.putRaw(`,"name":`);
-            w.putSanitizedString(p.name, 128);
-            w.putRaw(`,"cpu_pct":`);
-            w.putNullableDouble(p.cpu_pct);
-            w.putRaw(`,"rss_bytes":`);
-            w.putNullableUlong(p.rss_bytes);
-            w.putRaw(`,"memory_kind":`);
-            w.putJsonString(p.memory_kind);
-            w.putChar('}');
-        }
-        w.putChar(']');
-    }
-
     w.putRaw(`,"top_cpu":`);
-    writeProcArray(resp.top_cpu);
+    writeProcessArrayJson(w, resp.top_cpu);
     w.putRaw(`,"top_mem":`);
-    writeProcArray(resp.top_mem);
+    writeProcessArrayJson(w, resp.top_mem);
 
     w.putRaw(`,"drift":{"running_kernel":`);
     w.putSanitizedStringOrNull(resp.drift.running_kernel, 128);
@@ -1252,14 +1257,7 @@ void writeErrorResponseJson(ref JsonBufferWriter w, const(char)[] errCode, const
     w.putSanitizedString(message, 256);
     if (groups !is null) {
         w.putRaw(`,"groups":{`);
-        bool first = true;
-        foreach (k, const ref gm; groups) {
-            if (!first) w.putChar(',');
-            first = false;
-            w.putJsonString(k);
-            w.putChar(':');
-            writeGroupMetaJson(w, gm);
-        }
+        writeGroupMetaMapJson(w, groups);
         w.putChar('}');
     }
     w.putChar('}');

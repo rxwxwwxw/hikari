@@ -111,6 +111,19 @@ unittest {
     procRes.processes = rawProcs[];
 
     auto jsonBuf = new char[HTTP_RESPONSE_BUF_SIZE];
+    auto aaJsonBuf = new char[HTTP_RESPONSE_BUF_SIZE];
+    auto errJsonBuf = new char[HTTP_RESPONSE_BUF_SIZE];
+    size_t aaJsonLen = 0;
+    size_t errJsonLen = 0;
+    StatusResponse aaSnap;
+    aaSnap.node_id = "hikari:nogc-aa-test";
+    aaSnap.host = "aa-host";
+    aaSnap.os = "linux";
+    aaSnap.arch = "x86_64";
+    aaSnap.server_ts = 1794945600L;
+    aaSnap.use_fixed_groups = false;
+    aaSnap.groups["fast"] = GroupMeta(GroupStatus.fresh, Nullable!long(1794945598L), Nullable!long(2L), false);
+
     static immutable string[1] knownFqdns = ["peer.tail1234.ts.net"];
     static immutable string rawReq = "GET /api/v1/status?probe=0 HTTP/1.1\r\nHost: 127.0.0.1:19100\r\nOrigin: https://peer.tail1234.ts.net:9100\r\n\r\n";
 
@@ -149,6 +162,16 @@ unittest {
         writeNodesResponseJson(w4, nr);
         assert(!w4.overflow && w4.pos > 0);
 
+        auto w5 = JsonBufferWriter(aaJsonBuf);
+        writeStatusResponseJson(w5, aaSnap);
+        assert(!w5.overflow && w5.pos > 0);
+        aaJsonLen = w5.pos;
+
+        auto w6 = JsonBufferWriter(errJsonBuf);
+        writeErrorResponseJson(w6, "test_err", "test message", aaSnap.groups);
+        assert(!w6.overflow && w6.pos > 0);
+        errJsonLen = w6.pos;
+
         HttpRequest req;
         assert(parseHttpRequestInPlace(rawReq, req));
         assert(isValidHostHeader(req.getHostHeader(), "workstation.tail1234.ts.net"));
@@ -157,6 +180,16 @@ unittest {
     }
 
     runHotPathNoGc();
+
+    auto aaParsed = parseJSON(cast(string) aaJsonBuf[0 .. aaJsonLen]);
+    assert(aaParsed["groups"]["fast"]["status"].str == "fresh");
+    assert(aaParsed["groups"]["fast"]["sampled_at"].integer == 1794945598);
+    assert(aaParsed["groups"]["fast"]["age_s"].integer == 2);
+
+    auto errParsed = parseJSON(cast(string) errJsonBuf[0 .. errJsonLen]);
+    assert(errParsed["status"].str == "error");
+    assert(errParsed["error"].str == "test_err");
+    assert(errParsed["groups"]["fast"]["status"].str == "fresh");
 }
 
 version (Posix) unittest {
@@ -217,6 +250,7 @@ version (Posix) unittest {
 
     HikariConfig cfg;
     cfg.paths.state_dir = root ~ "/state";
+    cfg.paths.versions_dir = root ~ "/versions";
     cfg.tailscale_fixture = "tests/fixtures/tailscale/online_fleet.json";
     auto store = new TelemetryCacheStore(cfg, "hikari:zero-test");
     auto coord = new RefreshCoordinator(backend, store);

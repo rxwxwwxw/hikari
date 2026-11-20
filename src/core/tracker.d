@@ -2,8 +2,11 @@ module core.tracker;
 
 import core.limits;
 import core.model;
-import std.algorithm : clamp;
 import std.typecons : Nullable;
+
+private double clampDouble(double val, double lo, double hi) pure nothrow @nogc @safe {
+    return val < lo ? lo : (val > hi ? hi : val);
+}
 
 struct FixedString(size_t N) {
     static assert(N <= ushort.max);
@@ -360,7 +363,7 @@ class SystemRateState {
         if (dTotal == 0) return pct;
         ulong active = dTotal > dIdle ? (dTotal - dIdle) : 0;
         double val = (cast(double) active / cast(double) dTotal) * 100.0;
-        pct = clamp(val, 0.0, 100.0);
+        pct = clampDouble(val, 0.0, 100.0);
         return pct;
     }
 
@@ -518,7 +521,7 @@ class SystemRateState {
 
             if (dTotal > 0) {
                 double val = (cast(double) dProc / cast(double) dTotal) * 100.0 * cast(double) cores;
-                ps.cpu_pct = clamp(val, 0.0, 100.0 * cast(double) cores);
+                ps.cpu_pct = clampDouble(val, 0.0, 100.0 * cast(double) cores);
             }
             procOutBuf[outCount++] = ps;
         }

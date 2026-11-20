@@ -23,6 +23,7 @@ unittest {
     scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     auto store = new TelemetryCacheStore(cfg, "hikari:completion-meta");
     auto entry = store.groups[ProbeGroup.fast];
     entry.hasSuccess = true;
@@ -52,6 +53,7 @@ unittest {
 
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     cfg.collection.cold_wait_ms = 500;
     auto fake = new FakePlatformBackend("desktop-x86_64");
     auto store = new TelemetryCacheStore(cfg, "hikari:test-node-1");
@@ -130,6 +132,7 @@ unittest {
 
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     cfg.collection.cold_wait_ms = 2000;
     auto fake = new FakePlatformBackend("desktop-x86_64");
     fake.sleepHardwareMs = 50;
@@ -163,6 +166,7 @@ unittest {
 
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     cfg.collection.cold_wait_ms = 60;
     cfg.collection.probe_timeout_ms = 200;
 
@@ -202,6 +206,7 @@ unittest {
     scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     auto fake = new FakePlatformBackend;
     auto coord = new RefreshCoordinator(fake, new TelemetryCacheStore(cfg, "hikari:network-error"));
     auto first = coord.getStatus();
@@ -228,6 +233,7 @@ unittest {
     scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     auto coord = new RefreshCoordinator(new RestrictedBattery,
         new TelemetryCacheStore(cfg, "hikari:battery-permission"));
     auto status = coord.getStatus();
@@ -285,6 +291,7 @@ private class SlowPersistenceStore : TelemetryCacheStore {
 unittest {
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = makeTempStateDir("slow-disk");
+    cfg.paths.versions_dir = cfg.paths.state_dir ~ "/versions";
     cfg.collection.cold_wait_ms = 20;
     scope(exit) rmdirRecurse(cfg.paths.state_dir);
     auto store = new SlowPersistenceStore(cfg);
@@ -326,6 +333,7 @@ unittest {
 
     auto cfg = HikariConfig.init;
     cfg.paths.state_dir = stateDir;
+    cfg.paths.versions_dir = stateDir ~ "/versions";
     cfg.tailscale_fixture = tsFix;
     cfg.collection.cold_wait_ms = 500;
 

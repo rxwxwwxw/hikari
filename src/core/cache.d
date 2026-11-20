@@ -438,7 +438,7 @@ class TelemetryCacheStore {
         }
     }
 
-    private static string ownedCopy(string s) pure nothrow @safe {
+    private static string ownedCopy(string s) pure @safe {
         return s.length > 0 ? s.idup : "";
     }
 

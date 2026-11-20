@@ -222,6 +222,16 @@ private struct HttpHeaderWriter {
     }
 }
 
+private void writeExtraHeaders(ref HttpHeaderWriter w, const string[string] headers) @nogc nothrow @trusted {
+    if (headers is null) return;
+    foreach (kv; headers.byKeyValue) {
+        w.put(kv.key);
+        w.put(": ");
+        w.put(kv.value);
+        w.put("\r\n");
+    }
+}
+
 private bool formatHttpResponseHeadersInto(
     char[] hdrBuf,
     const ref HttpResponse resp,
@@ -255,13 +265,8 @@ private bool formatHttpResponseHeadersInto(
         w.put(resp.cspHeader);
         w.put("\r\n");
     }
-    if (resp.headers.length > 0) {
-        foreach (k, v; resp.headers) {
-            w.put(k);
-            w.put(": ");
-            w.put(v);
-            w.put("\r\n");
-        }
+    if (resp.headers !is null) {
+        writeExtraHeaders(w, resp.headers);
     }
     w.put("\r\n");
     hdrLen = w.pos;
@@ -613,7 +618,7 @@ class LoopbackHttpServer {
         return sendAllFd(cfd, formatRawHttpResponse(fallback, headOnly));
     }
 
-    private static void closeFdQuietly(socket_t cfd) nothrow @nogc {
+    private static void closeFdQuietly(socket_t cfd) @nogc {
         if (cfd == INVALID_FD) return;
         version (Windows) {
             closesocket(cast(SOCKET) cfd);
@@ -622,7 +627,7 @@ class LoopbackHttpServer {
         }
     }
 
-    private static void setTimeoutMs(socket_t cfd, bool isRecv, long ms) nothrow @nogc {
+    private static void setTimeoutMs(socket_t cfd, bool isRecv, long ms) @nogc {
         if (ms < 1) ms = 1;
         version (Windows) {
             DWORD dms = ms > DWORD.max ? DWORD.max : cast(DWORD) ms;
@@ -635,7 +640,7 @@ class LoopbackHttpServer {
         }
     }
 
-    private static ptrdiff_t rawRecv(socket_t cfd, char* ptr, size_t len) nothrow @nogc {
+    private static ptrdiff_t rawRecv(socket_t cfd, char* ptr, size_t len) @nogc {
         version (Windows) {
             int maxChunk = len > int.max ? int.max : cast(int) len;
             return cast(ptrdiff_t) recv(cast(SOCKET) cfd, ptr, maxChunk, 0);
@@ -648,7 +653,7 @@ class LoopbackHttpServer {
         }
     }
 
-    private static bool sendAllFd(socket_t cfd, const(char)[] data) nothrow @nogc {
+    private static bool sendAllFd(socket_t cfd, const(char)[] data) @nogc {
         auto deadline = MonoTime.currTime + msecs(5000);
         size_t sent = 0;
         while (sent < data.length) {

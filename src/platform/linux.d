@@ -88,7 +88,7 @@ version (Posix) {
         bool eof = false;
         bool hadBytes = false;
 
-        nothrow @trusted:
+        @nogc @trusted:
 
         bool open(const(char)* pathZ) {
             close();
@@ -422,7 +422,7 @@ class LinuxPlatformBackend : PlatformBackend {
         if (res.length > 0) dst.set(res);
     }
 
-    private static const(char)[] readStackFile(ref PathBuf!512 path, char[] dst, bool stripWs = true) nothrow @trusted {
+    private static const(char)[] readStackFile(ref PathBuf!512 path, char[] dst, bool stripWs = true) @nogc @trusted {
         version (Posix) {
             int fd = posixOpen(path.ptr, O_RDONLY);
             if (fd < 0) return null;
@@ -829,7 +829,7 @@ class LinuxPlatformBackend : PlatformBackend {
         }
     }
 
-    private bool netAttrExists(const(char)[] ifName, const(char)[] suffix) const nothrow @nogc @trusted {
+    private bool netAttrExists(const(char)[] ifName, const(char)[] suffix) const @nogc @trusted {
         version (Posix) {
             PathBuf!512 p;
             p.put(sysRoot);
@@ -842,7 +842,7 @@ class LinuxPlatformBackend : PlatformBackend {
         }
     }
 
-    private string classifyNetKind(const(char)[] ifName) const nothrow @nogc @safe {
+    private string classifyNetKind(const(char)[] ifName) const @nogc @safe {
         if (ifName == "lo") return "loopback";
         if (startsWithAscii(ifName, "tailscale") || startsWithAscii(ifName, "ts")) return "tailnet";
 
