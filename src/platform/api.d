@@ -297,6 +297,9 @@ class FakePlatformBackend : PlatformBackend {
             r.drift.installed_kernel = (profile == "desktop-x86_64") ? "6.12.5" : "6.12.4";
         if (profile != "macos-arm64" && profile != "macos-intel")
             r.drift.reboot_required = (profile == "desktop-x86_64");
+        r.drift.hikari_version = AGENT_VERSION;
+        r.drift.caddy_version = "2.11.9";
+        r.drift.tailscale_version = "1.78.1";
         return r;
     }
 

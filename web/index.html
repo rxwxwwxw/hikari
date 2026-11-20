@@ -435,11 +435,11 @@
       <div class="kpi-value" id="kpi-online" style="color:var(--ok)">0</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Unreachable / Offline</div>
+      <div class="kpi-label">Offline</div>
       <div class="kpi-value" id="kpi-offline" style="color:var(--text-muted)">0</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Stale / Warnings</div>
+      <div class="kpi-label">Maybe offline</div>
       <div class="kpi-value" id="kpi-stale" style="color:var(--warn)">0</div>
     </div>
     <div class="kpi-card">
@@ -453,7 +453,8 @@
     <select id="status-filter" class="select" aria-label="Filter by state">
       <option value="all">All hosts</option>
       <option value="online">Online only</option>
-      <option value="offline">Unreachable / Offline</option>
+      <option value="maybe_offline">Maybe offline</option>
+      <option value="offline">Offline</option>
       <option value="reboot">Reboot required</option>
     </select>
     <select id="sort-select" class="select" aria-label="Sort hosts">
@@ -473,7 +474,8 @@
         <tr>
           <th>Machine</th>
           <th>OS / Arch</th>
-          <th>Status &amp; Freshness</th>
+          <th>Versions</th>
+          <th>Status</th>
           <th>CPU</th>
           <th>Memory</th>
           <th>Max Disk</th>
@@ -483,7 +485,7 @@
         </tr>
       </thead>
       <tbody id="fleet-tbody">
-        <tr><td colspan="9" class="muted">Loading known hosts...</td></tr>
+        <tr><td colspan="10" class="muted">Loading known hosts...</td></tr>
       </tbody>
     </table>
   </div>
@@ -658,6 +660,13 @@
     return Number(p).toFixed(1) + "%";
   }
 
+  function formatVer(v) {
+    if (v === null || v === undefined || v === "") return "—";
+    const s = String(v).trim();
+    if (!s) return "—";
+    return s.startsWith("v") ? s : "v" + s;
+  }
+
   function formatDuration(sec) {
     if (sec === null || sec === undefined || !Number.isFinite(sec)) return "—";
     const s = Math.max(0, Math.floor(sec));
@@ -751,20 +760,25 @@
 
   function getPresenceInfo(node, st) {
     if (!st) {
-      if (node.discovery_state === "unreachable") return { label: "Unreachable", cls: "badge-err", online: false };
-      return { label: "Checking", cls: "badge-muted", online: false };
+      if (node.discovery_state === "unreachable" || node.tailscale_online === false) {
+        return { label: "Offline", cls: "badge-err", online: false, maybeOffline: false, offline: true };
+      }
+      return { label: "Checking", cls: "badge-muted", online: false, maybeOffline: false, offline: false };
     }
-    if (st.state === "online") {
-      const groups = st.data && st.data.groups ? Object.values(st.data.groups) : [];
-      const anyErr = groups.some((g) => g.status === "error");
-      const anyStale = groups.some((g) => g.status === "stale");
-      if (anyErr) return { label: "Online · Error", cls: "badge-warn", online: true, stale: true };
-      if (anyStale) return { label: "Online · Stale", cls: "badge-warn", online: true, stale: true };
-      return { label: "Online · Fresh", cls: "badge-ok", online: true, stale: false };
+    if (st.state === "collecting") {
+      if (st.data) return { label: "Online", cls: "badge-ok", online: true, maybeOffline: false, offline: false };
+      return { label: "Collecting (202)", cls: "badge-info", online: true, maybeOffline: false, offline: false };
     }
-    if (st.state === "collecting") return { label: "Collecting (202)", cls: "badge-info", online: true };
-    if (st.state === "incompatible") return { label: "Incompatible", cls: "badge-err", online: false };
-    return { label: "Unreachable", cls: "badge-err", online: false };
+    if (st.state === "incompatible") {
+      return { label: "Incompatible", cls: "badge-err", online: false, maybeOffline: false, offline: true };
+    }
+    if (st.state === "online" || (st.everSeen && st.missedPolls < 2)) {
+      return { label: "Online", cls: "badge-ok", online: true, maybeOffline: false, offline: false };
+    }
+    if (st.state === "maybe_offline" || st.missedPolls < 5) {
+      return { label: "Maybe offline", cls: "badge-warn", online: false, maybeOffline: true, offline: false };
+    }
+    return { label: "Offline", cls: "badge-err", online: false, maybeOffline: false, offline: true };
   }
 
   function maxMountInfo(st) {
@@ -836,33 +850,40 @@
     const filter = document.getElementById("status-filter").value;
     const sortBy = document.getElementById("sort-select").value;
 
-    let onlineCount = 0, offlineCount = 0, staleCount = 0, rebootCount = 0;
+    let onlineCount = 0, offlineCount = 0, maybeOfflineCount = 0, rebootCount = 0;
 
     for (const n of state.nodes) {
       const st = state.statusByNode.get(n.node_id);
       const pres = getPresenceInfo(n, st);
       if (pres.online) onlineCount++;
+      else if (pres.maybeOffline) maybeOfflineCount++;
       else offlineCount++;
-      if (pres.stale) staleCount++;
       if (st && st.data && st.data.drift && st.data.drift.reboot_required === true) rebootCount++;
     }
 
     document.getElementById("kpi-total").textContent = String(state.nodes.length);
     document.getElementById("kpi-online").textContent = String(onlineCount);
     document.getElementById("kpi-offline").textContent = String(offlineCount);
-    document.getElementById("kpi-stale").textContent = String(staleCount);
+    document.getElementById("kpi-stale").textContent = String(maybeOfflineCount);
     document.getElementById("kpi-reboot").textContent = String(rebootCount);
 
     let rows = state.nodes.filter((n) => {
       const st = state.statusByNode.get(n.node_id);
       const pres = getPresenceInfo(n, st);
       if (filter === "online" && !pres.online) return false;
-      if (filter === "offline" && pres.online) return false;
+      if (filter === "maybe_offline" && !pres.maybeOffline) return false;
+      if (filter === "offline" && !pres.offline) return false;
       if (filter === "reboot" && !(st && st.data && st.data.drift && st.data.drift.reboot_required === true)) return false;
 
       if (search) {
         const hwSum = (st && st.data && st.data.hardware_summary) || n.last_known_hardware_summary;
-        const hay = [n.alias, n.name, n.fqdn, n.os, hwSum && hwSum.cpu, hwSum && hwSum.system_model].filter(Boolean).join(" ").toLowerCase();
+        const dr = st && st.data && st.data.drift ? st.data.drift : null;
+        const hay = [
+          n.alias, n.name, n.fqdn, n.os,
+          hwSum && hwSum.cpu, hwSum && hwSum.system_model,
+          st && st.data && st.data.agent_version,
+          dr && dr.hikari_version, dr && dr.caddy_version, dr && dr.tailscale_version,
+        ].filter(Boolean).join(" ").toLowerCase();
         if (!hay.includes(search)) return false;
       }
       return true;
@@ -896,7 +917,7 @@
     tbody.textContent = "";
 
     if (rows.length === 0) {
-      tbody.appendChild(el("tr", null, el("td", { colspan: 9, className: "muted", text: "No matching machines." })));
+      tbody.appendChild(el("tr", null, el("td", { colspan: 10, className: "muted", text: "No matching machines." })));
       return;
     }
 
@@ -939,7 +960,17 @@
         el("div", { className: "host-sub", text: osArchSub }),
       ]));
 
-      // Status & Freshness
+      // Versions
+      const dr = d && d.drift ? d.drift : null;
+      const hikariVer = (dr && dr.hikari_version) || (d && d.agent_version) || null;
+      const caddyVer = dr && dr.caddy_version ? dr.caddy_version : null;
+      const tsVer = dr && dr.tailscale_version ? dr.tailscale_version : null;
+      tr.appendChild(el("td", null, [
+        el("div", { className: "mono", text: "hikari " + formatVer(hikariVer) }),
+        el("div", { className: "host-sub", text: `caddy ${formatVer(caddyVer)} · ts ${formatVer(tsVer)}` }),
+      ]));
+
+      // Status
       const tdStatus = el("td");
       const badgeWrap = el("div", { style: { display: "flex", gap: "4px", flexWrap: "wrap" } });
       badgeWrap.appendChild(el("span", { className: "badge " + pres.cls, text: pres.label }));
@@ -950,7 +981,7 @@
         badgeWrap.appendChild(el("span", { className: "badge badge-muted", text: "Local" }));
       }
       tdStatus.appendChild(badgeWrap);
-      if (st && st.error) {
+      if (st && st.error && (!pres.online || st.state === "collecting")) {
         tdStatus.appendChild(el("div", { className: "host-sub", text: st.error }));
       }
       tr.appendChild(tdStatus);
@@ -1218,6 +1249,11 @@
       || (hwData && hwData.cpu && hwData.cpu.display_name)
       || "Not loaded";
 
+    const dr = d.drift || {};
+    const hikariVerDisplay = (dr.hikari_version && d.agent_version && dr.hikari_version !== d.agent_version)
+      ? `${formatVer(dr.hikari_version)} (running ${formatVer(d.agent_version)})`
+      : `${(dr.hikari_version || d.agent_version) ? formatVer(dr.hikari_version || d.agent_version) : "v?"} (schema v${d.schema_version ?? "?"})`;
+
     grid.appendChild(el("div", { className: "card" }, [
       el("div", { className: "card-head" }, [
         el("div", { className: "card-title", text: "System & Host Identity" }),
@@ -1227,11 +1263,13 @@
         ["Hostname", d.host],
         ["MagicDNS FQDN", d.fqdn || node.fqdn || "None"],
         ["OS / Arch", `${d.os} / ${d.arch}`],
-        ["OS / Kernel", d.drift && d.drift.running_kernel],
+        ["OS / Kernel", dr.running_kernel],
         ["System model", sysModel],
         ["Processor", cpuModel],
         ["Uptime", formatDuration(d.uptime_s)],
-        ["Agent version", `v${d.agent_version || "?"} (schema v${d.schema_version ?? "?"})`],
+        ["hikari version", hikariVerDisplay],
+        ["Caddy version", dr.caddy_version ? formatVer(dr.caddy_version) : "Unavailable"],
+        ["Tailscale version", dr.tailscale_version ? formatVer(dr.tailscale_version) : "Unavailable"],
       ]),
     ]));
 
@@ -1362,12 +1400,12 @@
         ]));
       }
     }
-    const dr = d.drift || {};
     pmCard.appendChild(el("div", { className: "sub-item" }, renderKv([
       ["Installed OS / kernel", dr.installed_kernel],
       ["Reboot required", (dr.reboot_required === null || dr.reboot_required === undefined) ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
       ["Pending updates", (dr.pending_updates !== null && dr.pending_updates !== undefined) ? String(dr.pending_updates) : "Unknown"],
       ["Metadata age", formatDuration(dr.package_cache_age_s)],
+      ["hikari / Caddy / Tailscale", `${formatVer(dr.hikari_version || d.agent_version)} · ${formatVer(dr.caddy_version)} · ${formatVer(dr.tailscale_version)}`],
     ])));
     grid.appendChild(pmCard);
 
@@ -1817,6 +1855,9 @@
         ["Reboot required", dr.reboot_required === null ? "Unknown" : (dr.reboot_required ? "Yes" : "No")],
         ["Pending updates", dr.pending_updates !== null ? String(dr.pending_updates) : "Unknown"],
         ["Package cache age", formatDuration(dr.package_cache_age_s)],
+        ["hikari version", formatVer(dr.hikari_version || d.agent_version)],
+        ["Caddy version", dr.caddy_version ? formatVer(dr.caddy_version) : "Unavailable"],
+        ["Tailscale version", dr.tailscale_version ? formatVer(dr.tailscale_version) : "Unavailable"],
       ]),
     ]));
 
@@ -1835,6 +1876,13 @@
       const nRes = await fetchJsonBounded(nodesUrl, 6000);
       if (nRes.ok && nRes.json && Array.isArray(nRes.json.nodes)) {
         state.nodes = nRes.json.nodes;
+        const activeIds = new Set(state.nodes.map((n) => n.node_id));
+        for (const id of Array.from(state.statusByNode.keys())) {
+          if (!activeIds.has(id)) state.statusByNode.delete(id);
+        }
+        for (const id of Array.from(state.hardwareByNode.keys())) {
+          if (!activeIds.has(id)) state.hardwareByNode.delete(id);
+        }
         scheduleDiscoveryFollowup(nRes.json.discovery, discoverPeers);
         if (!state.selectedNodeId && state.nodes.length > 0) {
           state.selectedNodeId = state.nodes[0].node_id;
@@ -1848,13 +1896,44 @@
         b.textContent = "Failed to load /api/v1/nodes (HTTP " + nRes.status + ")";
       }
 
+      function recordPollFailure(node, httpStatus, errorMsg) {
+        const prev = state.statusByNode.get(node.node_id);
+        const everSeen = Boolean(prev && prev.everSeen);
+        const missedPolls = prev
+          ? (prev.missedPolls || 0) + 1
+          : ((node.tailscale_online === false || node.discovery_state === "unreachable") ? 5 : 1);
+        let nextState;
+        if (everSeen && missedPolls < 2) {
+          nextState = "online";
+        } else if (missedPolls >= 5) {
+          nextState = "offline";
+        } else {
+          nextState = "maybe_offline";
+        }
+        state.statusByNode.set(node.node_id, {
+          state: nextState,
+          httpStatus,
+          data: prev ? prev.data : null,
+          error: errorMsg,
+          missedPolls,
+          everSeen,
+        });
+      }
+
       // Bounded parallel status requests (concurrency 4)
       await runBoundedPool(state.nodes, 4, async (node) => {
         const url = resolveEndpointUrl(node, "status");
         try {
           const res = await fetchJsonBounded(url, 5000);
           if (res.status === 200 && res.json && res.json.app === "hikari") {
-            state.statusByNode.set(node.node_id, { state: "online", httpStatus: 200, data: res.json, error: null });
+            state.statusByNode.set(node.node_id, {
+              state: "online",
+              httpStatus: 200,
+              data: res.json,
+              error: null,
+              missedPolls: 0,
+              everSeen: true,
+            });
           } else if (res.status === 202) {
             const prev = state.statusByNode.get(node.node_id);
             state.statusByNode.set(node.node_id, {
@@ -1862,15 +1941,11 @@
               httpStatus: 202,
               data: prev ? prev.data : null,
               error: "Collecting initial sample (retry in " + ((res.json && res.json.retry_after_s) || 1) + "s)",
+              missedPolls: 0,
+              everSeen: true,
             });
           } else if (res.status === 503) {
-            const prev = state.statusByNode.get(node.node_id);
-            state.statusByNode.set(node.node_id, {
-              state: "unreachable",
-              httpStatus: 503,
-              data: prev ? prev.data : null,
-              error: (res.json && res.json.error) || "Service unavailable (503)",
-            });
+            recordPollFailure(node, 503, (res.json && res.json.error) || "Service unavailable (503)");
           } else {
             const prev = state.statusByNode.get(node.node_id);
             state.statusByNode.set(node.node_id, {
@@ -1878,17 +1953,13 @@
               httpStatus: res.status,
               data: prev ? prev.data : null,
               error: "Incompatible or HTTP " + res.status,
+              missedPolls: prev ? (prev.missedPolls || 0) + 1 : 5,
+              everSeen: false,
             });
           }
         } catch (err) {
           if (err && err.name === "AbortError") return;
-          const prev = state.statusByNode.get(node.node_id);
-          state.statusByNode.set(node.node_id, {
-            state: "unreachable",
-            httpStatus: 0,
-            data: prev ? prev.data : null,
-            error: "Connection failed or timed out",
-          });
+          recordPollFailure(node, 0, "Connection failed or timed out");
         }
         renderFleet();
         if (state.selectedNodeId === node.node_id) renderDetail();

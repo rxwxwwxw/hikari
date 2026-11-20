@@ -82,6 +82,7 @@ class RefreshCoordinator {
 
     private Mutex mtx;
     private Condition cond;
+    private long lastGcMonoNs = 0;
 
     this(PlatformBackend backend, TelemetryCacheStore store, ClockSource clocks = ClockSource.system()) {
         this.backend = backend;
@@ -333,12 +334,31 @@ class RefreshCoordinator {
     }
 
     private void clearWorkerAlive(ProbeGroup g, ulong expectedGen) {
+        bool runGc = false;
+        long nowMono = clocks.monoNs();
         synchronized (mtx) {
             auto e = store.groups[g];
-            if (e.workerGeneration != expectedGen) return;
-            e.workerAlive = false;
-            store.groups[g] = e;
-            cond.notifyAll();
+            if (e.workerGeneration == expectedGen) {
+                e.workerAlive = false;
+                store.groups[g] = e;
+                cond.notifyAll();
+            }
+            bool anyAlive = false;
+            foreach (_, entry; store.groups) {
+                if (entry.workerAlive) {
+                    anyAlive = true;
+                    break;
+                }
+            }
+            if (!anyAlive && (nowMono - lastGcMonoNs) >= 60_000_000_000L) {
+                lastGcMonoNs = nowMono;
+                runGc = true;
+            }
+        }
+        if (runGc) {
+            import core.memory : GC;
+            GC.collect();
+            GC.minimize();
         }
     }
 
@@ -476,7 +496,7 @@ class RefreshCoordinator {
                 ulong br = b.rss_bytes.isNull ? 0 : b.rss_bytes.get;
                 return ar > br;
             })(byCpu);
-            store.cachedTopCpu = byCpu.length > 5 ? byCpu[0 .. 5] : byCpu;
+            store.cachedTopCpu = byCpu.length > 5 ? byCpu[0 .. 5].dup : byCpu;
 
             auto byMem = rates.dup;
             sort!((a, b) {
@@ -484,7 +504,7 @@ class RefreshCoordinator {
                 ulong br = b.rss_bytes.isNull ? 0 : b.rss_bytes.get;
                 return ar > br;
             })(byMem);
-            store.cachedTopMem = byMem.length > 5 ? byMem[0 .. 5] : byMem;
+            store.cachedTopMem = byMem.length > 5 ? byMem[0 .. 5].dup : byMem;
 
             markGroupSuccessLocked(ProbeGroup.processes, doneMono, doneWall);
         }
@@ -555,6 +575,10 @@ class RefreshCoordinator {
     }
 
     private void runMaintenanceProbe(ulong expectedGen) {
+        import caddyfile.integrate : IntegrationRecord, loadIntegrationRecord;
+        import platform.command : queryLocalCaddyVersion, queryLocalTailscaleVersion;
+        import update.activate : readVersionSymlink;
+
         auto mr = backend.sampleMaintenance();
         long doneMono = clocks.monoNs();
         long doneWall = clocks.wallTs();
@@ -566,6 +590,34 @@ class RefreshCoordinator {
         if (mr.state == CapabilityState.unsupported) {
             markGroupUnsupported(ProbeGroup.maintenance, expectedGen);
             return;
+        }
+
+        string versionsDir;
+        string stateDir;
+        string tsFixture;
+        synchronized (mtx) {
+            versionsDir = store.config.paths.versions_dir;
+            stateDir = store.config.paths.state_dir;
+            tsFixture = store.config.tailscale_fixture;
+        }
+
+        if (versionsDir.length > 0) {
+            auto activeVer = readVersionSymlink(versionsDir ~ "/current");
+            if (activeVer.length > 0) {
+                mr.drift.hikari_version = activeVer;
+            }
+        }
+        if (mr.drift.hikari_version.length == 0) {
+            mr.drift.hikari_version = AGENT_VERSION;
+        }
+        if (mr.drift.caddy_version.length == 0 && stateDir.length > 0) {
+            IntegrationRecord rec;
+            if (loadIntegrationRecord(stateDir, rec)) {
+                mr.drift.caddy_version = queryLocalCaddyVersion(stateDir);
+            }
+        }
+        if (mr.drift.tailscale_version.length == 0 && tsFixture.length > 0) {
+            mr.drift.tailscale_version = queryLocalTailscaleVersion(tsFixture);
         }
 
         synchronized (mtx) {

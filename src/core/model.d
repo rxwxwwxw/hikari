@@ -137,6 +137,9 @@ struct DriftStatus {
     Nullable!bool reboot_required;
     Nullable!uint pending_updates;
     Nullable!long package_cache_age_s;
+    string hikari_version;
+    string caddy_version;
+    string tailscale_version;
 }
 
 struct StatusResponse {
@@ -331,6 +334,9 @@ struct InfoResponse {
     string app = "hikari";
     int schema_version = SCHEMA_VERSION;
     string agent_version = AGENT_VERSION;
+    string hikari_version = AGENT_VERSION;
+    string caddy_version;
+    string tailscale_version;
     string node_id;
     string host;
     string fqdn;

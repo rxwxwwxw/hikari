@@ -218,6 +218,7 @@ async function runTests() {
   const selfStatus = {
     app: "hikari",
     schema_version: 1,
+    agent_version: "0.1.4",
     node_id: "hikari:self-1",
     host: "workstation-linux",
     os: "linux",
@@ -238,7 +239,14 @@ async function runTests() {
     batteries: [],
     top_cpu: [{ pid: 10, start_id: "1", name: "proc<svg onload=alert(3)>", cpu_pct: 50.0, rss_bytes: 1048576 }],
     top_mem: [],
-    drift: { running_kernel: "7.3.4", installed_kernel: "7.3.5", reboot_required: true },
+    drift: {
+      running_kernel: "7.3.4",
+      installed_kernel: "7.3.5",
+      reboot_required: true,
+      hikari_version: "0.1.4",
+      caddy_version: "2.11.9",
+      tailscale_version: "1.78.1",
+    },
   };
 
   const selfHardware = {
@@ -292,6 +300,7 @@ async function runTests() {
         text: () => Promise.resolve(JSON.stringify({
           app: "hikari",
           schema_version: 1,
+          agent_version: "0.1.4",
           node_id: "hikari:mac-5",
           host: "macbook-pro-m3",
           os: "darwin",
@@ -307,7 +316,7 @@ async function runTests() {
           batteries: [{ id: "BAT0", name: "BAT0", status: "discharging", pct: 84.0, time_remaining_s: 15120 }],
           top_cpu: [],
           top_mem: [],
-          drift: { running_kernel: "24.1.0", reboot_required: false },
+          drift: { running_kernel: "24.1.0", reboot_required: false, hikari_version: "0.1.4", caddy_version: "2.10.0", tailscale_version: "1.76.6" },
         })),
       });
     }
@@ -367,31 +376,39 @@ async function runTests() {
   const app = sandbox.window.__hikariApp;
   assert(app, "Dashboard failed to initialize");
 
-  // Verify KPIs & fleet rendering (Linux self, macOS M3, Windows 202 collecting, broken 503, offline ARM)
+  // Verify KPIs & fleet rendering (Linux self, macOS M3, Windows 202 collecting, broken 503 maybe_offline, offline ARM)
   assert.strictEqual(document.getElementById("kpi-total").textContent, "5");
   assert.strictEqual(document.getElementById("kpi-online").textContent, "3", "Self (200) + macOS (200) + Windows (202 collecting) count as online");
-  assert.strictEqual(document.getElementById("kpi-offline").textContent, "2", "broken-node (503) + offline-arm count as unreachable/offline");
+  assert.strictEqual(document.getElementById("kpi-stale").textContent, "1", "broken-node (1st 503 while tailscale_online=true) counts as Maybe offline");
+  assert.strictEqual(document.getElementById("kpi-offline").textContent, "1", "offline-arm (tailscale_online=false) counts as Offline");
   assert.strictEqual(document.getElementById("kpi-reboot").textContent, "1");
 
   // Verify NO hardware requests occurred during fleet overview
   assert(!fetchCalls.some((u) => u.includes("/hardware")), "Overview load must NEVER trigger /api/v1/hardware fetches");
 
-  // Verify enriched Overview tab renders System, Storage, and Processes & Maintenance from /status without /hardware
+  // Verify enriched Overview tab renders System, Versions, Storage, and Processes & Maintenance from /status without /hardware
   const detailBody = document.getElementById("detail-body");
   assert(detailBody.textContent.includes("System & Host Identity"), "Overview must render System & Host Identity card");
   assert(detailBody.textContent.includes("workstation-linux"), "Overview must render hostname");
+  assert(detailBody.textContent.includes("v0.1.4"), "Overview must render hikari version");
+  assert(detailBody.textContent.includes("v2.11.9"), "Overview must render Caddy version");
+  assert(detailBody.textContent.includes("v1.78.1"), "Overview must render Tailscale version");
   assert(detailBody.textContent.includes("Storage & Filesystems"), "Overview must render Storage & Filesystems card");
   assert(detailBody.textContent.includes("btrfs"), "Overview must render filesystem type");
   assert(detailBody.textContent.includes("Processes & Maintenance"), "Overview must render Processes & Maintenance card");
   assert(detailBody.textContent.includes("7.3.5"), "Overview must render installed kernel/OS drift");
   assert.strictEqual(detailBody.findAllByTag("svg").length, 0, "XSS <svg> in process name must not be parsed as HTML");
 
-  // Verify XSS payloads were escaped (no <img>, <script>, or <svg> elements created)
+  // Verify XSS payloads were escaped (no <img>, <script>, or <svg> elements created) and versions/presence labels render
   const tbody = document.getElementById("fleet-tbody");
   assert.strictEqual(tbody.findAllByTag("img").length, 0, "XSS <img> must not be parsed as HTML");
   assert.strictEqual(tbody.findAllByTag("script").length, 0, "XSS <script> must not be parsed as HTML");
   assert(tbody.textContent.includes("<script>alert(2)</script>"), "Untrusted alias must render literally as text");
   assert(tbody.textContent.includes("darwin") && tbody.textContent.includes("windows") && tbody.textContent.includes("linux"), "All 3 OS families must render in fleet table");
+  assert(tbody.textContent.includes("hikari v0.1.4") && tbody.textContent.includes("caddy v2.11.9") && tbody.textContent.includes("ts v1.78.1"), "Fleet table must show hikari, caddy, and tailscale versions");
+  assert(tbody.textContent.includes("caddy v2.10.0") && tbody.textContent.includes("ts v1.76.6"), "Fleet table must show peer caddy and tailscale versions");
+  assert(!tbody.textContent.includes("Online · Fresh") && !tbody.textContent.includes("Online · Stale"), "Legacy freshness status strings must be removed");
+  assert(tbody.textContent.includes("Online") && tbody.textContent.includes("Maybe offline") && tbody.textContent.includes("Offline"), "Fleet table must render Online, Maybe offline, and Offline badges");
 
   // Verify relative URL resolution for local dev vs remote HTTPS
   assert.strictEqual(app.resolveEndpointUrl(nodesPayload.nodes[0], "status"), "./api/v1/status");
@@ -405,7 +422,8 @@ async function runTests() {
   const hwCount2 = fetchCalls.filter((u) => u.includes("/hardware")).length;
   assert.strictEqual(hwCount2, 1, "Second hardware view must reuse session cache");
 
-  // Real timeout AbortErrors must change presence, unlike visibility cancellation.
+  // Real timeout errors drive polling-attempt presence transitions:
+  // seen in last 2 attempts -> Online; 2..4 missed -> Maybe offline; >=5 missed -> Offline.
   const originalFetch = sandbox.fetch;
   const originalTimeout = sandbox.setTimeout;
   sandbox.setTimeout = (fn, ms) => setTimeout(fn, ms === 5000 ? 5 : ms);
@@ -413,9 +431,46 @@ async function runTests() {
     ? new Promise((resolve, reject) => opts.signal.addEventListener("abort", () =>
         reject(Object.assign(new Error("aborted"), { name: "AbortError" }))))
     : originalFetch(url, opts);
+
   await app.refreshAll(false);
-  assert.strictEqual(app.state.statusByNode.get("hikari:self-1").state, "unreachable");
+  let selfSt = app.state.statusByNode.get("hikari:self-1");
+  assert.strictEqual(selfSt.missedPolls, 1);
+  assert.strictEqual(selfSt.state, "online", "1 missed poll after success stays Online (seen in last 2 attempts)");
+  assert.strictEqual(app.getPresenceInfo(nodesPayload.nodes[0], selfSt).label, "Online");
+
+  await app.refreshAll(false);
+  selfSt = app.state.statusByNode.get("hikari:self-1");
+  assert.strictEqual(selfSt.missedPolls, 2);
+  assert.strictEqual(selfSt.state, "maybe_offline", "2 consecutive missed polls transition to Maybe offline");
+  assert.strictEqual(app.getPresenceInfo(nodesPayload.nodes[0], selfSt).label, "Maybe offline");
+
+  await app.refreshAll(false);
+  await app.refreshAll(false);
+  selfSt = app.state.statusByNode.get("hikari:self-1");
+  assert.strictEqual(selfSt.missedPolls, 4);
+  assert.strictEqual(selfSt.state, "maybe_offline", "4 consecutive missed polls remain Maybe offline");
+
+  await app.refreshAll(false);
+  selfSt = app.state.statusByNode.get("hikari:self-1");
+  assert.strictEqual(selfSt.missedPolls, 5);
+  assert.strictEqual(selfSt.state, "offline", "5 consecutive missed polls transition to Offline");
+  assert.strictEqual(app.getPresenceInfo(nodesPayload.nodes[0], selfSt).label, "Offline");
+
+  sandbox.fetch = originalFetch;
   sandbox.setTimeout = originalTimeout;
+
+  // Recovering poll resets missedPolls back to 0 and restores Online
+  await app.refreshAll(false);
+  selfSt = app.state.statusByNode.get("hikari:self-1");
+  assert.strictEqual(selfSt.missedPolls, 0);
+  assert.strictEqual(selfSt.state, "online");
+
+  // Verify stale statusByNode/hardwareByNode entries are pruned when nodes disappear
+  app.state.statusByNode.set("hikari:removed-node", { state: "offline", missedPolls: 5, everSeen: false });
+  app.state.hardwareByNode.set("hikari:removed-node", { loading: false, data: {} });
+  await app.refreshAll(false);
+  assert(!app.state.statusByNode.has("hikari:removed-node"), "Removed node must be pruned from statusByNode");
+  assert(!app.state.hardwareByNode.has("hikari:removed-node"), "Removed node must be pruned from hardwareByNode");
 
   // A cold inventory retries while visible, and stops loading after success.
   app.state.activeTab = "hardware";

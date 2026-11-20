@@ -1008,7 +1008,11 @@ class WindowsPlatformBackend : PlatformBackend {
     override RawMaintenanceResult sampleMaintenance() {
         RawMaintenanceResult r;
         version (Windows) {
+            import platform.command : queryLocalCaddyVersion, queryLocalTailscaleVersion;
             r.state = CapabilityState.ok;
+            r.drift.hikari_version = AGENT_VERSION;
+            r.drift.caddy_version = queryLocalCaddyVersion();
+            r.drift.tailscale_version = queryLocalTailscaleVersion();
             HMODULE ntdll = GetModuleHandleA("ntdll.dll".ptr);
             if (ntdll !is null) {
                 auto pRtl = cast(fn_RtlGetVersion) GetProcAddress(ntdll, "RtlGetVersion".ptr);

@@ -49,7 +49,7 @@ alias PeerInfoFetcher = PeerValidationResult delegate(string infoUrl, string exp
 string trimTrailingDot(string s) pure @safe {
     auto t = s.strip();
     while (t.endsWith(".")) t = t[0 .. $ - 1];
-    return t;
+    return t.length == 0 ? "" : t.idup;
 }
 
 TailscaleSnapshot parseTailscaleStatusJson(string rawJson) {
@@ -82,10 +82,10 @@ TailscaleSnapshot parseTailscaleStatusJson(string rawJson) {
         TailscalePeerCandidate c;
         c.is_self = isSelf;
         if (obj.type != JSONType.object) return c;
-        if (auto p = "ID" in obj.object) if (p.type == JSONType.string) c.tailscale_node_id = p.str;
+        if (auto p = "ID" in obj.object) if (p.type == JSONType.string) c.tailscale_node_id = p.str.idup;
         if (auto p = "HostName" in obj.object) if (p.type == JSONType.string) c.host_name = sanitizeOsString(p.str, 128);
         if (auto p = "DNSName" in obj.object) if (p.type == JSONType.string) c.fqdn = trimTrailingDot(p.str);
-        if (auto p = "OS" in obj.object) if (p.type == JSONType.string) c.os = p.str;
+        if (auto p = "OS" in obj.object) if (p.type == JSONType.string) c.os = p.str.idup;
         if (auto p = "Online" in obj.object) {
             if (p.type == JSONType.true_) c.online = true;
             else if (p.type == JSONType.false_) c.online = false;
@@ -93,7 +93,7 @@ TailscaleSnapshot parseTailscaleStatusJson(string rawJson) {
         if (auto p = "TailscaleIPs" in obj.object) {
             if (p.type == JSONType.array) {
                 foreach (ip; p.array) {
-                    if (ip.type == JSONType.string && ip.str.length > 0) c.tailscale_ips ~= ip.str;
+                    if (ip.type == JSONType.string && ip.str.length > 0) c.tailscale_ips ~= ip.str.idup;
                 }
             }
         }
@@ -164,12 +164,12 @@ PeerValidationResult parsePeerInfoPayload(string bodyText, string expectedFqdn) 
     InfoResponse ir;
     ir.app = "hikari";
     ir.schema_version = cast(int) pSchema.integer;
-    ir.node_id = pNode.str;
-    if (auto p = "agent_version" in j.object) if (p.type == JSONType.string) ir.agent_version = p.str;
+    ir.node_id = pNode.str.idup;
+    if (auto p = "agent_version" in j.object) if (p.type == JSONType.string) ir.agent_version = p.str.idup;
     if (auto p = "host" in j.object) if (p.type == JSONType.string) ir.host = sanitizeOsString(p.str, 128);
     if (auto p = "fqdn" in j.object) if (p.type == JSONType.string) ir.fqdn = trimTrailingDot(p.str);
-    if (auto p = "os" in j.object) if (p.type == JSONType.string) ir.os = p.str;
-    if (auto p = "arch" in j.object) if (p.type == JSONType.string) ir.arch = p.str;
+    if (auto p = "os" in j.object) if (p.type == JSONType.string) ir.os = p.str.idup;
+    if (auto p = "arch" in j.object) if (p.type == JSONType.string) ir.arch = p.str.idup;
     if (auto p = "tailnet_port" in j.object) if (p.type == JSONType.integer) ir.tailnet_port = cast(ushort) p.integer;
     if (auto p = "base_path" in j.object) if (p.type == JSONType.string) ir.base_path = normalizeBasePath(p.str);
     if (auto p = "hardware_summary" in j.object) if (p.type == JSONType.object) {
@@ -504,13 +504,16 @@ class TailnetDiscoveryService {
         long nowMono = clocks.monoNs();
         CandidateJob[] jobs;
         synchronized (mtx) {
+            string[] expiredNonHikari;
+            foreach (k, until; nonHikariUntilMono) {
+                if (nowMono >= until) expiredNonHikari ~= k;
+            }
+            foreach (k; expiredNonHikari) nonHikariUntilMono.remove(k);
+
             foreach (p; snap.peers) {
                 if (p.fqdn.length == 0) continue; // MagicDNS absent for this peer
                 if (!p.online.isNull && !p.online.get) continue; // Tailscale: offline
-                if (auto until = p.fqdn in nonHikariUntilMono) {
-                    if (nowMono < *until) continue;
-                    nonHikariUntilMono.remove(p.fqdn);
-                }
+                if (p.fqdn in nonHikariUntilMono) continue;
                 ushort port = config.listen.tailnet_port;
                 string bp = "/";
                 bool hidden = false;

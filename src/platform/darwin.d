@@ -633,7 +633,11 @@ class DarwinPlatformBackend : PlatformBackend {
     override RawMaintenanceResult sampleMaintenance() {
         RawMaintenanceResult r;
         version (OSX) {
+            import platform.command : queryLocalCaddyVersion, queryLocalTailscaleVersion;
             r.state = CapabilityState.ok;
+            r.drift.hikari_version = AGENT_VERSION;
+            r.drift.caddy_version = queryLocalCaddyVersion();
+            r.drift.tailscale_version = queryLocalTailscaleVersion();
             auto osRelease = sysctlString("kern.osrelease");
             if (osRelease.length == 0) {
                 r.state = CapabilityState.unavailable;

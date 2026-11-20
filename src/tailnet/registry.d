@@ -38,25 +38,25 @@ class NodeRegistry {
             foreach (el; pNodes.array) {
                 if (el.type != JSONType.object) continue;
                 NodeRecord nr;
-                if (auto p = "node_id" in el.object) if (p.type == JSONType.string) nr.node_id = p.str;
+                if (auto p = "node_id" in el.object) if (p.type == JSONType.string) nr.node_id = p.str.idup;
                 if (nr.node_id.length == 0) continue;
-                if (auto p = "tailscale_node_id" in el.object) if (p.type == JSONType.string) nr.tailscale_node_id = p.str;
+                if (auto p = "tailscale_node_id" in el.object) if (p.type == JSONType.string) nr.tailscale_node_id = p.str.idup;
                 if (auto p = "name" in el.object) if (p.type == JSONType.string) nr.name = sanitizeOsString(p.str, 128);
                 if (auto p = "alias" in el.object) if (p.type == JSONType.string) nr.alias_name = sanitizeOsString(p.str, 128);
                 if (auto p = "fqdn" in el.object) if (p.type == JSONType.string) nr.fqdn = sanitizeOsString(p.str, 253);
-                if (auto p = "status_url" in el.object) if (p.type == JSONType.string) nr.status_url = p.str;
-                if (auto p = "hardware_url" in el.object) if (p.type == JSONType.string) nr.hardware_url = p.str;
-                if (auto p = "info_url" in el.object) if (p.type == JSONType.string) nr.info_url = p.str;
+                if (auto p = "status_url" in el.object) if (p.type == JSONType.string) nr.status_url = p.str.idup;
+                if (auto p = "hardware_url" in el.object) if (p.type == JSONType.string) nr.hardware_url = p.str.idup;
+                if (auto p = "info_url" in el.object) if (p.type == JSONType.string) nr.info_url = p.str.idup;
                 if (auto p = "tailnet_port" in el.object) if (p.type == JSONType.integer && p.integer > 0) nr.tailnet_port = cast(ushort) p.integer;
                 if (auto p = "base_path" in el.object) if (p.type == JSONType.string) nr.base_path = normalizeBasePath(p.str);
-                if (auto p = "os" in el.object) if (p.type == JSONType.string) nr.os = p.str;
-                if (auto p = "arch" in el.object) if (p.type == JSONType.string) nr.arch = p.str;
+                if (auto p = "os" in el.object) if (p.type == JSONType.string) nr.os = p.str.idup;
+                if (auto p = "arch" in el.object) if (p.type == JSONType.string) nr.arch = p.str.idup;
                 if (auto p = "is_self" in el.object) nr.is_self = (p.type == JSONType.true_);
                 if (auto p = "tailscale_online" in el.object) {
                     if (p.type == JSONType.true_) nr.tailscale_online = true;
                     else if (p.type == JSONType.false_) nr.tailscale_online = false;
                 }
-                if (auto p = "discovery_state" in el.object) if (p.type == JSONType.string) nr.discovery_state = p.str;
+                if (auto p = "discovery_state" in el.object) if (p.type == JSONType.string) nr.discovery_state = p.str.idup;
                 if (auto p = "last_seen_ts" in el.object) if (p.type == JSONType.integer) nr.last_seen_ts = p.integer;
                 if (auto p = "last_success_ts" in el.object) if (p.type == JSONType.integer) nr.last_success_ts = p.integer;
                 if (auto p = "last_known_hardware_summary" in el.object) if (p.type == JSONType.object) {
@@ -133,30 +133,6 @@ class NodeRegistry {
         } catch (Exception) {
             return false;
         }
-    }
-
-    ref NodeRecord* findByIdentity(string nodeId, string tailscaleNodeId, string fqdn) {
-        static NodeRecord* nilPtr = null;
-        foreach (ref n; nodes) {
-            if (nodeId.length > 0 && n.node_id == nodeId) {
-                return *(new NodeRecord*(&n));
-            }
-        }
-        if (tailscaleNodeId.length > 0) {
-            foreach (ref n; nodes) {
-                if (n.tailscale_node_id == tailscaleNodeId) {
-                    return *(new NodeRecord*(&n));
-                }
-            }
-        }
-        if (fqdn.length > 0) {
-            foreach (ref n; nodes) {
-                if (n.fqdn == fqdn) {
-                    return *(new NodeRecord*(&n));
-                }
-            }
-        }
-        return nilPtr;
     }
 
     private size_t findIndex(string nodeId, string tailscaleNodeId, string fqdn) const pure nothrow @safe {

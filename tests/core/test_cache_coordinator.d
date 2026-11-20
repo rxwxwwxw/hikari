@@ -71,6 +71,15 @@ unittest {
     assert(fake.counts.filesystemCalls == 1);
     assert(fake.counts.hardwareCalls == 0, "/status must NEVER scan hardware");
     assert(st1.payload.groups["fast"].status == GroupStatus.fresh);
+    assert(st1.payload.drift.hikari_version == AGENT_VERSION);
+    assert(st1.payload.drift.caddy_version == "2.11.9");
+    assert(st1.payload.drift.tailscale_version == "1.78.1");
+
+    // Subsequent /info reflects cached maintenance versions without invoking probes
+    auto infoAfterStatus = coord.getInfo();
+    assert(infoAfterStatus.hikari_version == AGENT_VERSION);
+    assert(infoAfterStatus.caddy_version == "2.11.9");
+    assert(infoAfterStatus.tailscale_version == "1.78.1");
 
     // Second request at +5s (< fast TTL 10s) -> ZERO additional probes!
     fakeMono += 5_000_000_000L;
@@ -290,4 +299,15 @@ unittest {
     assert(coord.getStatus().httpStatus == 200);
     assert(coord.getHardware(true).httpStatus == 202);
     assert(fake.counts.hardwareCalls == 1, "No overlapping persistence workers");
+}
+
+unittest {
+    // queryLocalTailscaleVersion extracts Version from fixture files safely
+    import platform.command : queryLocalTailscaleVersion;
+    import std.file : write;
+    auto stateDir = makeTempStateDir("ts-ver-fixture");
+    scope (exit) if (exists(stateDir)) rmdirRecurse(stateDir);
+    auto fix = stateDir ~ "/ts.json";
+    write(fix, `{"Version":"1.78.1-t123456-g789","MagicDNSSuffix":"tail.ts.net"}`);
+    assert(queryLocalTailscaleVersion(fix) == "1.78.1");
 }

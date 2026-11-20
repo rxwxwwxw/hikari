@@ -185,4 +185,14 @@ unittest {
     assert(mods[0].technology == "DDR5");
     assert(mods[0].speed_mt_s.get == 5600);
     assert(mods[0].size_bytes.get == 16384UL * 1024UL * 1024UL);
+
+    // Multi-chunk (>4096 bytes) /proc/self/mountinfo & >100 processes parsed via stack-buffer path
+    string bigMounts = "26 1 0:25 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw\n";
+    foreach (idx; 0 .. 120) {
+        bigMounts ~= "30 26 0:30 / /tmp/ignored-" ~ cast(char)('a' + (idx % 26)) ~ " rw,nosuid - tmpfs tmpfs rw\n";
+    }
+    assert(bigMounts.length > 4096);
+    write(root ~ "/proc/self/mountinfo", bigMounts);
+    auto bigFs = backend.sampleFilesystems();
+    assert(bigFs.mounts.length == 1 && bigFs.mounts[0].mount == "/");
 }

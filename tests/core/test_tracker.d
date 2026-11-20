@@ -100,4 +100,29 @@ unittest {
     assert(!pr2[0].cpu_pct.isNull && abs(pr2[0].cpu_pct.get - 200.0) < 0.01);
     assert(pr2[1].cpu_pct.isNull, "Reused PID with new start_id must report null initial CPU");
     assert(state.trackedProcessCount() == 2, "Old exited PID entry must be pruned");
+
+    // Exercise >64 sweeps with process and interface churn to verify AA compaction
+    long tNs = 3_000_000_000L;
+    foreach (step; 0 .. 70) {
+        tNs += 1_000_000_000L;
+        RawProcessResult rp;
+        rp.total_cpu_ticks = 2000 + cast(ulong) step * 100;
+        rp.logical_cores = 4;
+        rp.processes = [
+            RawProcess(100, "startA", "worker", 300 + cast(ulong) step * 20, 1024, "rss"),
+            RawProcess(cast(uint)(1000 + step), "ephemeral", "short", 10, 512, "rss"),
+        ];
+        auto res = state.computeProcessRates("b1", rp, tNs);
+        assert(res.length == 2);
+        assert(!res[0].cpu_pct.isNull);
+        assert(res[1].cpu_pct.isNull);
+        assert(state.trackedProcessCount() == 2, "Compaction must retain exact active process count");
+
+        auto nr = state.computeNetworkRates("b1", [
+            RawNetworkInterface("ifindex:2", "enp5s0", "physical", 50 + cast(ulong) step * 1000, 4600 + cast(ulong) step * 500, Nullable!bool(true), Nullable!ulong.init),
+            RawNetworkInterface("veth:" ~ cast(char)('a' + (step % 26)), "veth", "virtual", 100, 100, Nullable!bool(true), Nullable!ulong.init),
+        ], tNs);
+        assert(nr.length == 2);
+        assert(state.trackedNetworkCount() == 2, "Compaction must retain exact active interface count");
+    }
 }

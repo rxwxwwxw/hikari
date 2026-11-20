@@ -54,6 +54,8 @@ struct CounterTracker(K) {
 
     private Entry[K] entries;
     private ulong currentGen = 0;
+    private uint sweepsSinceCompact = 0;
+    private bool sawRemovals = false;
 
     Nullable!double update(K key, ulong value, long monoNs, long bootOrWallNs = -1) {
         Nullable!double rate;
@@ -67,7 +69,7 @@ struct CounterTracker(K) {
 
         // Monotonic discontinuity (clock went backwards or stalled)
         if (monoNs <= prev.monoNs) {
-            entries[key] = Entry(value, monoNs, bootOrWallNs, currentGen);
+            *p = Entry(value, monoNs, bootOrWallNs, currentGen);
             return rate;
         }
 
@@ -77,20 +79,20 @@ struct CounterTracker(K) {
         if (bootOrWallNs >= 0 && prev.bootNs >= 0) {
             long bootDelta = bootOrWallNs - prev.bootNs;
             if (bootDelta < 0 || (bootDelta - deltaNs) > suspendGapNs) {
-                entries[key] = Entry(value, monoNs, bootOrWallNs, currentGen);
+                *p = Entry(value, monoNs, bootOrWallNs, currentGen);
                 return rate;
             }
         }
 
         // Baseline too old (e.g. post-resume or multi-hour gap)
         if (maxIntervalNs > 0 && deltaNs > maxIntervalNs) {
-            entries[key] = Entry(value, monoNs, bootOrWallNs, currentGen);
+            *p = Entry(value, monoNs, bootOrWallNs, currentGen);
             return rate;
         }
 
         // Counter wrap or reset (e.g. interface recreated, counter overflow/zeroed)
         if (value < prev.value) {
-            entries[key] = Entry(value, monoNs, bootOrWallNs, currentGen);
+            *p = Entry(value, monoNs, bootOrWallNs, currentGen);
             return rate;
         }
 
@@ -103,7 +105,7 @@ struct CounterTracker(K) {
         double deltaVal = cast(double)(value - prev.value);
         double deltaSec = cast(double) deltaNs / 1_000_000_000.0;
         rate = deltaVal / deltaSec;
-        entries[key] = Entry(value, monoNs, bootOrWallNs, currentGen);
+        *p = Entry(value, monoNs, bootOrWallNs, currentGen);
         return rate;
     }
 
@@ -118,18 +120,35 @@ struct CounterTracker(K) {
                 toDelete ~= k;
             }
         }
-        foreach (k; toDelete) {
-            entries.remove(k);
+        if (toDelete.length > 0) {
+            foreach (k; toDelete) {
+                entries.remove(k);
+            }
+            sawRemovals = true;
+        }
+        sweepsSinceCompact++;
+        if (sweepsSinceCompact >= 64 && sawRemovals) {
+            sweepsSinceCompact = 0;
+            sawRemovals = false;
+            if (entries.length == 0) {
+                entries = null;
+            } else {
+                Entry[K] compacted;
+                foreach (k, e; entries) compacted[k] = e;
+                entries = compacted;
+            }
         }
     }
 
     void remove(K key) @safe {
-        entries.remove(key);
+        if (entries.remove(key)) sawRemovals = true;
     }
 
     void reset() @safe {
         entries = null;
         currentGen = 0;
+        sweepsSinceCompact = 0;
+        sawRemovals = false;
     }
 
     size_t length() const nothrow @safe {
@@ -160,6 +179,8 @@ class SystemRateState {
     }
     private ProcEntry[ProcessKey] procEntries;
     private ulong procGen = 0;
+    private uint procSweepsSinceCompact = 0;
+    private bool procSawRemovals = false;
     private string lastBootId;
 
     long minIntervalNs = CounterTracker!NetKey.DEFAULT_MIN_INTERVAL_NS;
@@ -172,6 +193,8 @@ class SystemRateState {
         netTxTracker.reset();
         procEntries = null;
         procGen = 0;
+        procSweepsSinceCompact = 0;
+        procSawRemovals = false;
     }
 
     void checkBootId(string bootId) @safe {
@@ -302,7 +325,7 @@ class SystemRateState {
             if (rp.cpu_ticks < prev.procTicks || raw.total_cpu_ticks <= prev.totalCpuTicks) invalid = true;
 
             if (invalid) {
-                procEntries[key] = ProcEntry(rp.cpu_ticks, raw.total_cpu_ticks, monoNs, bootOrWallNs, procGen);
+                *p = ProcEntry(rp.cpu_ticks, raw.total_cpu_ticks, monoNs, bootOrWallNs, procGen);
                 result ~= ps;
                 continue;
             }
@@ -315,7 +338,7 @@ class SystemRateState {
 
             ulong dProc = rp.cpu_ticks - prev.procTicks;
             ulong dTotal = raw.total_cpu_ticks - prev.totalCpuTicks;
-            procEntries[key] = ProcEntry(rp.cpu_ticks, raw.total_cpu_ticks, monoNs, bootOrWallNs, procGen);
+            *p = ProcEntry(rp.cpu_ticks, raw.total_cpu_ticks, monoNs, bootOrWallNs, procGen);
 
             if (dTotal > 0) {
                 // One logical CPU = 100.0%
@@ -329,7 +352,22 @@ class SystemRateState {
         foreach (k, ref e; procEntries) {
             if (e.generation != procGen) stale ~= k;
         }
-        foreach (k; stale) procEntries.remove(k);
+        if (stale.length > 0) {
+            foreach (k; stale) procEntries.remove(k);
+            procSawRemovals = true;
+        }
+        procSweepsSinceCompact++;
+        if (procSweepsSinceCompact >= 64 && procSawRemovals) {
+            procSweepsSinceCompact = 0;
+            procSawRemovals = false;
+            if (procEntries.length == 0) {
+                procEntries = null;
+            } else {
+                ProcEntry[ProcessKey] compacted;
+                foreach (k, e; procEntries) compacted[k] = e;
+                procEntries = compacted;
+            }
+        }
 
         return result;
     }

@@ -5,6 +5,7 @@ import core.serializer : sanitizeOsString;
 import hardware.inventory;
 import hardware.isa_names;
 import platform.api;
+import platform.command : queryLocalCaddyVersion, queryLocalTailscaleVersion;
 import platform.nvml;
 import std.algorithm : canFind, map, sort, startsWith, uniq;
 import std.array : array, split;
@@ -65,7 +66,27 @@ class LinuxPlatformBackend : PlatformBackend {
     private string safeReadText(string path) const {
         if (!exists(path)) return "";
         try {
-            return readText(path).strip();
+            import std.stdio : File;
+            import std.array : appender;
+            auto f = File(path, "rb");
+            scope (exit) f.close();
+            char[4096] stackBuf;
+            auto first = f.rawRead(stackBuf[]);
+            if (first.length == 0) return "";
+            if (first.length < stackBuf.length) {
+                auto trimmed = (cast(const(char)[]) first).strip();
+                return trimmed.length == 0 ? "" : trimmed.idup;
+            }
+            auto app = appender!(char[])();
+            app.put(first);
+            while (true) {
+                auto more = f.rawRead(stackBuf[]);
+                if (more.length == 0) break;
+                app.put(more);
+                if (app.data.length >= 4 * 1024 * 1024) break;
+            }
+            auto trimmed = (cast(const(char)[]) app.data).strip();
+            return trimmed.length == 0 ? "" : trimmed.idup;
         } catch (Exception) {
             return "";
         }
@@ -362,6 +383,19 @@ class LinuxPlatformBackend : PlatformBackend {
         return r;
     }
 
+    private static bool parseU64Token(const(char)[] tok, out ulong val) pure nothrow @safe {
+        if (tok.length == 0) return false;
+        ulong acc = 0;
+        foreach (char c; tok) {
+            if (c < '0' || c > '9') return false;
+            ulong d = cast(ulong)(c - '0');
+            if (acc > (ulong.max - d) / 10) return false;
+            acc = acc * 10 + d;
+        }
+        val = acc;
+        return true;
+    }
+
     override RawProcessResult sampleProcesses() {
         RawProcessResult r;
         auto cpu = sampleCpu();
@@ -379,46 +413,77 @@ class LinuxPlatformBackend : PlatformBackend {
             if (ps > 0) pageSize = ps;
         }
 
+        import std.stdio : File;
+        char[1024] statBuf;
         try {
             foreach (DirEntry de; dirEntries(procRoot, SpanMode.shallow)) {
                 auto name = baseName(de.name);
                 if (name.length == 0 || name[0] < '0' || name[0] > '9') continue;
-                uint pid;
-                try {
-                    pid = to!uint(name);
-                } catch (Exception) {
-                    continue;
+                uint pid = 0;
+                bool validPid = true;
+                foreach (char ch; name) {
+                    if (ch < '0' || ch > '9') { validPid = false; break; }
+                    pid = pid * 10 + cast(uint)(ch - '0');
                 }
+                if (!validPid) continue;
 
                 // Never read /cmdline or /environ
-                auto statTxt = safeReadText(de.name ~ "/stat");
-                if (statTxt.length == 0) continue;
-
-                auto openParen = statTxt.indexOf('(');
-                auto closeParen = statTxt.lastIndexOf(')');
-                if (openParen < 0 || closeParen <= openParen || closeParen + 2 >= statTxt.length) continue;
-
-                auto comm = sanitizeOsString(statTxt[openParen + 1 .. closeParen], 128);
-                auto fields = statTxt[closeParen + 2 .. $].strip().split();
-                if (fields.length <= 21) continue;
-
+                size_t statLen = 0;
                 try {
-                    ulong utime = to!ulong(fields[11]);
-                    ulong stime = to!ulong(fields[12]);
-                    string startId = fields[19];
-                    ulong rssPages = to!ulong(fields[21]);
-
-                    RawProcess rp;
-                    rp.pid = pid;
-                    rp.start_id = startId;
-                    rp.name = comm;
-                    rp.cpu_ticks = utime + stime;
-                    rp.rss_bytes = rssPages * cast(ulong) pageSize;
-                    rp.memory_kind = "rss";
-                    r.processes ~= rp;
+                    auto f = File(de.name ~ "/stat", "rb");
+                    scope (exit) f.close();
+                    statLen = f.rawRead(statBuf[]).length;
                 } catch (Exception) {
                     continue;
                 }
+                if (statLen == 0) continue;
+                auto statSlice = cast(const(char)[]) statBuf[0 .. statLen];
+
+                ptrdiff_t openParen = -1;
+                ptrdiff_t closeParen = -1;
+                foreach (idx, char c; statSlice) {
+                    if (c == '(' && openParen < 0) openParen = cast(ptrdiff_t) idx;
+                    else if (c == ')') closeParen = cast(ptrdiff_t) idx;
+                }
+                if (openParen < 0 || closeParen <= openParen || closeParen + 2 >= statSlice.length) continue;
+
+                // sanitizeOsString always allocates an independent heap string (never slices statBuf)
+                auto comm = sanitizeOsString(cast(string) statSlice[openParen + 1 .. closeParen], 128);
+                auto rest = statSlice[closeParen + 2 .. $];
+
+                // Scan fields after ') ' directly on stack buffer without allocating arrays
+                ulong utime = 0, stime = 0, rssPages = 0;
+                const(char)[] startTok;
+                size_t fieldIdx = 0;
+                size_t pos = 0;
+                bool parseErr = false;
+                while (pos < rest.length && fieldIdx <= 21) {
+                    while (pos < rest.length && (rest[pos] == ' ' || rest[pos] == '\t' || rest[pos] == '\r' || rest[pos] == '\n')) pos++;
+                    if (pos >= rest.length) break;
+                    size_t start = pos;
+                    while (pos < rest.length && rest[pos] != ' ' && rest[pos] != '\t' && rest[pos] != '\r' && rest[pos] != '\n') pos++;
+                    auto tok = rest[start .. pos];
+                    if (fieldIdx == 11) {
+                        if (!parseU64Token(tok, utime)) { parseErr = true; break; }
+                    } else if (fieldIdx == 12) {
+                        if (!parseU64Token(tok, stime)) { parseErr = true; break; }
+                    } else if (fieldIdx == 19) {
+                        startTok = tok;
+                    } else if (fieldIdx == 21) {
+                        if (!parseU64Token(tok, rssPages)) { parseErr = true; break; }
+                    }
+                    fieldIdx++;
+                }
+                if (parseErr || fieldIdx <= 21 || startTok.length == 0) continue;
+
+                RawProcess rp;
+                rp.pid = pid;
+                rp.start_id = startTok.idup;
+                rp.name = comm;
+                rp.cpu_ticks = utime + stime;
+                rp.rss_bytes = rssPages * cast(ulong) pageSize;
+                rp.memory_kind = "rss";
+                r.processes ~= rp;
             }
         } catch (Exception) {
             r.state = CapabilityState.error;
@@ -772,6 +837,12 @@ class LinuxPlatformBackend : PlatformBackend {
             }
         }
 
+        r.drift.hikari_version = AGENT_VERSION;
+        if (isRealHost()) {
+            r.drift.caddy_version = queryLocalCaddyVersion();
+            r.drift.tailscale_version = queryLocalTailscaleVersion();
+        }
+
         return r;
     }
 
@@ -780,6 +851,11 @@ class LinuxPlatformBackend : PlatformBackend {
         if (!pciIdsLoaded) {
             pciIds.loadLocalPciIdsFile();
             pciIdsLoaded = true;
+        }
+        scope (exit) {
+            pciIds.vendors = null;
+            pciIds.devices = null;
+            pciIdsLoaded = false;
         }
 
         HardwareInventory hw;

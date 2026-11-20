@@ -13,6 +13,19 @@ JSONValue jsonNull() pure nothrow @safe {
 
 string sanitizeOsString(string raw, size_t maxLen = 256) pure @safe {
     if (raw.length == 0) return "";
+    if (raw.length <= maxLen) {
+        auto trimmed = raw.strip();
+        if (trimmed.length == 0) return "";
+        bool clean = true;
+        foreach (char c; trimmed) {
+            ubyte b = cast(ubyte) c;
+            if (b < 0x20 || b == 0x7F) {
+                clean = false;
+                break;
+            }
+        }
+        if (clean) return trimmed.idup;
+    }
     auto app = appender!string();
     bool prevSpace = false;
     foreach (char c; raw) {
@@ -31,7 +44,8 @@ string sanitizeOsString(string raw, size_t maxLen = 256) pure @safe {
         prevSpace = (c == ' ');
         if (app.data.length >= maxLen) break;
     }
-    return app.data.strip();
+    auto res = app.data.strip();
+    return res.length == 0 ? "" : res.idup;
 }
 
 JSONValue jsonStringOrNull(string s, size_t maxLen = 256) pure @safe {
@@ -239,6 +253,9 @@ JSONValue serializeStatusResponse(const ref StatusResponse resp) pure @safe {
     drift["reboot_required"] = jsonNullableBool(resp.drift.reboot_required);
     drift["pending_updates"] = jsonNullableUint(resp.drift.pending_updates);
     drift["package_cache_age_s"] = jsonNullableLong(resp.drift.package_cache_age_s);
+    drift["hikari_version"] = jsonStringOrNull(resp.drift.hikari_version, 64);
+    drift["caddy_version"] = jsonStringOrNull(resp.drift.caddy_version, 64);
+    drift["tailscale_version"] = jsonStringOrNull(resp.drift.tailscale_version, 64);
     j["drift"] = drift;
 
     return j;
@@ -612,6 +629,9 @@ JSONValue serializeInfoResponse(const ref InfoResponse ir) pure @safe {
     j["app"] = ir.app;
     j["schema_version"] = ir.schema_version;
     j["agent_version"] = ir.agent_version;
+    j["hikari_version"] = jsonStringOrNull(ir.hikari_version, 64);
+    j["caddy_version"] = jsonStringOrNull(ir.caddy_version, 64);
+    j["tailscale_version"] = jsonStringOrNull(ir.tailscale_version, 64);
     j["node_id"] = ir.node_id;
     j["host"] = sanitizeOsString(ir.host, 128);
     j["fqdn"] = jsonStringOrNull(ir.fqdn, 253);

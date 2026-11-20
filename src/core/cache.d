@@ -263,6 +263,9 @@ class TelemetryCacheStore {
         ir.app = "hikari";
         ir.schema_version = SCHEMA_VERSION;
         ir.agent_version = AGENT_VERSION;
+        ir.hikari_version = cachedDrift.hikari_version.length > 0 ? cachedDrift.hikari_version : AGENT_VERSION;
+        ir.caddy_version = cachedDrift.caddy_version;
+        ir.tailscale_version = cachedDrift.tailscale_version;
         ir.node_id = nodeId;
         ir.host = cachedIdentity.host;
         ir.fqdn = fqdn;
