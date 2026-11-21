@@ -120,7 +120,13 @@ string reloadExistingCaddy(const IntegrateOptions o, const CaddyfileReport r, ou
     if (o.manager == "systemd" && o.service.length > 0) {
         auto res = runIsolated(["systemctl", "reload", o.service], 60_000, false);
         ok = res.status == 0;
-        return ok ? "reloaded " ~ o.service ~ " via systemd" : "systemctl reload " ~ o.service ~ " failed: " ~ res.stderr_.strip();
+        if (ok) return "reloaded " ~ o.service ~ " via systemd";
+        auto isAct = runIsolated(["systemctl", "is-active", o.service], 10_000, false);
+        if (isAct.stdout_.strip() != "active") {
+            attempted = false;
+            return o.service ~ " is not currently active, so it cannot be reloaded; start it with: sudo systemctl start " ~ o.service;
+        }
+        return "systemctl reload " ~ o.service ~ " failed: " ~ res.stderr_.strip();
     }
     if (r.globals.admin == "off") {
         attempted = false;

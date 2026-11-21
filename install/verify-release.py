@@ -164,13 +164,19 @@ def verify_snapshot(args):
         if args.extract_dir:
             destination = Path(args.extract_dir)
             destination.mkdir(parents=True, exist_ok=True)
+            destination.chmod(0o755)
+            def ensure_dir(path):
+                for parent in reversed(path.relative_to(destination).parents):
+                    (destination / parent).mkdir(exist_ok=True)
+                    (destination / parent).chmod(0o755)
+                path.mkdir(exist_ok=True)
+                path.chmod(0o755)
             for member in members:
                 target = destination.joinpath(*PurePosixPath(member.name).parts)
                 if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    target.chmod(0o755)
+                    ensure_dir(target)
                 else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    ensure_dir(target.parent)
                     with tar.extractfile(member) as source, target.open("xb") as output:
                         shutil.copyfileobj(source, output, 1024 * 1024)
                     target.chmod(0o755 if member.mode & 0o111 else 0o644)

@@ -28,6 +28,7 @@ payload = base64.b64encode(source.encode()).decode()
 param(
     [string]$Version = "latest",
     [switch]$DryRun,
+    [switch]$Repair,
     [switch]$Reload,
     [ValidateSet("", "auto", "integrate", "isolated", "snippet")]
     [string]$CaddyMode = "",
@@ -42,6 +43,7 @@ try {
     [System.IO.File]::WriteAllBytes($script, [Convert]::FromBase64String("''' + payload + '''"))
     $bootstrapArgs = @($script, "--version", $Version)
     if ($DryRun) { $bootstrapArgs += "--dry-run" }
+    if ($Repair) { $bootstrapArgs += "--repair" }
     if ($Reload) { $bootstrapArgs += "--reload" }
     if ($CaddyMode) { $bootstrapArgs += @("--caddy-mode", $CaddyMode) }
     if ($InstallerArguments.Count) { $bootstrapArgs += "--"; $bootstrapArgs += $InstallerArguments }

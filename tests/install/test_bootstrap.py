@@ -65,8 +65,9 @@ class BootstrapTests(unittest.TestCase):
                     self.assertLessEqual(len(content), limit)
                     destination.write_bytes(content)
                 with patch.object(bootstrap, 'HERE', root), patch.object(bootstrap, 'target', return_value=(system, arch)), patch.object(bootstrap, 'download', side_effect=download), patch.object(bootstrap.subprocess, 'run', side_effect=launch):
-                    self.assertEqual(bootstrap.main(['--version', '0.2.0', '--dry-run', '--reload']), 0)
+                    self.assertEqual(bootstrap.main(['--version', '0.2.0', '--dry-run', '--repair', '--reload']), 0)
                     self.assertEqual(len(launched), 1)
+                    self.assertIn('-Repair' if system == 'windows' else '--repair', launched[0])
                     self.assertIn('-Reload' if system == 'windows' else '--reload', launched[0])
                     launched.clear()
                     with self.assertRaises(ValueError): bootstrap.main(['--version', '0.3.0'])

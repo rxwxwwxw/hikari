@@ -1,7 +1,7 @@
 module update.stage;
 
-import std.algorithm : canFind, startsWith, all;
-import std.file : exists, mkdirRecurse, rename, rmdirRecurse, write, remove, readText, getSize;
+import std.algorithm : all, canFind, endsWith, startsWith;
+import std.file : dirEntries, exists, getAttributes, getSize, mkdirRecurse, readText, remove, rename, rmdirRecurse, setAttributes, SpanMode, write;
 import std.path : buildNormalizedPath, dirName;
 import std.process : Config, execute;
 import std.string : indexOf, split, strip, toLower;
@@ -233,6 +233,25 @@ string stageVerifiedArchive(string archivePath, string versionsDir, string targe
         enum binRel = "/hikari";
     }
 
+    version (Posix) {
+        // Privileged maintenance jobs may run under UMask=0077; ensure the
+        // restricted service account can traverse and execute the release.
+        auto expectedBin = buildNormalizedPath(stageDir ~ binRel);
+        setAttributes(stageDir, 0x1ed); // 0755
+        foreach (entry; dirEntries(stageDir, SpanMode.depth)) {
+            if (entry.isDir) {
+                setAttributes(entry.name, 0x1ed); // 0755
+            } else if (entry.isFile) {
+                if (buildNormalizedPath(entry.name) == expectedBin || entry.name.endsWith(".sh") ||
+                    entry.name.endsWith(".py") || (getAttributes(entry.name) & 0x49) != 0) {
+                    setAttributes(entry.name, 0x1ed); // 0755
+                } else {
+                    setAttributes(entry.name, 0x1a4); // 0644
+                }
+            }
+        }
+    }
+
     // Validate expected layout inside staged release
     if (!exists(stageDir ~ binRel)) {
         throw new Exception("Staged release missing hikari binary");
@@ -248,7 +267,6 @@ string stageVerifiedArchive(string archivePath, string versionsDir, string targe
     }
 
     version (Posix) {
-        import std.file : dirEntries, SpanMode;
         foreach (entry; dirEntries(stageDir, SpanMode.depth))
             if (entry.isFile) syncUpdatePath(entry.name);
         foreach (entry; dirEntries(stageDir, SpanMode.depth))

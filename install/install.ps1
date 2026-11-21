@@ -477,11 +477,13 @@ function Set-VersionPointer([string]$Name, [string]$Version) {
 
 $CurTxt = Join-Path $VersionsDir "current.txt"
 $oldVer = if (Test-Path $CurTxt) { (Get-Content -Raw $CurTxt).Trim() } else { "" }
+$VersionChanged = $false
 if ($oldVer -ne $AppVersion -or -not (Test-Path $CurrentJunction)) {
     if ($oldVer -and $oldVer -ne $AppVersion -and (Test-Path (Join-Path $VersionsDir $oldVer))) {
         Set-VersionPointer "previous" $oldVer
     }
     Set-VersionPointer "current" $AppVersion
+    $VersionChanged = $true
     Write-Log "Activated versions\current -> $AppVersion"
 }
 
@@ -645,7 +647,7 @@ if ($ManageServices) {
     }
 
     # Restart only what changed; start anything not running.
-    $restartAgent = $agentResult -match ": updated" -and -not ($StoppedForUpgrade -contains "hikari")
+    $restartAgent = ($agentResult -match ": updated" -or $VersionChanged -or $Repair) -and -not ($StoppedForUpgrade -contains "hikari")
     if ($restartAgent) { Invoke-HikariService @("stop", "--name", "hikari") | Out-Null }
     Invoke-HikariService @("start", "--name", "hikari") | Out-Null
     if ($caddyResult) {

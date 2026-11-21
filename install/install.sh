@@ -324,7 +324,7 @@ print(c.get("tailnet_port",9100), c.get("loopback_port",19100), c.get("base_path
 fi
 
 if [ -f "$VERSIONS_DIR/.activation-previous" ] && [ "$REPAIR" -eq 0 ]; then
-  echo "Interrupted activation pending; run hikari update recover or install.sh --repair." >&2
+  echo "Interrupted activation pending; run /opt/hikari/versions/current/hikari update recover or rerun the installer with --repair." >&2
   exit 1
 fi
 
@@ -1058,6 +1058,14 @@ else
   mv "$STAGING_DIR" "$REL_DIR"
 fi
 
+chmod 0755 "$OPT_HIKARI" "$VERSIONS_DIR" "$REL_DIR"
+find "$REL_DIR" -type d -exec chmod 0755 {} +
+find "$REL_DIR" -type f -exec chmod 0644 {} +
+chmod 0755 "$REL_DIR/hikari"
+for f in "$REL_DIR/install/"*.sh "$REL_DIR/install/"*.py; do
+  if [ -f "$f" ]; then chmod 0755 "$f"; fi
+done
+
 log "Staged hikari $APP_VERSION at $REL_DIR; activation follows generated-config validation"
 activate_install_release() {
   python3 "$REPO_ROOT/install/activate-release.py" begin "$VERSIONS_DIR" "$APP_VERSION"
@@ -1508,9 +1516,11 @@ EOF
   activate_install_release
   if [ "$SYSTEMD_MODE" = "auto" ] && [ -z "$ROOT_PREFIX" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
-    systemctl enable --now hikari.service
+    systemctl enable hikari.service
+    systemctl restart hikari.service
     if [ "$SNIPPET_ONLY" -eq 0 ] && [ "$INTEGRATED" -eq 0 ] && [ -f "$ETC_HIKARI/Caddyfile" ]; then
-      systemctl enable --now hikari-caddy.service
+      systemctl enable hikari-caddy.service
+      systemctl restart hikari-caddy.service
     fi
     log "Enabled and started hikari systemd units"
   else
@@ -1525,7 +1535,21 @@ bash "$REPO_ROOT/install/maintenance-jobs.sh" "$TARGET_OS" "$ROOT_PREFIX" "$SYST
 if [ -n "$ROOT_PREFIX" ]; then
   python3 "$REPO_ROOT/install/activate-release.py" confirm "$VERSIONS_DIR" "$APP_VERSION"
 elif [ "$SYSTEMD_MODE" = "auto" ]; then
-  python3 "$REPO_ROOT/install/activate-release.py" health-confirm "$VERSIONS_DIR" "$APP_VERSION" "$CONFIG_PATH"
+  if ! python3 "$REPO_ROOT/install/activate-release.py" health-confirm "$VERSIONS_DIR" "$APP_VERSION" "$CONFIG_PATH"; then
+    if [ -f "$VERSIONS_DIR/.activation-previous" ]; then
+      PREV_VER=$(python3 "$REPO_ROOT/install/activate-release.py" recover "$VERSIONS_DIR" || true)
+      if [ -n "$PREV_VER" ]; then
+        log "Activation health check failed for $APP_VERSION; recovering back to $PREV_VER"
+        if [ "$TARGET_OS" = "macos" ]; then
+          reload_launchd_job "io.hikari.agent" "$UNIT_DIR/io.hikari.agent.plist" || true
+        elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+          systemctl restart hikari.service || true
+        fi
+        python3 "$REPO_ROOT/install/activate-release.py" health-confirm "$VERSIONS_DIR" "$PREV_VER" "$CONFIG_PATH" || true
+      fi
+    fi
+    exit 1
+  fi
 fi
 
 # 11. Reload the existing Caddy only when asked (after hikari-caddy released the port).

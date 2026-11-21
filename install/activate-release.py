@@ -122,21 +122,42 @@ def health_confirm(versions, version, config_path):
     raise ValueError("Local health/version check failed; prior activation remains recorded for recovery")
 
 
+def recover(versions):
+    pending = versions / ".activation-previous"
+    if not pending.exists():
+        return ""
+    prev = canonical_version(pending.read_text(encoding="utf-8").strip())
+    target = versions / prev
+    binary = target / "hikari"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise ValueError(f"Prior release executable missing for interrupted activation: {binary}")
+    replace_link(target, versions / "current")
+    print(prev)
+    return prev
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("begin", "confirm", "health-confirm"))
+    parser.add_argument("action", choices=("begin", "confirm", "health-confirm", "recover"))
     parser.add_argument("versions")
-    parser.add_argument("version")
+    parser.add_argument("version", nargs="?")
     parser.add_argument("config", nargs="?")
     args = parser.parse_args()
     try:
         versions = Path(args.versions).resolve(strict=True)
-        if args.action == "begin":
-            begin(versions, args.version)
-        elif args.action == "confirm":
-            confirm(versions, args.version)
+        if args.action == "recover":
+            recover(versions)
         else:
-            health_confirm(versions, args.version, args.config)
+            if not args.version:
+                raise ValueError("Release version is required")
+            if args.action == "begin":
+                begin(versions, args.version)
+            elif args.action == "confirm":
+                confirm(versions, args.version)
+            else:
+                if not args.config:
+                    raise ValueError("Configuration path is required")
+                health_confirm(versions, args.version, args.config)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Release activation failed: {error}\n")
 

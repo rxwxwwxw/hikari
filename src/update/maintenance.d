@@ -233,6 +233,12 @@ int maintainRelease(HikariConfig cfg, string targetOs, string targetArch, Mainte
     auto current = readVersionSymlink(cfg.paths.versions_dir ~ "/current");
     if (!current.length) throw new Exception("Automatic activation requires a known-good current release");
     if (release.manifest.version_parsed <= SemVer.parse(current)) return 0;
+    auto targetDir = cfg.paths.versions_dir ~ "/" ~ release.manifest.version_str;
+    if (exists(targetDir) && current != release.manifest.version_str &&
+        readVersionSymlink(cfg.paths.versions_dir ~ "/previous") != release.manifest.version_str) {
+        if (isDir(targetDir) && !isSymlink(targetDir)) rmdirRecurse(targetDir);
+        else remove(targetDir);
+    }
     auto staged = stageSignedRelease(cfg, release.manifestPath, release.signaturePath, archive,
         cfg.paths.versions_dir, current, targetOs, targetArch);
     auto outcome = activateAndVerifyRelease(cfg.paths.versions_dir, cfg.paths.state_dir,

@@ -79,6 +79,13 @@ class Activation(unittest.TestCase):
                            capture_output=True, text=True)
             self.assertEqual((versions / "current").resolve(), new)
             self.assertFalse((versions / ".activation-previous").exists())
+            release("0.5.0")
+            activate.begin(versions, "0.5.0")
+            self.assertEqual(activate.recover(versions), "0.2.0")
+            self.assertEqual((versions / "current").resolve(), new)
+            self.assertTrue((versions / ".activation-previous").exists())
+            activate.confirm(versions, "0.2.0")
+            self.assertFalse((versions / ".activation-previous").exists())
 
 
 if __name__ == "__main__": unittest.main()

@@ -65,6 +65,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', default='latest')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--repair', action='store_true', help='Reconcile units/Caddyfile and recover any interrupted activation')
     parser.add_argument('--reload', action='store_true', help='Explicitly authorize reloading an integrated Caddy')
     parser.add_argument('--caddy-mode', choices=['auto', 'integrate', 'isolated', 'snippet'], default=None)
     parser.add_argument('installer_args', nargs=argparse.REMAINDER, help='Additional platform installer options after --')
@@ -109,12 +110,14 @@ def main(argv=None):
                        '-BinarySource', str(work / filename), '-Repo', repo, '-PubKey', str(key),
                        '-Manifest', str(work / 'manifest.json'), '-Signature', str(work / 'manifest.sig')]
             if args.dry_run: command += ['-DryRun']
+            if args.repair: command += ['-Repair']
             if args.reload: command += ['-Reload']
             if args.caddy_mode: command += ['-CaddyMode', args.caddy_mode]
         else:
             command = ['bash', str(stage / 'install/install.sh'), '--binary-source', str(work / filename),
                        '--manifest', str(work / 'manifest.json'), '--sig', str(work / 'manifest.sig'), '--repo', repo, '--pubkey', str(key)]
             if args.dry_run: command += ['--dry-run']
+            if args.repair: command += ['--repair']
             if args.reload: command += ['--reload']
             if args.caddy_mode: command += ['--caddy-mode', args.caddy_mode]
         result = subprocess.run(command + extra, check=False).returncode

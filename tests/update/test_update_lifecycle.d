@@ -172,6 +172,13 @@ unittest {
     assertThrown!Exception(maintainRelease(autoCfg, "linux", "x86_64", hooks));
     assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.1.0");
     assert(!exists(autoCfg.paths.versions_dir ~ "/.activation-previous"));
+    assert(exists(autoCfg.paths.versions_dir ~ "/0.2.0"));
+
+    // A later due maintenance run cleans up the unactivated 0.2.0 directory and succeeds.
+    now += 86400;
+    hooks.health = (string _) => true;
+    assert(maintainRelease(autoCfg, "linux", "x86_64", hooks) == 0);
+    assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.2.0");
 
     // Simulate a newer installer finishing while an old supervisor downloads.
     autoCfg.paths.versions_dir = root ~ "/auto-race";
@@ -191,6 +198,22 @@ unittest {
     assert(restarts == restartsBeforeRace);
     assert(readVersionSymlink(autoCfg.paths.versions_dir ~ "/current") == "0.3.0");
     assert(!exists(autoCfg.paths.versions_dir ~ "/0.2.0"));
+
+    // Stage verified archive under a strict UMask=0077 (matches hikari-maintenance.service)
+    {
+        import core.sys.posix.sys.stat : umask;
+        import std.file : getAttributes;
+        auto umaskVersions = root ~ "/umask-versions";
+        mkdirRecurse(umaskVersions ~ "/0.1.0");
+        auto oldMask = umask(0x3f); // 0077
+        scope (exit) umask(oldMask);
+        auto umaskRel = stageSignedRelease(cfg, manifestPath, sigPath, archive,
+            umaskVersions, "0.1.0", "linux", "x86_64");
+        assert((getAttributes(umaskRel.directory) & 0x1ff) == 0x1ed);
+        assert((getAttributes(umaskRel.directory ~ "/web") & 0x1ff) == 0x1ed);
+        assert((getAttributes(umaskRel.directory ~ "/hikari") & 0x1ff) == 0x1ed);
+        assert((getAttributes(umaskRel.directory ~ "/web/index.html") & 0x1ff) == 0x1a4);
+    }
 
     // Stage verified archive
     auto release = stageSignedRelease(cfg, manifestPath, sigPath, archive,
