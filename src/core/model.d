@@ -3,7 +3,7 @@ module core.model;
 import std.typecons : Nullable;
 
 enum int SCHEMA_VERSION = 1;
-enum string AGENT_VERSION = "0.1.7";
+enum string AGENT_VERSION = "0.1.8";
 
 enum ProbeGroup : string {
     fast = "fast",
