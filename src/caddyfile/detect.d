@@ -129,20 +129,28 @@ DetectedCaddy detectExistingCaddy(string skipConfigUnder = "") @trusted {
         import std.process : execute;
         foreach (unit; ["caddy.service", "caddy-api.service"]) {
             try {
-                auto r = execute(["systemctl", "show", unit, "-p", "ExecStart", "-p", "LoadState", "-p", "ActiveState", "--no-pager"]);
+                auto r = execute(["systemctl", "show", unit, "-p", "ExecStart", "-p", "LoadState", "-p", "ActiveState", "-p", "UnitFileState", "--no-pager"]);
                 if (r.status != 0 || !r.output.canFind("LoadState=loaded")) continue;
                 auto inv = caddyArgsToConfig(parseSystemdExecStart(r.output));
                 if (!inv.isCaddy || skipped(inv)) continue;
-                string state;
-                foreach (l; r.output.split("\n")) if (l.startsWith("ActiveState=")) state = l[12 .. $].strip();
+                string state, unitFileState;
+                foreach (l; r.output.split("\n")) {
+                    if (l.startsWith("ActiveState=")) state = l[12 .. $].strip();
+                    else if (l.startsWith("UnitFileState=")) unitFileState = l[14 .. $].strip();
+                }
+                if (state != "active" && unitFileState != "enabled") continue;
                 return fromInvocation(inv, unit, "systemd", state);
             } catch (Exception) {}
         }
     } else version (OSX) {
         import std.file : exists, readText;
+        import std.process : execute;
         foreach (p; ["/Library/LaunchDaemons/homebrew.mxcl.caddy.plist", "/opt/homebrew/opt/caddy/homebrew.mxcl.caddy.plist", "/usr/local/opt/caddy/homebrew.mxcl.caddy.plist"]) {
             try {
                 if (!exists(p)) continue;
+                if (p != "/Library/LaunchDaemons/homebrew.mxcl.caddy.plist") {
+                    if (execute(["/bin/launchctl", "print", "system/homebrew.mxcl.caddy"]).status != 0) continue;
+                }
                 auto inv = caddyArgsToConfig(parseLaunchdProgramArguments(readText(p)));
                 if (!inv.isCaddy || skipped(inv)) continue;
                 return fromInvocation(inv, "homebrew.mxcl.caddy", "launchd", "");
@@ -154,7 +162,7 @@ DetectedCaddy detectExistingCaddy(string skipConfigUnder = "") @trusted {
             foreach (name; listServiceNames()) {
                 if (name.toLower() == "hikari-caddy") continue;
                 auto info = queryService(name);
-                if (!info.exists || !info.imagePath.toLower().canFind("caddy")) continue;
+                if (!info.exists || info.state.toLower() != "running" || !info.imagePath.toLower().canFind("caddy")) continue;
                 auto inv = caddyArgsToConfig(parseWindowsCommandLine(info.imagePath));
                 if (!inv.isCaddy || skipped(inv)) continue;
                 return fromInvocation(inv, name, "scm", info.state);

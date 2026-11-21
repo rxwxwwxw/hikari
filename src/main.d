@@ -412,7 +412,7 @@ private int cmdCaddyIntegration(string sub, string[] args, ref HikariConfig cfg)
         bool ok, attempted;
         auto note = reloadExistingCaddy(ro, analyzeCaddyfile(record.caddyfile), ok, attempted);
         writeln(note);
-        if (!attempted) writeln("run: ", manualReloadHint(ro));
+        if (!attempted && !note.canFind("sudo systemctl start")) writeln("run: ", manualReloadHint(ro));
         return ok ? 0 : (attempted ? 1 : 3);
     }
 
@@ -694,7 +694,11 @@ private int cmdDoctor(string[] args) {
             ""
         );
     } catch (Exception e) {
-        rep.checks ~= DoctorCheck("config", "fail", "Invalid configuration: " ~ e.msg, "Fix " ~ cfgPath);
+        if (e.msg.canFind("Permission denied") || e.msg.canFind("Access is denied")) {
+            rep.checks ~= DoctorCheck("config", "fail", "Cannot read " ~ cfgPath ~ " (permission denied)", "Re-run with sudo: sudo hikari doctor");
+        } else {
+            rep.checks ~= DoctorCheck("config", "fail", "Invalid configuration: " ~ e.msg, "Fix " ~ cfgPath);
+        }
         rep.overall = "fail";
     }
 

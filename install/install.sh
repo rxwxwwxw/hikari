@@ -1069,6 +1069,10 @@ done
 log "Staged hikari $APP_VERSION at $REL_DIR; activation follows generated-config validation"
 activate_install_release() {
   python3 "$REPO_ROOT/install/activate-release.py" begin "$VERSIONS_DIR" "$APP_VERSION"
+  mkdir -p "${ROOT_PREFIX}/usr/local/bin"
+  if [ ! -e "${ROOT_PREFIX}/usr/local/bin/hikari" ] || [ -L "${ROOT_PREFIX}/usr/local/bin/hikari" ]; then
+    ln -sfn /opt/hikari/versions/current/hikari "${ROOT_PREFIX}/usr/local/bin/hikari"
+  fi
 }
 
 # Seed the agent's last-known MagicDNS name (hikari-owned state, refreshed by the
@@ -1080,12 +1084,12 @@ case "$TS_FQDN" in
 esac
 
 # 8. Write default config.json ONLY if missing
+if [ -n "$TRUST_PUBKEY" ]; then
+  cp "$TRUST_PUBKEY" "$ETC_HIKARI/release-public-key.pem"
+  chmod 0644 "$ETC_HIKARI/release-public-key.pem"
+  TRUST_PUBKEY="$REAL_ETC_HIKARI/release-public-key.pem"
+fi
 if [ ! -f "$CONFIG_PATH" ]; then
-  if [ -n "$TRUST_PUBKEY" ]; then
-    cp "$TRUST_PUBKEY" "$ETC_HIKARI/release-public-key.pem"
-    chmod 0644 "$ETC_HIKARI/release-public-key.pem"
-    TRUST_PUBKEY="$REAL_ETC_HIKARI/release-public-key.pem"
-  fi
   cat > "$CONFIG_PATH" <<EOF
 {
   "schema_version": 1,
@@ -1149,6 +1153,21 @@ EOF
   chmod 0644 "$CONFIG_PATH"
   log "Created initial configuration at $CONFIG_PATH"
 else
+  if [ -n "$TRUST_REPO" ] && [ -n "$TRUST_PUBKEY" ]; then
+    python3 - "$CONFIG_PATH" "$TRUST_REPO" "$TRUST_PUBKEY" <<'PYTRUST'
+import json, os, pathlib, sys, uuid
+path = pathlib.Path(sys.argv[1])
+repo, pubkey = sys.argv[2], sys.argv[3]
+cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+upd = cfg.setdefault("updates", {})
+if upd.get("repo") in (None, "", "OWNER/REPO") and not upd.get("public_key"):
+    upd["repo"] = repo
+    upd["public_key"] = pubkey
+    tmp = path.parent / (".config.json.tmp-" + uuid.uuid4().hex)
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+PYTRUST
+  fi
   log "Preserved existing user configuration at $CONFIG_PATH"
 fi
 
@@ -1495,6 +1514,7 @@ Wants=network-online.target tailscaled.service hikari.service
 [Service]
 Type=simple
 User=root
+Environment=HOME=/var/lib/hikari/caddy XDG_DATA_HOME=/var/lib/hikari/caddy XDG_CONFIG_HOME=/var/lib/hikari/caddy
 ExecStart=${RESOLVED_CADDY_BIN} run --config /etc/hikari/Caddyfile --adapter caddyfile
 Restart=on-failure
 RestartSec=10s
@@ -1580,7 +1600,7 @@ else
   echo "  Caddy:            isolated hikari-caddy ($RESOLVED_CADDY_BIN)"
 fi
 echo "  Install log:      $LOG_FILE"
-echo "  Recovery/status:  /opt/hikari/versions/current/hikari doctor"
+echo "  Recovery/status:  sudo hikari doctor  (or sudo /opt/hikari/versions/current/hikari doctor)"
 READINESS_ARGS=(--config "$CONFIG_PATH" --version "$APP_VERSION" --fqdn "$TS_FQDN")
 if [ -n "$MACOS_CERT_STORE" ]; then READINESS_ARGS+=(--certificate-store "$MACOS_CERT_STORE"); fi
 if [ "$INTEGRATED" -eq 1 ] && [ "$RELOAD_CADDY" -ne 1 ]; then

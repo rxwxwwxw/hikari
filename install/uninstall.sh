@@ -95,6 +95,11 @@ if [ -f "$U_VAR/caddy-integration.json" ]; then
   echo "$UN_OUT"
 fi
 
+CLI_LINK="${ROOT_PREFIX}/usr/local/bin/hikari"
+if [ -L "$CLI_LINK" ] && [ "$(readlink "$CLI_LINK" 2>/dev/null || true)" = "/opt/hikari/versions/current/hikari" ]; then
+  remove_path "$CLI_LINK"
+fi
+
 if [ "$TARGET_OS" = "macos" ]; then
   ETC_HIKARI="${ROOT_PREFIX}/Library/Application Support/hikari"
   VAR_HIKARI="${ROOT_PREFIX}/Library/Application Support/hikari/state"
